@@ -81,9 +81,14 @@ function readDir(dir: string, source: "user" | "project", warnings: string[]): A
   const agents: AgentDef[] = [];
   for (const name of names.filter((n) => n.endsWith(".md")).sort()) {
     const filePath = join(dir, name);
-    const { agent, warning } = parseAgentFile(readFileSync(filePath, "utf8"), filePath, source);
-    if (warning) warnings.push(warning);
-    if (agent) agents.push(agent);
+    // One unreadable or malformed file must not block loading the rest.
+    try {
+      const { agent, warning } = parseAgentFile(readFileSync(filePath, "utf8"), filePath, source);
+      if (warning) warnings.push(warning);
+      if (agent) agents.push(agent);
+    } catch (error) {
+      warnings.push(`${filePath}: ${(error as Error).message}; skipped`);
+    }
   }
   return agents;
 }

@@ -87,4 +87,28 @@ describe("loadAgents", () => {
     expect(agents.size).toBe(0);
     expect(warnings).toEqual([]);
   });
+
+  it("skips a file with invalid YAML and warns", () => {
+    const { user } = dirs();
+    const bad = join(user, "bad.md");
+    writeFileSync(bad, md("name: a\ndescription: d: e: ["));
+    let result: ReturnType<typeof loadAgents> | undefined;
+    expect(() => {
+      result = loadAgents({ userDir: user, scope: "user" });
+    }).not.toThrow();
+    expect(result?.agents.get("reviewer")?.description).toBe("user reviewer");
+    expect(result?.warnings).toHaveLength(1);
+    expect(result?.warnings[0]).toContain(bad);
+  });
+
+  it("skips a directory named like an agent file", () => {
+    const { user } = dirs();
+    mkdirSync(join(user, "x.md"));
+    let result: ReturnType<typeof loadAgents> | undefined;
+    expect(() => {
+      result = loadAgents({ userDir: user, scope: "user" });
+    }).not.toThrow();
+    expect(result?.warnings).toHaveLength(1);
+    expect(result?.warnings[0]).toContain("x.md");
+  });
 });
