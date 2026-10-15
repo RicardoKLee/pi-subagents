@@ -6,7 +6,7 @@ function port() {
   return { calls, port: { sendMessage: (message, options) => calls.push({ message, options }) } as DeliveryPort };
 }
 
-const env = { handle: "reviewer", agent: "reviewer", status: "completed" as const, text: "Looks good." };
+const env = { handle: "reviewer", agent: "reviewer", status: "completed" as const, text: "Looks good.", sessionFile: "/s/child.jsonl" };
 
 describe("deliver", () => {
   it("share writes a visible result without starting a turn", () => {
@@ -16,7 +16,9 @@ describe("deliver", () => {
     expect(calls[0]!.message.display).toBe(true);
     expect(calls[0]!.message.content).toContain("@reviewer");
     expect(calls[0]!.message.content).toContain("Looks good.");
-    expect(calls[0]!.options).toEqual({ triggerTurn: false, deliverAs: "nextTurn" });
+    expect(calls[0]!.options).toEqual({ triggerTurn: false });
+    expect(calls[0]!.message.content).toContain("/s/child.jsonl");
+    expect(calls[0]!.message.details).toMatchObject({ sessionFile: "/s/child.jsonl" });
   });
 
   it("auto writes the result and triggers a turn", () => {

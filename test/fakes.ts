@@ -15,6 +15,7 @@ export class FakeSession implements ChildSession {
   constructor(readonly sessionFile: string, private readonly script: ChildResult[], private readonly hold = false) {}
 
   prompt(text: string): Promise<ChildResult> {
+    if (this.pending) return Promise.reject(new Error("FakeSession: prompt while busy"));
     this.prompts.push(text);
     const next = this.script.shift() ?? { text: "done", stopReason: "stop" as const, usage: usage() };
     if (!this.hold) return Promise.resolve(next);

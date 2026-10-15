@@ -17,20 +17,22 @@ export interface ResultEnvelope {
   status: RunStatus;
   /** Already sized by preparePayload. */
   text: string;
+  /** Child session file, so the full transcript stays reachable from the main session. */
+  sessionFile: string;
   filePath?: string;
 }
 
 function render(env: ResultEnvelope): string {
-  return `[subagent @${env.handle} (${env.agent}) ${env.status}]\n${env.text}`;
+  return `[subagent @${env.handle} (${env.agent}) ${env.status}]\n${env.text}\n\nSession: ${env.sessionFile}`;
 }
 
 export function deliver(port: DeliveryPort, mode: DeliveryMode, env: ResultEnvelope): void {
-  const details = { handle: env.handle, agent: env.agent, status: env.status, ...(env.filePath ? { filePath: env.filePath } : {}) };
+  const details = { handle: env.handle, agent: env.agent, status: env.status, sessionFile: env.sessionFile, ...(env.filePath ? { filePath: env.filePath } : {}) };
   if (mode === "private") {
     port.sendMessage({ customType: PRIVATE_MESSAGE_TYPE, content: render(env), display: true, details }, { triggerTurn: false });
     return;
   }
-  const options = mode === "auto" ? { triggerTurn: true, deliverAs: "followUp" as const } : { triggerTurn: false, deliverAs: "nextTurn" as const };
+  const options = mode === "auto" ? { triggerTurn: true, deliverAs: "followUp" as const } : { triggerTurn: false };
   port.sendMessage({ customType: RESULT_MESSAGE_TYPE, content: render(env), display: true, details }, options);
 }
 
