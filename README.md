@@ -60,4 +60,5 @@ and a read-only snapshot `<sessionDir>/<sessionId>.subagents.json` (never used f
 - Without a session directory (in-memory session), child sessions and outputs go to `<tmpdir>/pi-subagents/<sessionId>/` and no snapshot is written.
 - `private` results are visible only in the TUI; in print, JSON or RPC mode they are not displayed.
 - After `/reload` or a restart, records that were running are marked `paused` and can be resumed.
+- After `/tree`, a still-running record carried over to the new branch may share its handle with a record already on that branch. `@handle` resolution is then ambiguous; use the record id, or wait for the run to finish.
 - Not yet available: RPC runner, `@handle` mentions in the editor, chains, nested subagents. These are planned for later milestones.

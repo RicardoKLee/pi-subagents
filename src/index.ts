@@ -34,6 +34,17 @@ export function subagentPaths(sessionDir: string, sessionId: string): { childDir
   return { childDir: join(base, "sessions"), outputDir: join(base, "outputs") };
 }
 
+/**
+ * Reload the registry from a new branch after /tree: keep children that are still running, then pause records the
+ * branch left as "running" but that have no live child (e.g. /tree back to a point mid-run). Returns how many were paused.
+ */
+export function rebuildForBranch(manager: SubagentManager, registry: Registry, branch: readonly unknown[]): number {
+  const active = manager.activeRecords();
+  registry.reload(branch);
+  for (const r of active) registry.restore(r);
+  return manager.recoverInterrupted();
+}
+
 export default function (pi: ExtensionAPI): void {
   const agentDir = getAgentDir();
   let state: State | undefined;
@@ -82,12 +93,13 @@ export default function (pi: ExtensionAPI): void {
     if (ctx.hasUI) for (const n of notes) ctx.ui.notify(`pi-subagents: ${n}`, "warning");
   });
 
-  // /tree only fires session_tree: reload the registry from the new branch, keeping children that are still running.
+  // /tree only fires session_tree: rebuild the registry for the new branch (see rebuildForBranch).
   pi.on("session_tree", (_event, ctx) => {
     if (!state) return;
-    const active = state.manager.activeRecords();
-    state.registry.reload(ctx.sessionManager.getBranch());
-    for (const r of active) state.registry.restore(r);
+    const paused = rebuildForBranch(state.manager, state.registry, ctx.sessionManager.getBranch());
+    if (paused > 0 && ctx.hasUI) {
+      ctx.ui.notify(`pi-subagents: ${paused} subagent(s) from another branch were not running and are now paused`, "warning");
+    }
     if (!state.snapshotFile) return;
     try {
       writeSnapshot(state.snapshotFile, state.registry.list());
