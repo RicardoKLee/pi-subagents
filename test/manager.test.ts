@@ -13,10 +13,23 @@ import { FakeRunner, FakeSession, usage } from "./fakes.ts";
 
 const reviewer: AgentDef = { name: "reviewer", description: "r", systemPrompt: "Review.", source: "user", filePath: "/a/reviewer.md" };
 
-function setup(opts: { scripts?: ChildResult[][]; hold?: boolean; contextWindow?: number; registry?: Registry } = {}) {
+function setup(
+  opts: {
+    scripts?: ChildResult[][];
+    hold?: boolean;
+    contextWindow?: number;
+    registry?: Registry;
+    limit?: number;
+    outputDir?: string;
+    port?: DeliveryPort;
+    /** Zero-based open index at which FakeRunner.open rejects with "open failed". */
+    failOpenAt?: number;
+  } = {},
+) {
   const root = mkdtempSync(join(tmpdir(), "mgr-"));
   const scripts = opts.scripts ?? [];
   const runner = new FakeRunner((spec, n) => {
+    if (n === opts.failOpenAt) throw new Error("open failed");
     const file = spec.resumeFile ?? join(root, `child-${n}.jsonl`);
     writeFileSync(file, "", { flag: "a" });
     return new FakeSession(file, scripts[n] ?? [], opts.hold ?? false);
@@ -24,15 +37,15 @@ function setup(opts: { scripts?: ChildResult[][]; hold?: boolean; contextWindow?
   const sent: Parameters<DeliveryPort["sendMessage"]>[] = [];
   const manager = new SubagentManager({
     registry: opts.registry ?? new Registry(() => {}),
-    scheduler: new Scheduler(() => 4),
+    scheduler: new Scheduler(() => opts.limit ?? 4),
     runners: { sdk: runner, rpc: undefined },
     agents: () => new Map([["reviewer", reviewer]]),
     settings: () => DEFAULT_SETTINGS,
-    port: { sendMessage: (...args) => sent.push(args) },
+    port: opts.port ?? { sendMessage: (...args) => sent.push(args) },
     receiverContextWindow: () => opts.contextWindow ?? 200000,
     cwd: root,
     sessionDir: join(root, "sessions"),
-    outputDir: join(root, "out"),
+    outputDir: opts.outputDir ?? join(root, "out"),
   });
   return { manager, runner, sent, root };
 }
@@ -173,5 +186,56 @@ describe("steer / interrupt / stop / background", () => {
     expect(sent).toHaveLength(1);
     expect(sent[0]![0].customType).toBe("pi-subagents/private");
     expect(sent[0]![0].content).toContain("done!");
+  });
+});
+
+describe("fix round 1", () => {
+  it("stop while resume waits for a slot keeps the record stopped", async () => {
+    const registry = new Registry(() => {});
+    const { manager, runner } = setup({ limit: 1, hold: true, registry });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    await manager.interrupt("reviewer");
+    await manager.whenIdle();
+    expect(registry.resolve("reviewer")!.status).toBe("paused");
+    await manager.run({ agent: "reviewer", task: "y", background: true });
+    const p = manager.resume("reviewer", "again", { background: true });
+    await manager.stop("reviewer");
+    await expect(p).rejects.toMatchObject({ code: "stopped" });
+    expect(registry.resolve("reviewer")!.status).toBe("stopped");
+    expect(runner.opened).toHaveLength(2);
+    runner.sessions[1]!.finish();
+    await manager.whenIdle();
+  });
+
+  it("marks the run failed when result handling throws", async () => {
+    const root = mkdtempSync(join(tmpdir(), "mgr-file-"));
+    const blocker = join(root, "blocker");
+    writeFileSync(blocker, "");
+    const { manager } = setup({ scripts: [[ok("z".repeat(4000))]], contextWindow: 1000, outputDir: join(blocker, "out") });
+    const { record } = await manager.run({ agent: "reviewer", task: "x" });
+    expect(record.status).toBe("failed");
+    expect(record.error).toMatch(/result handling failed/);
+  });
+
+  it("keeps the status and records the error when delivery fails", async () => {
+    const port: DeliveryPort = {
+      sendMessage: () => {
+        throw new Error("port down");
+      },
+    };
+    const { manager } = setup({ scripts: [[ok("done!")]], port });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    await manager.whenIdle();
+    const record = manager.list()[0]!;
+    expect(record.status).toBe("completed");
+    expect(record.error).toMatch(/delivery failed: port down/);
+  });
+
+  it("failed resume restores delivery and error", async () => {
+    const { manager } = setup({ failOpenAt: 1, scripts: [[{ text: "", stopReason: "error", errorMessage: "rate limited", usage: usage(0) }]] });
+    const { record } = await manager.run({ agent: "reviewer", task: "x" });
+    expect(record.status).toBe("failed");
+    await expect(manager.resume("reviewer", "x", { delivery: "private" })).rejects.toThrow("open failed");
+    expect(manager.list()[0]).toMatchObject({ status: "failed", runId: 1, delivery: "share", error: "rate limited" });
   });
 });

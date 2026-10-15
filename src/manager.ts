@@ -51,6 +51,8 @@ interface Live {
 export class SubagentManager {
   private readonly live = new Map<string, Live>();
   private readonly work = new Set<Promise<unknown>>();
+  /** Resumes that claimed a record but have not reached execute() yet. */
+  private readonly claims = new Map<string, { intent?: "stop"; controller: AbortController }>();
 
   constructor(private readonly deps: ManagerDeps) {}
 
@@ -98,7 +100,13 @@ export class SubagentManager {
     }
     const agent = this.requireAgent(record.agent);
     const runner = this.requireRunner(record.runner);
-    const previous: RunStatus = record.status;
+    // Snapshot taken before the claim so a failed resume can be rolled back fully.
+    const previous: { status: RunStatus; runId: number; delivery: DeliveryMode; error: string | undefined } = {
+      status: record.status,
+      runId: record.runId,
+      delivery: record.delivery,
+      error: record.error,
+    };
     // Claim the record synchronously so a second resume sees "running".
     const claimed = this.deps.registry.update(record.id, {
       status: "running",
@@ -106,10 +114,16 @@ export class SubagentManager {
       delivery: opts.delivery ?? record.delivery,
       error: undefined,
     });
+    const claim: { intent?: "stop"; controller: AbortController } = { controller: new AbortController() };
+    this.claims.set(record.id, claim);
+    const stoppedWhileWaiting = () => {
+      this.markStopped(record.id);
+      return new SubagentError("stopped", `@${record.handle} was stopped while waiting to resume`);
+    };
     let release: () => void;
     let session: ChildSession;
     try {
-      release = await this.deps.scheduler.acquire();
+      release = await this.deps.scheduler.acquire(claim.controller.signal);
       try {
         session = await runner.open({
           agent,
@@ -123,8 +137,16 @@ export class SubagentManager {
         throw error;
       }
     } catch (error) {
-      this.deps.registry.update(record.id, { status: previous, runId: record.runId });
+      this.claims.delete(record.id);
+      if (claim.intent === "stop") throw stoppedWhileWaiting();
+      this.deps.registry.update(record.id, previous);
       throw error;
+    }
+    this.claims.delete(record.id);
+    if (claim.intent === "stop") {
+      release();
+      await session.dispose().catch(() => {});
+      throw stoppedWhileWaiting();
     }
     return this.execute(claimed, session, message, release, opts.background ?? false);
   }
@@ -146,6 +168,14 @@ export class SubagentManager {
 
   async stop(handle: string): Promise<void> {
     const record = this.requireRecord(handle);
+    const claim = this.claims.get(record.id);
+    if (claim) {
+      // A resume is still waiting for a slot or a session; cancel it.
+      claim.intent = "stop";
+      claim.controller.abort();
+      this.markStopped(record.id);
+      return;
+    }
     const live = this.live.get(record.id);
     if (live) {
       live.intent = "stop";
@@ -164,7 +194,7 @@ export class SubagentManager {
   recoverInterrupted(): number {
     let count = 0;
     for (const r of this.deps.registry.list()) {
-      if (r.status === "running" && !this.live.has(r.id)) {
+      if (r.status === "running" && !this.live.has(r.id) && !this.claims.has(r.id)) {
         this.deps.registry.update(r.id, { status: "paused", error: "interrupted by reload or restart" });
         count++;
       }
@@ -190,10 +220,18 @@ export class SubagentManager {
         release();
         await session.dispose().catch(() => {});
       }
-      return this.finish(record.id, result, live, background);
+      try {
+        return this.finish(record.id, result, live, background);
+      } catch (error) {
+        // Never leave the record stuck in "running" or let a background job reject.
+        const message = `result handling failed: ${(error as Error).message}`;
+        const failed = this.deps.registry.update(record.id, { status: "failed", error: message, lastSummary: message });
+        const note = `@${failed.handle} failed: ${message}`;
+        return { record: failed, payload: { text: note, summary: note } };
+      }
     })();
     this.work.add(job);
-    void job.finally(() => this.work.delete(job));
+    void job.catch(() => {}).finally(() => this.work.delete(job));
     if (background) return { record };
     return job;
   }
@@ -223,18 +261,27 @@ export class SubagentManager {
       const note = `@${current.handle} ${status}${error ? `: ${error}` : ""}`;
       payload = { text: note, summary: note };
     }
-    const record = registry.update(id, { status, error, lastSummary: payload.summary });
+    let record = registry.update(id, { status, error, lastSummary: payload.summary });
     if (background && status !== "stopped" && status !== "paused") {
-      deliver(this.deps.port, record.delivery, {
-        handle: record.handle,
-        agent: record.agent,
-        status,
-        text: payload.text,
-        sessionFile: record.sessionFile,
-        ...(payload.filePath ? { filePath: payload.filePath } : {}),
-      });
+      try {
+        deliver(this.deps.port, record.delivery, {
+          handle: record.handle,
+          agent: record.agent,
+          status,
+          text: payload.text,
+          sessionFile: record.sessionFile,
+          ...(payload.filePath ? { filePath: payload.filePath } : {}),
+        });
+      } catch (deliveryError) {
+        // Delivery is a side channel: keep the run's status, record why it was not delivered.
+        record = registry.update(id, { error: `delivery failed: ${(deliveryError as Error).message}` });
+      }
     }
     return { record, payload };
+  }
+
+  private markStopped(id: string): void {
+    if (this.deps.registry.get(id)?.status !== "stopped") this.deps.registry.update(id, { status: "stopped" });
   }
 
   private requireAgent(name: string): AgentDef {
