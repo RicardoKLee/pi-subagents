@@ -1,4 +1,4 @@
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -348,5 +348,17 @@ describe("final fix wave", () => {
     const record = manager.list()[0]!;
     expect(record.status).toBe("failed");
     expect(record.error).toBe("rate limited; delivery failed: port down");
+  });
+});
+
+describe("final fix wave round 2", () => {
+  it("background private keeps short results inline", async () => {
+    const { manager, entries, root } = setup({ scripts: [[ok("FULLTEXT-" + "x".repeat(50))]] });
+    await manager.run({ agent: "reviewer", task: "x", background: true, delivery: "private" });
+    await manager.whenIdle();
+    expect(entries).toHaveLength(1);
+    expect((entries[0]![1] as { text: string }).text).toContain("FULLTEXT-");
+    const outDir = join(root, "out");
+    expect(existsSync(outDir) ? readdirSync(outDir) : []).toHaveLength(0);
   });
 });

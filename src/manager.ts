@@ -335,12 +335,13 @@ export class SubagentManager {
     const current = registry.get(id)!;
     let payload: Payload;
     if (status === "completed") {
-      // Background results are delivered into the main session: always move the full text to a file there and
-      // send only the summary + paths (ratio 0). Foreground returns keep the contextRatio rule. One file per run.
+      // share/auto background results are delivered into the main LLM context: always move the full text to a file
+      // and send only the summary + paths (ratio 0). Private results never enter the LLM context, so they keep the
+      // contextRatio rule like foreground returns. One file per run at most.
       payload = preparePayload({
         text: result.text,
         receiverContextWindow: this.deps.receiverContextWindow(),
-        ratio: background ? 0 : this.deps.settings().contextRatio,
+        ratio: background && current.delivery !== "private" ? 0 : this.deps.settings().contextRatio,
         outputDir: this.deps.outputDir,
         label: `${current.handle}-run${current.runId}`,
       });
