@@ -335,10 +335,12 @@ export class SubagentManager {
     const current = registry.get(id)!;
     let payload: Payload;
     if (status === "completed") {
+      // Background results are delivered into the main session: always move the full text to a file there and
+      // send only the summary + paths (ratio 0). Foreground returns keep the contextRatio rule. One file per run.
       payload = preparePayload({
         text: result.text,
         receiverContextWindow: this.deps.receiverContextWindow(),
-        ratio: this.deps.settings().contextRatio,
+        ratio: background ? 0 : this.deps.settings().contextRatio,
         outputDir: this.deps.outputDir,
         label: `${current.handle}-run${current.runId}`,
       });

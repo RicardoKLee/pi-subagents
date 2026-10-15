@@ -60,6 +60,12 @@ describe("preparePayload", () => {
     expect(p.summary).toHaveLength(1200);
   });
 
+  it("falls back to the head when the summary tag is empty", () => {
+    const p = preparePayload({ text: `${"c".repeat(5000)}\n<summary>  </summary>`, receiverContextWindow: 1000, ratio: 0.3, outputDir: outputDir(), label: "x" });
+    expect(p.summary).toBe("c".repeat(1200));
+    expect(p.text).toContain("c".repeat(1200));
+  });
+
   it("moves CJK output above 30% to a file", () => {
     const p = preparePayload({ text: "中".repeat(400), receiverContextWindow: 1000, ratio: 0.3, outputDir: outputDir(), label: "cjk" });
     expect(p.filePath).toBeDefined();

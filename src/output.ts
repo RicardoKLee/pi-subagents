@@ -51,7 +51,8 @@ export function preparePayload(opts: {
   label: string;
 }): Payload {
   const { body, summary } = extractSummary(opts.text);
-  const shortSummary = summary ?? body.slice(0, SUMMARY_FALLBACK_CHARS);
+  // An empty <summary></summary> is treated like a missing one.
+  const shortSummary = summary || body.slice(0, SUMMARY_FALLBACK_CHARS);
   if (estimateTokens(body) <= opts.receiverContextWindow * opts.ratio) {
     return { text: opts.text, summary: shortSummary };
   }

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -316,5 +316,19 @@ describe("final fix wave", () => {
     runner.sessions[0]!.finish();
     await manager.whenIdle();
     expect(manager.activeRecords()).toHaveLength(0);
+  });
+
+  it("background share delivers summary and file path, not the full text", async () => {
+    const { manager, sent, root } = setup({ scripts: [[ok("FULLTEXT-" + "x".repeat(50) + "\n<summary>short</summary>")]] });
+    await manager.run({ agent: "reviewer", task: "x", background: true, delivery: "share" });
+    await manager.whenIdle();
+    expect(sent).toHaveLength(1);
+    const message = sent[0]![0];
+    expect(message.content).toContain("short");
+    expect(message.content).not.toContain("FULLTEXT-");
+    const filePath = (message.details as { filePath?: string }).filePath;
+    expect(filePath).toBeDefined();
+    expect(readFileSync(filePath!, "utf8").startsWith("FULLTEXT-")).toBe(true);
+    expect(readdirSync(join(root, "out"))).toHaveLength(1);
   });
 });
