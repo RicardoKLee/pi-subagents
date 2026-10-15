@@ -7,7 +7,7 @@ import type { ChildResult, ChildSession, Runner } from "./runner/types.ts";
 import type { Scheduler } from "./scheduler.ts";
 import type { DeliveryMode, RunnerKind, SubagentSettings } from "./settings.ts";
 
-export type SubagentErrorCode = "unknown_agent" | "unknown_handle" | "stopped" | "busy" | "not_running" | "missing_session";
+export type SubagentErrorCode = "unknown_agent" | "unknown_handle" | "stopped" | "busy" | "not_running" | "missing_session" | "interrupted";
 
 export class SubagentError extends Error {
   constructor(readonly code: SubagentErrorCode, message: string) {
@@ -35,6 +35,8 @@ export interface RunRequest {
   task: string;
   delivery?: DeliveryMode;
   background?: boolean;
+  /** The calling tool's signal: aborting it cancels this run while queued, opening, or (foreground) running. */
+  signal?: AbortSignal;
 }
 
 export interface RunOutcome {
@@ -68,7 +70,14 @@ export class SubagentManager {
     const agent = this.requireAgent(req.agent);
     const runner = this.requireRunner(agent.runner ?? this.deps.settings().defaultRunner);
     const delivery = req.delivery ?? agent.delivery ?? this.deps.settings().defaultDelivery;
-    const release = await this.deps.scheduler.acquire(this.lifetime.signal);
+    const signal = req.signal;
+    let release: () => void;
+    try {
+      release = await this.deps.scheduler.acquire(signal ? AbortSignal.any([this.lifetime.signal, signal]) : this.lifetime.signal);
+    } catch (error) {
+      if (!this.closed && signal?.aborted) throw runInterruptedError();
+      throw error;
+    }
     let session: ChildSession;
     try {
       session = await runner.open({
@@ -87,6 +96,12 @@ export class SubagentManager {
       await session.dispose().catch(() => {});
       throw shutDownError();
     }
+    if (signal?.aborted) {
+      // The calling tool was aborted while the session was opening.
+      release();
+      await session.dispose().catch(() => {});
+      throw runInterruptedError();
+    }
     const record = this.deps.registry.create({
       agent: agent.name,
       preferredHandle: agent.handle ?? agent.name,
@@ -96,10 +111,14 @@ export class SubagentManager {
       delivery,
       task: req.task,
     });
-    return this.execute(record, session, req.task, release, req.background ?? false);
+    return this.execute(record, session, req.task, release, req.background ?? false, signal);
   }
 
-  async resume(handle: string, message: string, opts: { delivery?: DeliveryMode; background?: boolean } = {}): Promise<RunOutcome> {
+  async resume(
+    handle: string,
+    message: string,
+    opts: { delivery?: DeliveryMode; background?: boolean; signal?: AbortSignal } = {},
+  ): Promise<RunOutcome> {
     if (this.closed) throw shutDownError();
     const record = this.requireRecord(handle);
     if (record.status === "stopped") throw new SubagentError("stopped", `@${record.handle} was stopped and cannot be resumed; start a new subagent instead`);
@@ -127,9 +146,18 @@ export class SubagentManager {
     });
     const claim: { intent?: "stop"; controller: AbortController } = { controller: new AbortController() };
     this.claims.set(record.id, claim);
+    const signal = opts.signal;
     const abortClaim = () => claim.controller.abort();
-    if (this.lifetime.signal.aborted) abortClaim();
-    else this.lifetime.signal.addEventListener("abort", abortClaim, { once: true });
+    if (this.lifetime.signal.aborted || signal?.aborted) abortClaim();
+    else {
+      this.lifetime.signal.addEventListener("abort", abortClaim, { once: true });
+      signal?.addEventListener("abort", abortClaim, { once: true });
+    }
+    const unlinkClaim = () => {
+      this.lifetime.signal.removeEventListener("abort", abortClaim);
+      signal?.removeEventListener("abort", abortClaim);
+    };
+    const interruptedWhileWaiting = () => new SubagentError("interrupted", `@${record.handle} was interrupted before it resumed`);
     const stoppedWhileWaiting = () => {
       this.markStopped(record.id);
       return new SubagentError("stopped", `@${record.handle} was stopped while waiting to resume`);
@@ -151,25 +179,31 @@ export class SubagentManager {
           await session.dispose().catch(() => {});
           throw shutDownError();
         }
+        if (signal?.aborted && claim.intent !== "stop") {
+          // The calling tool was aborted while the session was opening; release and rollback run below.
+          await session.dispose().catch(() => {});
+          throw interruptedWhileWaiting();
+        }
       } catch (error) {
         release();
         throw error;
       }
     } catch (error) {
-      this.lifetime.signal.removeEventListener("abort", abortClaim);
+      unlinkClaim();
       this.claims.delete(record.id);
       if (claim.intent === "stop") throw stoppedWhileWaiting();
       this.deps.registry.update(record.id, previous);
+      if (!this.closed && signal?.aborted) throw interruptedWhileWaiting();
       throw error;
     }
-    this.lifetime.signal.removeEventListener("abort", abortClaim);
+    unlinkClaim();
     this.claims.delete(record.id);
     if (claim.intent === "stop") {
       release();
       await session.dispose().catch(() => {});
       throw stoppedWhileWaiting();
     }
-    return this.execute(claimed, session, message, release, opts.background ?? false);
+    return this.execute(claimed, session, message, release, opts.background ?? false, signal);
   }
 
   async steer(handle: string, message: string, mode: "steer" | "followUp" = "steer"): Promise<void> {
@@ -235,16 +269,32 @@ export class SubagentManager {
     while (this.work.size) await Promise.allSettled([...this.work]);
   }
 
-  private async execute(record: SubagentRecord, session: ChildSession, text: string, release: () => void, background: boolean): Promise<RunOutcome> {
+  private async execute(
+    record: SubagentRecord,
+    session: ChildSession,
+    text: string,
+    release: () => void,
+    background: boolean,
+    signal?: AbortSignal,
+  ): Promise<RunOutcome> {
     const live: Live = { session };
     this.live.set(record.id, live);
+    // Only a foreground call is still waiting on its tool signal; a background call has already returned.
+    const callSignal = background ? undefined : signal;
+    const onCallAbort = () => {
+      live.intent = "interrupt";
+      void session.abort().catch(() => {});
+    };
     const job = (async (): Promise<RunOutcome> => {
       let result: ChildResult;
       try {
+        if (callSignal?.aborted) onCallAbort();
+        else callSignal?.addEventListener("abort", onCallAbort, { once: true });
         result = await session.prompt(text);
       } catch (error) {
         result = { text: "", stopReason: "error", errorMessage: (error as Error).message, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } };
       } finally {
+        callSignal?.removeEventListener("abort", onCallAbort);
         this.live.delete(record.id);
         release();
         await session.dispose().catch(() => {});
@@ -334,6 +384,10 @@ export class SubagentManager {
     }
     return record;
   }
+}
+
+function runInterruptedError(): SubagentError {
+  return new SubagentError("interrupted", "subagent run was interrupted before it started");
 }
 
 function shutDownError(): Error {

@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { AgentDef } from "../src/agents.ts";
 import type { DeliveryPort } from "../src/delivery.ts";
 import { SubagentError, SubagentManager } from "../src/manager.ts";
@@ -257,5 +257,51 @@ describe("task 9 fix round 1", () => {
     const { manager } = setup();
     await manager.shutdown();
     await expect(manager.run({ agent: "reviewer", task: "x" })).rejects.toThrow(/shut down/);
+  });
+});
+
+describe("task 9 fix round 2", () => {
+  it("aborting a queued foreground run rejects it without opening a session", async () => {
+    const { manager, runner } = setup({ limit: 1, hold: true });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    const c = new AbortController();
+    const p = manager.run({ agent: "reviewer", task: "y", signal: c.signal });
+    c.abort();
+    await expect(p).rejects.toMatchObject({ code: "interrupted" });
+    expect(runner.opened).toHaveLength(1);
+    expect(manager.list()).toHaveLength(1);
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+  });
+
+  it("aborting a running foreground run pauses only that run", async () => {
+    const { manager, runner } = setup({ hold: true });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    const c = new AbortController();
+    const b = manager.run({ agent: "reviewer", task: "y", signal: c.signal });
+    await vi.waitFor(() => expect(runner.sessions).toHaveLength(2));
+    c.abort();
+    const { record } = await b;
+    expect(record.status).toBe("paused");
+    expect(runner.sessions[0]!.aborted).toBe(0);
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+  });
+
+  it("aborting a queued resume rolls the record back", async () => {
+    const registry = new Registry(() => {});
+    const { manager, runner } = setup({ limit: 1, hold: true, registry });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    await manager.interrupt("reviewer");
+    await manager.whenIdle();
+    expect(registry.resolve("reviewer")!.status).toBe("paused");
+    await manager.run({ agent: "reviewer", task: "y", background: true });
+    const c = new AbortController();
+    const p = manager.resume("reviewer", "again", { background: true, signal: c.signal });
+    c.abort();
+    await expect(p).rejects.toMatchObject({ code: "interrupted" });
+    expect(registry.resolve("reviewer")).toMatchObject({ status: "paused", runId: 1 });
+    runner.sessions[1]!.finish();
+    await manager.whenIdle();
   });
 });

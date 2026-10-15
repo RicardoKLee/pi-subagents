@@ -69,6 +69,15 @@ describe("executeAction", () => {
     expect(m.interruptAll).toHaveBeenCalledTimes(0);
   });
 
+  it("passes the tool signal to run and resume", async () => {
+    const m = fakeManager({ interruptAll: vi.fn(async () => {}) });
+    const controller = new AbortController();
+    await executeAction(m, { action: "run", agent: "reviewer", task: "x" }, controller.signal);
+    await executeAction(m, { action: "resume", handle: "@reviewer", message: "y" }, controller.signal);
+    expect(m.run).toHaveBeenCalledWith({ agent: "reviewer", task: "x", signal: controller.signal });
+    expect(m.resume).toHaveBeenCalledWith("@reviewer", "y", { signal: controller.signal });
+  });
+
   it("surfaces SubagentError messages unchanged", async () => {
     const m = fakeManager({ resume: vi.fn(async () => { throw new SubagentError("stopped", "@reviewer was stopped"); }) });
     await expect(executeAction(m, { action: "resume", handle: "reviewer", message: "x" })).rejects.toThrow("@reviewer was stopped");

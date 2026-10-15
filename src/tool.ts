@@ -43,14 +43,23 @@ export async function executeAction(
   if (signal?.aborted) onAbort();
   else signal?.addEventListener("abort", onAbort, { once: true });
   try {
-    return await dispatch(manager, input);
+    return await dispatch(manager, input, signal);
   } finally {
     signal?.removeEventListener("abort", onAbort);
   }
 }
 
-async function dispatch(manager: SubagentManager, input: SubagentsInput): Promise<{ text: string; details: Record<string, unknown> }> {
-  const extra = { ...(input.delivery ? { delivery: input.delivery } : {}), ...(input.background ? { background: true } : {}) };
+async function dispatch(
+  manager: SubagentManager,
+  input: SubagentsInput,
+  signal?: AbortSignal,
+): Promise<{ text: string; details: Record<string, unknown> }> {
+  // `signal` is only added when present so callers without one see the same arguments as before.
+  const extra = {
+    ...(input.delivery ? { delivery: input.delivery } : {}),
+    ...(input.background ? { background: true } : {}),
+    ...(signal ? { signal } : {}),
+  };
   switch (input.action) {
     case "run": {
       const { record, payload } = await manager.run({ agent: need(input.agent, "agent", "run"), task: need(input.task, "task", "run"), ...extra });
