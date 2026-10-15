@@ -35,19 +35,20 @@ function setup(
     return new FakeSession(file, scripts[n] ?? [], opts.hold ?? false);
   });
   const sent: Parameters<DeliveryPort["sendMessage"]>[] = [];
+  const entries: Parameters<DeliveryPort["appendEntry"]>[] = [];
   const manager = new SubagentManager({
     registry: opts.registry ?? new Registry(() => {}),
     scheduler: new Scheduler(() => opts.limit ?? 4),
     runners: { sdk: runner, rpc: undefined },
     agents: () => new Map([["reviewer", reviewer]]),
     settings: () => DEFAULT_SETTINGS,
-    port: opts.port ?? { sendMessage: (...args) => sent.push(args) },
+    port: opts.port ?? { sendMessage: (...args) => sent.push(args), appendEntry: (...args) => entries.push(args) },
     receiverContextWindow: () => opts.contextWindow ?? 200000,
     cwd: root,
     sessionDir: join(root, "sessions"),
     outputDir: opts.outputDir ?? join(root, "out"),
   });
-  return { manager, runner, sent, root };
+  return { manager, runner, sent, entries, root };
 }
 
 const ok = (text: string): ChildResult => ({ text, stopReason: "stop", usage: usage() });
@@ -179,13 +180,14 @@ describe("steer / interrupt / stop / background", () => {
   });
 
   it("background run delivers through the record's mode", async () => {
-    const { manager, sent } = setup({ scripts: [[ok("done!")]] });
+    const { manager, sent, entries } = setup({ scripts: [[ok("done!")]] });
     const { payload } = await manager.run({ agent: "reviewer", task: "x", background: true, delivery: "private" });
     expect(payload).toBeUndefined();
     await manager.whenIdle();
-    expect(sent).toHaveLength(1);
-    expect(sent[0]![0].customType).toBe("pi-subagents/private");
-    expect(sent[0]![0].content).toContain("done!");
+    expect(sent).toHaveLength(0);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]![0]).toBe("pi-subagents/private");
+    expect((entries[0]![1] as { text: string }).text).toContain("done!");
   });
 });
 
@@ -222,6 +224,7 @@ describe("fix round 1", () => {
       sendMessage: () => {
         throw new Error("port down");
       },
+      appendEntry: () => {},
     };
     const { manager } = setup({ scripts: [[ok("done!")]], port });
     await manager.run({ agent: "reviewer", task: "x", background: true });

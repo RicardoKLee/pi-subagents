@@ -2,13 +2,25 @@ import type { RunStatus } from "./registry.ts";
 import type { DeliveryMode } from "./settings.ts";
 
 export const RESULT_MESSAGE_TYPE = "pi-subagents/result";
-export const PRIVATE_MESSAGE_TYPE = "pi-subagents/private";
+/** Private results are stored as custom entries, which never enter the LLM context (incl. compaction and branch summaries). */
+export const PRIVATE_ENTRY_TYPE = "pi-subagents/private";
 
 export interface DeliveryPort {
   sendMessage(
     message: { customType: string; content: string; display: boolean; details?: unknown },
     options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
   ): void;
+  appendEntry(customType: string, data: unknown): void;
+}
+
+/** Data of a `pi-subagents/private` custom entry. */
+export interface PrivateEntryData {
+  handle: string;
+  agent: string;
+  status: RunStatus;
+  text: string;
+  sessionFile: string;
+  filePath?: string;
 }
 
 export interface ResultEnvelope {
@@ -29,17 +41,10 @@ function render(env: ResultEnvelope): string {
 export function deliver(port: DeliveryPort, mode: DeliveryMode, env: ResultEnvelope): void {
   const details = { handle: env.handle, agent: env.agent, status: env.status, sessionFile: env.sessionFile, ...(env.filePath ? { filePath: env.filePath } : {}) };
   if (mode === "private") {
-    port.sendMessage({ customType: PRIVATE_MESSAGE_TYPE, content: render(env), display: true, details }, { triggerTurn: false });
+    const data: PrivateEntryData = { ...details, text: render(env) };
+    port.appendEntry(PRIVATE_ENTRY_TYPE, data);
     return;
   }
   const options = mode === "auto" ? { triggerTurn: true, deliverAs: "followUp" as const } : { triggerTurn: false };
   port.sendMessage({ customType: RESULT_MESSAGE_TYPE, content: render(env), display: true, details }, options);
-}
-
-/** Used by the `context` handler so private results never reach the model. */
-export function stripPrivateMessages<T>(messages: T[]): T[] {
-  return messages.filter((m) => {
-    const msg = m as { role?: string; customType?: string };
-    return !(msg.role === "custom" && msg.customType === PRIVATE_MESSAGE_TYPE);
-  });
 }

@@ -1,14 +1,17 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
 import { loadAgents } from "./agents.ts";
-import { stripPrivateMessages } from "./delivery.ts";
+import { PRIVATE_ENTRY_TYPE, type PrivateEntryData } from "./delivery.ts";
 import { SubagentManager } from "./manager.ts";
 import { REGISTRY_ENTRY_TYPE, Registry, writeSnapshot } from "./registry.ts";
 import { SdkRunner } from "./runner/sdk.ts";
 import { Scheduler } from "./scheduler.ts";
 import { loadSettings, type SubagentSettings } from "./settings.ts";
 import { executeAction, SubagentsParams, type SubagentsInput } from "./tool.ts";
+
+const PRIVATE_PREVIEW_LINES = 20;
 
 interface State {
   manager: SubagentManager;
@@ -64,7 +67,10 @@ export default function (pi: ExtensionAPI): void {
         return loaded.agents;
       },
       settings: () => settings,
-      port: { sendMessage: (message, options) => pi.sendMessage(message, options) },
+      port: {
+        sendMessage: (message, options) => pi.sendMessage(message, options),
+        appendEntry: (type, data) => pi.appendEntry(type, data),
+      },
       receiverContextWindow: () => state?.ctx.model?.contextWindow ?? 200000,
       cwd: ctx.cwd,
       sessionDir: childDir,
@@ -90,8 +96,18 @@ export default function (pi: ExtensionAPI): void {
     }
   });
 
-  // Private results stay visible in the transcript but never reach the model.
-  pi.on("context", (event) => ({ messages: stripPrivateMessages(event.messages) }));
+  // Private results are custom entries: shown in the TUI only, never part of the LLM context.
+  pi.registerEntryRenderer<PrivateEntryData>(PRIVATE_ENTRY_TYPE, (entry, { expanded }, theme) => {
+    const data = entry.data;
+    if (!data) return undefined;
+    const lines = data.text.split("\n");
+    const shown = expanded || lines.length <= PRIVATE_PREVIEW_LINES ? lines : lines.slice(0, PRIVATE_PREVIEW_LINES);
+    const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+    box.addChild(new Text(`${theme.fg("accent", "[subagent private]")} @${data.handle} ${data.status}`, 0, 0));
+    box.addChild(new Text(shown.join("\n"), 0, 0));
+    if (shown.length < lines.length) box.addChild(new Text(theme.fg("dim", `… ${lines.length - shown.length} more lines (expand to show)`), 0, 0));
+    return box;
+  });
 
   pi.on("session_shutdown", async () => {
     await state?.manager.shutdown();
