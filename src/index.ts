@@ -15,6 +15,7 @@ interface State {
   registry: Registry;
   ctx: ExtensionContext;
   settings: SubagentSettings;
+  snapshotFile?: string;
 }
 
 /** Where child sessions, large outputs and the snapshot live; sessionless (in-memory) sessions use a temp dir and no snapshot. */
@@ -69,10 +70,24 @@ export default function (pi: ExtensionAPI): void {
       sessionDir: childDir,
       outputDir,
     });
-    state = { manager, registry, ctx, settings };
+    state = { manager, registry, ctx, settings, ...(snapshotFile ? { snapshotFile } : {}) };
     const recovered = manager.recoverInterrupted();
     const notes = [...warnings, ...(recovered ? [`${recovered} subagent(s) were cut off by reload/restart and are now paused`] : [])];
     if (ctx.hasUI) for (const n of notes) ctx.ui.notify(`pi-subagents: ${n}`, "warning");
+  });
+
+  // /tree only fires session_tree: reload the registry from the new branch, keeping children that are still running.
+  pi.on("session_tree", (_event, ctx) => {
+    if (!state) return;
+    const active = state.manager.activeRecords();
+    state.registry.reload(ctx.sessionManager.getBranch());
+    for (const r of active) state.registry.restore(r);
+    if (!state.snapshotFile) return;
+    try {
+      writeSnapshot(state.snapshotFile, state.registry.list());
+    } catch {
+      // Snapshot is best-effort; the session entries are authoritative.
+    }
   });
 
   // Private results stay visible in the transcript but never reach the model.

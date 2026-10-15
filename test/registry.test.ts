@@ -79,6 +79,21 @@ describe("Registry", () => {
     expect(rebuilt.resolve("reviewer")?.status).toBe("paused");
     expect(rebuilt.create({ ...base, preferredHandle: "reviewer" }).handle).toBe("reviewer-2");
   });
+
+  it("reload replaces records with the given branch", () => {
+    const { registry, persisted } = make();
+    const a = registry.create({ ...base, preferredHandle: "a" });
+    const entriesA = persisted.map((data) => ({ type: "custom", customType: REGISTRY_ENTRY_TYPE, data }));
+    const b = registry.create({ ...base, preferredHandle: "b" });
+    const before = persisted.length;
+    registry.reload(entriesA);
+    expect(persisted).toHaveLength(before);
+    expect(registry.list().map((r) => r.id)).toEqual([a.id]);
+    registry.restore(b);
+    expect(registry.list().map((r) => r.id)).toEqual([a.id, b.id]);
+    expect(persisted).toHaveLength(before + 1);
+    expect(persisted.at(-1)).toMatchObject({ id: b.id, handle: "b" });
+  });
 });
 
 describe("writeSnapshot", () => {

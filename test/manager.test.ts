@@ -305,3 +305,16 @@ describe("task 9 fix round 2", () => {
     await manager.whenIdle();
   });
 });
+
+describe("final fix wave", () => {
+  it("activeRecords returns running and resuming records", async () => {
+    const { manager, runner } = setup({ hold: true });
+    const { record } = await manager.run({ agent: "reviewer", task: "x", background: true });
+    const active = manager.activeRecords();
+    expect(active).toHaveLength(1);
+    expect(active[0]!.id).toBe(record.id);
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+    expect(manager.activeRecords()).toHaveLength(0);
+  });
+});

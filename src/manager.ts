@@ -65,6 +65,12 @@ export class SubagentManager {
     return this.deps.registry.list();
   }
 
+  /** Records with a live child or a pending resume claim; these must survive a branch switch. */
+  activeRecords(): SubagentRecord[] {
+    const ids = new Set([...this.live.keys(), ...this.claims.keys()]);
+    return [...ids].map((id) => this.deps.registry.get(id)).filter((r): r is SubagentRecord => r !== undefined);
+  }
+
   async run(req: RunRequest): Promise<RunOutcome> {
     if (this.closed) throw shutDownError();
     const agent = this.requireAgent(req.agent);

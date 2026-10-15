@@ -68,12 +68,23 @@ export class Registry {
   /** Rebuild from session entries: the latest registry entry per id wins. */
   static rebuild(entries: readonly unknown[], persist: (r: SubagentRecord) => void, now?: () => number): Registry {
     const registry = new Registry(persist, now);
+    registry.reload(entries);
+    return registry;
+  }
+
+  /** Replace all records with those on the given branch (same rules as rebuild). Does not persist. */
+  reload(entries: readonly unknown[]): void {
+    this.records.clear();
     for (const entry of entries) {
       const e = entry as { type?: string; customType?: string; data?: unknown };
       if (e?.type !== "custom" || e.customType !== REGISTRY_ENTRY_TYPE || !isRecord(e.data)) continue;
-      registry.records.set(e.data.id, structuredClone(e.data));
+      this.records.set(e.data.id, structuredClone(e.data));
     }
-    return registry;
+  }
+
+  /** Put a record back (e.g. one still running after a branch switch) and persist it to the current branch. */
+  restore(record: SubagentRecord): SubagentRecord {
+    return this.save(structuredClone(record));
   }
 
   create(input: NewRecord): SubagentRecord {
