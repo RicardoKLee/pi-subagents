@@ -361,7 +361,8 @@ export class SubagentManager {
         });
       } catch (deliveryError) {
         // Delivery is a side channel: keep the run's status, record why it was not delivered.
-        record = registry.update(id, { error: `delivery failed: ${(deliveryError as Error).message}` });
+        // Keep the run's own error (e.g. why it failed) in front of the delivery error.
+        record = registry.update(id, { error: `${error ? `${error}; ` : ""}delivery failed: ${(deliveryError as Error).message}` });
       }
     }
     return { record, payload };

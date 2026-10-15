@@ -334,4 +334,19 @@ describe("final fix wave", () => {
     expect(readFileSync(filePath!, "utf8").startsWith("FULLTEXT-")).toBe(true);
     expect(readdirSync(join(root, "out"))).toHaveLength(1);
   });
+
+  it("keeps the root cause when delivery of a failed run fails", async () => {
+    const port: DeliveryPort = {
+      sendMessage: () => {
+        throw new Error("port down");
+      },
+      appendEntry: () => {},
+    };
+    const { manager } = setup({ scripts: [[{ text: "", stopReason: "error", errorMessage: "rate limited", usage: usage(0) }]], port });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    await manager.whenIdle();
+    const record = manager.list()[0]!;
+    expect(record.status).toBe("failed");
+    expect(record.error).toBe("rate limited; delivery failed: port down");
+  });
 });
