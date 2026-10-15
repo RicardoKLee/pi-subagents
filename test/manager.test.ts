@@ -239,3 +239,23 @@ describe("fix round 1", () => {
     expect(manager.list()[0]).toMatchObject({ status: "failed", runId: 1, delivery: "share", error: "rate limited" });
   });
 });
+
+describe("task 9 fix round 1", () => {
+  it("shutdown cancels a run waiting for a slot", async () => {
+    const { manager, runner } = setup({ limit: 1, hold: true });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    const second = manager.run({ agent: "reviewer", task: "y", background: true });
+    const rejected = expect(second).rejects.toThrow();
+    await manager.shutdown();
+    await rejected;
+    expect(runner.opened).toHaveLength(1);
+    expect(runner.sessions[0]!.aborted).toBe(1);
+    await manager.whenIdle();
+  });
+
+  it("rejects new runs after shutdown", async () => {
+    const { manager } = setup();
+    await manager.shutdown();
+    await expect(manager.run({ agent: "reviewer", task: "x" })).rejects.toThrow(/shut down/);
+  });
+});

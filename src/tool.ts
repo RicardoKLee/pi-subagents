@@ -33,7 +33,23 @@ function need<T>(value: T | undefined, name: string, action: string): T {
   return value;
 }
 
-export async function executeAction(manager: SubagentManager, input: SubagentsInput): Promise<{ text: string; details: Record<string, unknown> }> {
+export async function executeAction(
+  manager: SubagentManager,
+  input: SubagentsInput,
+  signal?: AbortSignal,
+): Promise<{ text: string; details: Record<string, unknown> }> {
+  // Esc / session switch aborts the tool call; pause the children so the call can return.
+  const onAbort = () => void manager.interruptAll();
+  if (signal?.aborted) onAbort();
+  else signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    return await dispatch(manager, input);
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+  }
+}
+
+async function dispatch(manager: SubagentManager, input: SubagentsInput): Promise<{ text: string; details: Record<string, unknown> }> {
   const extra = { ...(input.delivery ? { delivery: input.delivery } : {}), ...(input.background ? { background: true } : {}) };
   switch (input.action) {
     case "run": {

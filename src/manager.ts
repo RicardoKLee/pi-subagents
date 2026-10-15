@@ -53,6 +53,9 @@ export class SubagentManager {
   private readonly work = new Set<Promise<unknown>>();
   /** Resumes that claimed a record but have not reached execute() yet. */
   private readonly claims = new Map<string, { intent?: "stop"; controller: AbortController }>();
+  private closed = false;
+  /** Aborted on shutdown so queued run/resume calls stop waiting for a slot. */
+  private readonly lifetime = new AbortController();
 
   constructor(private readonly deps: ManagerDeps) {}
 
@@ -61,10 +64,11 @@ export class SubagentManager {
   }
 
   async run(req: RunRequest): Promise<RunOutcome> {
+    if (this.closed) throw shutDownError();
     const agent = this.requireAgent(req.agent);
     const runner = this.requireRunner(agent.runner ?? this.deps.settings().defaultRunner);
     const delivery = req.delivery ?? agent.delivery ?? this.deps.settings().defaultDelivery;
-    const release = await this.deps.scheduler.acquire();
+    const release = await this.deps.scheduler.acquire(this.lifetime.signal);
     let session: ChildSession;
     try {
       session = await runner.open({
@@ -76,6 +80,12 @@ export class SubagentManager {
     } catch (error) {
       release();
       throw error;
+    }
+    if (this.closed) {
+      // Shutdown happened while the session was opening; do not register a record on a dead session.
+      release();
+      await session.dispose().catch(() => {});
+      throw shutDownError();
     }
     const record = this.deps.registry.create({
       agent: agent.name,
@@ -90,6 +100,7 @@ export class SubagentManager {
   }
 
   async resume(handle: string, message: string, opts: { delivery?: DeliveryMode; background?: boolean } = {}): Promise<RunOutcome> {
+    if (this.closed) throw shutDownError();
     const record = this.requireRecord(handle);
     if (record.status === "stopped") throw new SubagentError("stopped", `@${record.handle} was stopped and cannot be resumed; start a new subagent instead`);
     if (record.status === "running" || this.live.has(record.id)) {
@@ -116,6 +127,9 @@ export class SubagentManager {
     });
     const claim: { intent?: "stop"; controller: AbortController } = { controller: new AbortController() };
     this.claims.set(record.id, claim);
+    const abortClaim = () => claim.controller.abort();
+    if (this.lifetime.signal.aborted) abortClaim();
+    else this.lifetime.signal.addEventListener("abort", abortClaim, { once: true });
     const stoppedWhileWaiting = () => {
       this.markStopped(record.id);
       return new SubagentError("stopped", `@${record.handle} was stopped while waiting to resume`);
@@ -132,16 +146,23 @@ export class SubagentManager {
           resumeFile: record.sessionFile,
           appendSystemPrompt: [agent.systemPrompt, SUMMARY_INSTRUCTION].filter(Boolean),
         });
+        if (this.closed) {
+          // Shutdown during open: dispose here; release and rollback run in the handlers below.
+          await session.dispose().catch(() => {});
+          throw shutDownError();
+        }
       } catch (error) {
         release();
         throw error;
       }
     } catch (error) {
+      this.lifetime.signal.removeEventListener("abort", abortClaim);
       this.claims.delete(record.id);
       if (claim.intent === "stop") throw stoppedWhileWaiting();
       this.deps.registry.update(record.id, previous);
       throw error;
     }
+    this.lifetime.signal.removeEventListener("abort", abortClaim);
     this.claims.delete(record.id);
     if (claim.intent === "stop") {
       release();
@@ -188,6 +209,14 @@ export class SubagentManager {
   /** Called when the main session is shutting down or the user aborts. */
   async interruptAll(): Promise<void> {
     await Promise.all([...this.live.values()].map((live) => ((live.intent = "interrupt"), live.session.abort())));
+  }
+
+  /** Main session is going away: cancel queued/opening run and resume calls, then interrupt live children. */
+  async shutdown(): Promise<void> {
+    this.closed = true;
+    this.lifetime.abort();
+    for (const claim of this.claims.values()) claim.controller.abort();
+    await this.interruptAll();
   }
 
   /** After /reload or restart no child is live; any "running" record was cut off. */
@@ -305,4 +334,8 @@ export class SubagentManager {
     }
     return record;
   }
+}
+
+function shutDownError(): Error {
+  return new Error("subagent manager is shut down");
 }

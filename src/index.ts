@@ -1,3 +1,4 @@
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { loadAgents } from "./agents.ts";
@@ -16,6 +17,19 @@ interface State {
   settings: SubagentSettings;
 }
 
+/** Where child sessions, large outputs and the snapshot live; sessionless (in-memory) sessions use a temp dir and no snapshot. */
+export function subagentPaths(sessionDir: string, sessionId: string): { childDir: string; outputDir: string; snapshotFile?: string } {
+  if (sessionDir) {
+    return {
+      childDir: join(sessionDir, "subagents"),
+      outputDir: join(sessionDir, "subagents", "outputs"),
+      snapshotFile: join(sessionDir, `${sessionId}.subagents.json`),
+    };
+  }
+  const base = join(tmpdir(), "pi-subagents", sessionId);
+  return { childDir: join(base, "sessions"), outputDir: join(base, "outputs") };
+}
+
 export default function (pi: ExtensionAPI): void {
   const agentDir = getAgentDir();
   let state: State | undefined;
@@ -29,10 +43,10 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     const { settings, warnings } = loadSettings(join(agentDir, "subagents.json"));
-    const sessionDir = ctx.sessionManager.getSessionDir();
-    const snapshotFile = join(sessionDir, `${ctx.sessionManager.getSessionId()}.subagents.json`);
+    const { childDir, outputDir, snapshotFile } = subagentPaths(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
     const registry = Registry.rebuild(ctx.sessionManager.getBranch(), (record) => {
       pi.appendEntry(REGISTRY_ENTRY_TYPE, record);
+      if (!snapshotFile) return;
       try {
         writeSnapshot(snapshotFile, registry.list());
       } catch {
@@ -52,8 +66,8 @@ export default function (pi: ExtensionAPI): void {
       port: { sendMessage: (message, options) => pi.sendMessage(message, options) },
       receiverContextWindow: () => state?.ctx.model?.contextWindow ?? 200000,
       cwd: ctx.cwd,
-      sessionDir: join(sessionDir, "subagents"),
-      outputDir: join(sessionDir, "subagents", "outputs"),
+      sessionDir: childDir,
+      outputDir,
     });
     state = { manager, registry, ctx, settings };
     const recovered = manager.recoverInterrupted();
@@ -65,7 +79,7 @@ export default function (pi: ExtensionAPI): void {
   pi.on("context", (event) => ({ messages: stripPrivateMessages(event.messages) }));
 
   pi.on("session_shutdown", async () => {
-    await state?.manager.interruptAll();
+    await state?.manager.shutdown();
     await state?.manager.whenIdle();
   });
 
@@ -77,10 +91,10 @@ export default function (pi: ExtensionAPI): void {
       "action=resume continues an existing one in its own context (handle + message); prefer it when the user wants the same subagent to revise its work. " +
       "action=steer guides a running one; interrupt pauses; stop ends it permanently; list shows all.",
     parameters: SubagentsParams,
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       if (!state) throw new Error("pi-subagents is not initialised for this session yet");
       state.ctx = ctx;
-      const out = await executeAction(state.manager, params as SubagentsInput);
+      const out = await executeAction(state.manager, params as SubagentsInput, signal);
       return { content: [{ type: "text", text: out.text }], details: out.details };
     },
   });

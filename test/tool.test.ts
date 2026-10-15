@@ -47,6 +47,28 @@ describe("executeAction", () => {
     expect(out.text).toMatch(/@reviewer\s+reviewer\s+completed/);
   });
 
+  it("aborting the tool signal interrupts running subagents", async () => {
+    let finish!: (v: unknown) => void;
+    const m = fakeManager({
+      interruptAll: vi.fn(async () => {}),
+      run: vi.fn(() => new Promise((resolve) => (finish = resolve))),
+    });
+    const controller = new AbortController();
+    const pending = executeAction(m, { action: "run", agent: "reviewer", task: "x" }, controller.signal);
+    controller.abort();
+    expect(m.interruptAll).toHaveBeenCalledTimes(1);
+    finish({ record, payload: { text: "paused", summary: "paused" } });
+    await pending;
+  });
+
+  it("does not interrupt when the signal is not aborted", async () => {
+    const m = fakeManager({ interruptAll: vi.fn(async () => {}) });
+    const controller = new AbortController();
+    await executeAction(m, { action: "run", agent: "reviewer", task: "x" }, controller.signal);
+    controller.abort();
+    expect(m.interruptAll).toHaveBeenCalledTimes(0);
+  });
+
   it("surfaces SubagentError messages unchanged", async () => {
     const m = fakeManager({ resume: vi.fn(async () => { throw new SubagentError("stopped", "@reviewer was stopped"); }) });
     await expect(executeAction(m, { action: "resume", handle: "reviewer", message: "x" })).rejects.toThrow("@reviewer was stopped");
