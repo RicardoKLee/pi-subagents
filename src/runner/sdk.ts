@@ -1,14 +1,12 @@
-import { type Api, createProvider, type Model } from "@earendil-works/pi-ai";
-import { getApiProvider } from "@earendil-works/pi-ai/compat";
+import type { Model } from "@earendil-works/pi-ai";
 import {
   type AgentSession,
   createAgentSession,
   DefaultResourceLoader,
-  ModelRuntime,
+  type ModelRuntime,
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { join } from "node:path";
 import type { Usage } from "../registry.ts";
 import type { ChildResult, ChildSession, ChildSpec, Runner, StopReason } from "./types.ts";
 
@@ -71,8 +69,6 @@ class SdkChildSession implements ChildSession {
 export class SdkRunner implements Runner {
   readonly kind = "sdk" as const;
 
-  private runtime: ModelRuntime | undefined;
-
   constructor(private readonly opts: { agentDir: string; resolveModel: ModelResolver; modelRuntime?: ModelRuntime }) {}
 
   async open(spec: ChildSpec): Promise<ChildSession> {
@@ -87,8 +83,6 @@ export class SdkRunner implements Runner {
       appendSystemPrompt: spec.appendSystemPrompt,
     });
     await resourceLoader.reload();
-    const modelRuntime = await this.modelRuntime();
-    this.ensureModel(modelRuntime, model);
     const sessionManager = spec.resumeFile ? SessionManager.open(spec.resumeFile) : SessionManager.create(spec.cwd, spec.sessionDir);
     const { session } = await createAgentSession({
       cwd: spec.cwd,
@@ -99,37 +93,8 @@ export class SdkRunner implements Runner {
       sessionManager,
       resourceLoader,
       settingsManager,
-      modelRuntime,
+      ...(this.opts.modelRuntime ? { modelRuntime: this.opts.modelRuntime } : {}),
     });
     return new SdkChildSession(session);
-  }
-
-  private async modelRuntime(): Promise<ModelRuntime> {
-    if (this.opts.modelRuntime) return this.opts.modelRuntime;
-    this.runtime ??= await ModelRuntime.create({
-      authPath: join(this.opts.agentDir, "auth.json"),
-      modelsPath: join(this.opts.agentDir, "models.json"),
-    });
-    return this.runtime;
-  }
-
-  /**
-   * A model the runtime does not know (such as a faux provider injected by a test) still needs a
-   * provider entry so auth preflight and request dispatch can find it. Bridging to the registered
-   * API implementation keeps the model's own transport. Known providers are left untouched.
-   */
-  private ensureModel(runtime: ModelRuntime, model: Model<any>): void {
-    if (runtime.getProvider(model.provider)) return;
-    const api = getApiProvider(model.api as Api);
-    if (!api) throw new Error(`no API implementation registered for "${String(model.api)}"`);
-    runtime.registerNativeProvider(
-      createProvider({
-        id: model.provider,
-        name: model.provider,
-        auth: { apiKey: { name: model.provider, resolve: async () => ({ auth: {} }) } },
-        models: [model],
-        api: { stream: api.stream, streamSimple: api.streamSimple },
-      }),
-    );
   }
 }
