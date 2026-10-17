@@ -80,6 +80,11 @@ describe("Registry", () => {
     expect(rebuilt.create({ ...base, preferredHandle: "reviewer" }).handle).toBe("reviewer-2");
   });
 
+  it("create can start a record as queued", () => {
+    const r = new Registry(() => {}).create({ ...base, preferredHandle: "reviewer", status: "queued" });
+    expect(r.status).toBe("queued");
+  });
+
   it("reload replaces records with the given branch", () => {
     const { registry, persisted } = make();
     const a = registry.create({ ...base, preferredHandle: "a" });

@@ -272,7 +272,8 @@ describe("task 9 fix round 2", () => {
     c.abort();
     await expect(p).rejects.toMatchObject({ code: "interrupted" });
     expect(runner.opened).toHaveLength(1);
-    expect(manager.list()).toHaveLength(1);
+    expect(manager.list()).toHaveLength(2);
+    expect(manager.list()[1]).toMatchObject({ status: "stopped", error: "cancelled before it started" });
     runner.sessions[0]!.finish();
     await manager.whenIdle();
   });
@@ -370,5 +371,89 @@ describe("final fix wave round 2", () => {
     expect((entries[0]![1] as { text: string }).text).toContain("FULLTEXT-");
     const outDir = join(root, "out");
     expect(existsSync(outDir) ? readdirSync(outDir) : []).toHaveLength(0);
+  });
+});
+
+describe("queued runs", () => {
+  it("a run waiting for a slot is listed as queued", async () => {
+    const { manager, runner } = setup({ limit: 1, hold: true });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    const second = manager.run({ agent: "reviewer", task: "y", background: true });
+    expect(manager.list().map((r) => r.status)).toEqual(["running", "queued"]);
+    expect(manager.list()[1]!.handle).toBe("reviewer-2");
+    runner.sessions[0]!.finish();
+    const { record } = await second;
+    expect(record.status).toBe("running");
+    expect(record.sessionFile).toBe(runner.sessions[1]!.sessionFile);
+    runner.sessions[1]!.finish();
+    await manager.whenIdle();
+  });
+
+  it.each(["interrupt", "stop"] as const)("%s cancels a queued run before it starts", async (action) => {
+    const { manager, runner } = setup({ limit: 1, hold: true });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    const second = manager.run({ agent: "reviewer", task: "y", background: true });
+    const rejected = expect(second).rejects.toMatchObject({ code: "stopped" });
+    await manager[action]("reviewer-2");
+    await rejected;
+    expect(manager.list()[1]).toMatchObject({ status: "stopped", error: "cancelled before it started" });
+    expect(runner.opened).toHaveLength(1);
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+  });
+
+  it("resume and steer refuse a queued run", async () => {
+    const { manager, runner } = setup({ limit: 1, hold: true });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    const second = manager.run({ agent: "reviewer", task: "y", background: true });
+    await expect(manager.resume("reviewer-2", "again")).rejects.toMatchObject({ code: "busy" });
+    await expect(manager.steer("reviewer-2", "hint")).rejects.toMatchObject({ code: "not_running" });
+    runner.sessions[0]!.finish();
+    await second;
+    runner.sessions[1]!.finish();
+    await manager.whenIdle();
+  });
+
+  it("recoverInterrupted settles orphaned queued records", () => {
+    const registry = new Registry(() => {});
+    const { manager } = setup({ registry });
+    registry.create({ agent: "reviewer", preferredHandle: "reviewer", runner: "sdk", depth: 1, sessionFile: "", delivery: "auto", task: "x", status: "queued" });
+    expect(manager.recoverInterrupted()).toBe(1);
+    expect(registry.resolve("reviewer")).toMatchObject({ status: "stopped", error: "interrupted by reload or restart before it started" });
+  });
+
+  it("shutdown settles a queued run as failed", async () => {
+    const { manager } = setup({ limit: 1, hold: true });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    const second = manager.run({ agent: "reviewer", task: "y", background: true });
+    const rejected = expect(second).rejects.toThrow();
+    await manager.shutdown();
+    await rejected;
+    expect(manager.list()[1]).toMatchObject({ status: "failed", error: "cut off by shutdown before it started" });
+    await manager.whenIdle();
+  });
+
+  it("a run whose session fails to open is recorded as failed", async () => {
+    const { manager } = setup({ failOpenAt: 0 });
+    await expect(manager.run({ agent: "reviewer", task: "x" })).rejects.toThrow("open failed");
+    expect(manager.list()[0]).toMatchObject({ status: "failed", error: "open failed", sessionFile: "" });
+    await expect(manager.resume("reviewer", "again")).rejects.toMatchObject({ code: "missing_session" });
+  });
+
+  it("does not create a record when subagents are disabled", async () => {
+    const { manager } = setup({ limit: 0 });
+    await expect(manager.run({ agent: "reviewer", task: "x" })).rejects.toThrow(/disabled/);
+    expect(manager.list()).toHaveLength(0);
+  });
+
+  it("activeRecords includes queued runs", async () => {
+    const { manager, runner } = setup({ limit: 1, hold: true });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    const second = manager.run({ agent: "reviewer", task: "y", background: true });
+    expect(manager.activeRecords().map((r) => r.status).sort()).toEqual(["queued", "running"]);
+    runner.sessions[0]!.finish();
+    await second;
+    runner.sessions[1]!.finish();
+    await manager.whenIdle();
   });
 });

@@ -26,6 +26,11 @@ export class Scheduler {
     return this.waiters.length;
   }
 
+  /** True when the limit is 0 (subagents disabled). */
+  get disabled(): boolean {
+    return this.getLimit() === 0;
+  }
+
   acquire(signal?: AbortSignal): Promise<() => void> {
     if (this.getLimit() === 0) return Promise.reject(new SubagentsDisabledError());
     if (signal?.aborted) return Promise.reject(new Error("aborted while waiting for a slot"));

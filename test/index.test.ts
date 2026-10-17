@@ -60,7 +60,8 @@ describe("rebuildForBranch", () => {
   it("rebuildForBranch pauses records left running on the new branch", async () => {
     const { manager, registry, runner, persisted } = setup();
     const { record } = await manager.run({ agent: "reviewer", task: "x", background: true });
-    const runningEntry = persisted[0]!;
+    // The first persisted entry is now the queued record; the branch snapshot is the one taken once it started.
+    const runningEntry = persisted.find((e) => e.data.status === "running")!;
     expect(runningEntry.data.status).toBe("running");
     runner.sessions[0]!.finish();
     await manager.whenIdle();
@@ -85,7 +86,7 @@ describe("rebuildForBranch", () => {
   it("rebuildForBranch explains why a record was paused", async () => {
     const { manager, registry, runner, persisted } = setup();
     const { record } = await manager.run({ agent: "reviewer", task: "x", background: true });
-    const runningEntry = persisted[0]!;
+    const runningEntry = persisted.find((e) => e.data.status === "running")!;
     runner.sessions[0]!.finish();
     await manager.whenIdle();
     rebuildForBranch(manager, registry, [runningEntry]);

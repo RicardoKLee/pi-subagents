@@ -5,7 +5,7 @@ import type { DeliveryMode, RunnerKind } from "./settings.ts";
 
 export const REGISTRY_ENTRY_TYPE = "pi-subagents/registry";
 
-export type RunStatus = "running" | "paused" | "completed" | "failed" | "stopped";
+export type RunStatus = "queued" | "running" | "paused" | "completed" | "failed" | "stopped";
 
 export interface Usage {
   input: number;
@@ -46,6 +46,8 @@ export interface NewRecord {
   sessionFile: string;
   delivery: DeliveryMode;
   task: string;
+  /** "queued" while the run waits for a slot and a child session; defaults to "running". */
+  status?: "queued" | "running";
 }
 
 export type RecordPatch = Partial<
@@ -99,7 +101,7 @@ export class Registry {
       depth: input.depth,
       sessionFile: input.sessionFile,
       runId: 1,
-      status: "running",
+      status: input.status ?? "running",
       delivery: input.delivery,
       task: input.task,
       createdAt: t,

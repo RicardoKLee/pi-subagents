@@ -4,7 +4,7 @@ import { deliver, type DeliveryPort } from "./delivery.ts";
 import { type Payload, preparePayload, SUMMARY_INSTRUCTION } from "./output.ts";
 import type { Registry, RunStatus, SubagentRecord } from "./registry.ts";
 import type { ChildResult, ChildSession, Runner } from "./runner/types.ts";
-import type { Scheduler } from "./scheduler.ts";
+import { type Scheduler, SubagentsDisabledError } from "./scheduler.ts";
 import type { DeliveryMode, RunnerKind, SubagentSettings } from "./settings.ts";
 
 export type SubagentErrorCode = "unknown_agent" | "unknown_handle" | "stopped" | "busy" | "not_running" | "missing_session" | "interrupted";
@@ -57,6 +57,8 @@ export class SubagentManager {
   private readonly work = new Set<Promise<unknown>>();
   /** Resumes that claimed a record but have not reached execute() yet. */
   private readonly claims = new Map<string, { intent?: "stop"; controller: AbortController }>();
+  /** Runs that have a record but no child session yet (waiting for a slot or opening); aborting cancels them. */
+  private readonly queued = new Map<string, AbortController>();
   private closed = false;
   /** Aborted on shutdown so queued run/resume calls stop waiting for a slot. */
   private readonly lifetime = new AbortController();
@@ -69,23 +71,39 @@ export class SubagentManager {
 
   /** Records with a live child or a pending resume claim; these must survive a branch switch. */
   activeRecords(): SubagentRecord[] {
-    const ids = new Set([...this.live.keys(), ...this.claims.keys()]);
+    const ids = new Set([...this.live.keys(), ...this.claims.keys(), ...this.queued.keys()]);
     return [...ids].map((id) => this.deps.registry.get(id)).filter((r): r is SubagentRecord => r !== undefined);
   }
 
   async run(req: RunRequest): Promise<RunOutcome> {
     if (this.closed) throw shutDownError();
+    if (this.deps.scheduler.disabled) throw new SubagentsDisabledError();
     const agent = this.requireAgent(req.agent);
     const runner = this.requireRunner(agent.runner ?? this.deps.settings().defaultRunner);
     // Runs started by the main agent's tool are always auto; `delivery` is only passed by internal callers.
     const delivery = req.delivery ?? "auto";
     const signal = req.signal;
+    // The record exists from the start so a run waiting for a slot is listed and can be cancelled by handle.
+    const queuedRecord = this.deps.registry.create({
+      agent: agent.name,
+      preferredHandle: agent.handle ?? agent.name,
+      runner: runner.kind,
+      depth: 1,
+      sessionFile: "",
+      delivery,
+      task: req.task,
+      status: "queued",
+    });
+    const id = queuedRecord.id;
+    const controller = new AbortController();
+    this.queued.set(id, controller);
+    const cancel = AbortSignal.any([this.lifetime.signal, controller.signal, ...(signal ? [signal] : [])]);
     let release: () => void;
     try {
-      release = await this.deps.scheduler.acquire(signal ? AbortSignal.any([this.lifetime.signal, signal]) : this.lifetime.signal);
+      release = await this.deps.scheduler.acquire(cancel);
     } catch (error) {
-      if (!this.closed && signal?.aborted) throw runInterruptedError();
-      throw error;
+      this.queued.delete(id);
+      throw this.settleQueued(id, error, signal);
     }
     let session: ChildSession;
     try {
@@ -96,31 +114,19 @@ export class SubagentManager {
         appendSystemPrompt: [agent.systemPrompt, SUMMARY_INSTRUCTION].filter(Boolean),
       });
     } catch (error) {
+      this.queued.delete(id);
       release();
-      throw error;
+      throw this.settleQueued(id, error, signal);
     }
-    if (this.closed) {
-      // Shutdown happened while the session was opening; do not register a record on a dead session.
-      release();
-      await session.dispose().catch(() => {});
-      throw shutDownError();
-    }
-    if (signal?.aborted) {
-      // The calling tool was aborted while the session was opening.
+    this.queued.delete(id);
+    if (this.closed || controller.signal.aborted || signal?.aborted) {
+      // Shutdown, a cancel by handle, or the calling tool's abort happened while the session was opening.
       release();
       await session.dispose().catch(() => {});
-      throw runInterruptedError();
+      throw this.settleQueued(id, this.closed ? shutDownError() : runInterruptedError(), signal);
     }
-    const record = this.deps.registry.create({
-      agent: agent.name,
-      preferredHandle: agent.handle ?? agent.name,
-      runner: runner.kind,
-      depth: 1,
-      sessionFile: session.sessionFile,
-      delivery,
-      task: req.task,
-    });
-    return this.execute(record, session, req.task, release, req.background ?? false, signal);
+    const running = this.deps.registry.update(id, { status: "running", sessionFile: session.sessionFile });
+    return this.execute(running, session, req.task, release, req.background ?? false, signal);
   }
 
   async resume(
@@ -131,9 +137,11 @@ export class SubagentManager {
     if (this.closed) throw shutDownError();
     const record = this.requireRecord(handle);
     if (record.status === "stopped") throw new SubagentError("stopped", `@${record.handle} was stopped and cannot be resumed; start a new subagent instead`);
+    if (record.status === "queued") throw new SubagentError("busy", `@${record.handle} is queued and has not started yet`);
     if (record.status === "running" || this.live.has(record.id)) {
       throw new SubagentError("busy", `@${record.handle} is still running; use steer to guide it`);
     }
+    if (!record.sessionFile) throw new SubagentError("missing_session", `@${record.handle} never started, so there is no session to resume`);
     if (!existsSync(record.sessionFile)) {
       throw new SubagentError("missing_session", `session file for @${record.handle} is missing: ${record.sessionFile}`);
     }
@@ -217,6 +225,7 @@ export class SubagentManager {
 
   async steer(handle: string, message: string, mode: "steer" | "followUp" = "steer"): Promise<void> {
     const record = this.requireRecord(handle);
+    if (record.status === "queued") throw new SubagentError("not_running", `@${record.handle} is queued and has not started yet`);
     const live = this.live.get(record.id);
     if (!live) throw new SubagentError("not_running", `@${record.handle} is ${record.status}; use resume to continue it`);
     await live.session.steer(message, mode);
@@ -224,6 +233,7 @@ export class SubagentManager {
 
   async interrupt(handle: string): Promise<void> {
     const record = this.requireRecord(handle);
+    if (this.cancelQueued(record)) return;
     const live = this.live.get(record.id);
     if (!live) throw new SubagentError("not_running", `@${record.handle} is ${record.status}`);
     live.intent = "interrupt";
@@ -232,6 +242,7 @@ export class SubagentManager {
 
   async stop(handle: string): Promise<void> {
     const record = this.requireRecord(handle);
+    if (this.cancelQueued(record)) return;
     const claim = this.claims.get(record.id);
     if (claim) {
       // A resume is still waiting for a slot or a session; cancel it.
@@ -262,12 +273,17 @@ export class SubagentManager {
     await this.interruptAll();
   }
 
-  /** After /reload, restart or a branch switch no child is live for these records; any "running" one was cut off. */
+  /** After /reload, restart or a branch switch no child is live for these records; settle the ones that were cut off. */
   recoverInterrupted(reason = "interrupted by reload or restart"): number {
     let count = 0;
     for (const r of this.deps.registry.list()) {
-      if (r.status === "running" && !this.live.has(r.id) && !this.claims.has(r.id)) {
+      if (this.live.has(r.id) || this.claims.has(r.id) || this.queued.has(r.id)) continue;
+      if (r.status === "running") {
         this.deps.registry.update(r.id, { status: "paused", error: reason });
+        count++;
+      } else if (r.status === "queued") {
+        // It never got a child session, so there is nothing to resume.
+        this.deps.registry.update(r.id, { status: "stopped", error: `${reason} before it started` });
         count++;
       }
     }
@@ -376,6 +392,35 @@ export class SubagentManager {
       }
     }
     return { record, payload };
+  }
+
+  /** Interrupt or stop on a run still waiting for a slot or a session: nothing has started, so it is cancelled for good. */
+  private cancelQueued(record: SubagentRecord): boolean {
+    const controller = this.queued.get(record.id);
+    if (!controller) return false;
+    this.deps.registry.update(record.id, { status: "stopped", error: "cancelled before it started" });
+    controller.abort();
+    return true;
+  }
+
+  /** Records why a run never reached its child session and returns the error the caller should see. */
+  private settleQueued(id: string, cause: unknown, signal?: AbortSignal): unknown {
+    const record = this.deps.registry.get(id);
+    try {
+      if (record?.status === "stopped") return new SubagentError("stopped", `@${record.handle} was cancelled before it started`);
+      if (this.closed) {
+        this.deps.registry.update(id, { status: "failed", error: "cut off by shutdown before it started" });
+        return cause;
+      }
+      if (signal?.aborted) {
+        this.deps.registry.update(id, { status: "stopped", error: "cancelled before it started" });
+        return runInterruptedError();
+      }
+      this.deps.registry.update(id, { status: "failed", error: cause instanceof Error ? cause.message : String(cause) });
+    } catch {
+      // Persisting can fail once the main session is gone; the caller still gets the original error.
+    }
+    return cause;
   }
 
   private markStopped(id: string): void {
