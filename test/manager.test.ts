@@ -1,0 +1,364 @@
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it, vi } from "vitest";
+import type { AgentDef } from "../src/agents.ts";
+import type { DeliveryPort } from "../src/delivery.ts";
+import { SubagentError, SubagentManager } from "../src/manager.ts";
+import { Registry } from "../src/registry.ts";
+import type { ChildResult } from "../src/runner/types.ts";
+import { Scheduler } from "../src/scheduler.ts";
+import { DEFAULT_SETTINGS } from "../src/settings.ts";
+import { FakeRunner, FakeSession, usage } from "./fakes.ts";
+
+const reviewer: AgentDef = { name: "reviewer", description: "r", systemPrompt: "Review.", source: "user", filePath: "/a/reviewer.md" };
+
+function setup(
+  opts: {
+    scripts?: ChildResult[][];
+    hold?: boolean;
+    contextWindow?: number;
+    registry?: Registry;
+    limit?: number;
+    outputDir?: string;
+    port?: DeliveryPort;
+    /** Zero-based open index at which FakeRunner.open rejects with "open failed". */
+    failOpenAt?: number;
+  } = {},
+) {
+  const root = mkdtempSync(join(tmpdir(), "mgr-"));
+  const scripts = opts.scripts ?? [];
+  const runner = new FakeRunner((spec, n) => {
+    if (n === opts.failOpenAt) throw new Error("open failed");
+    const file = spec.resumeFile ?? join(root, `child-${n}.jsonl`);
+    writeFileSync(file, "", { flag: "a" });
+    return new FakeSession(file, scripts[n] ?? [], opts.hold ?? false);
+  });
+  const sent: Parameters<DeliveryPort["sendMessage"]>[] = [];
+  const entries: Parameters<DeliveryPort["appendEntry"]>[] = [];
+  const manager = new SubagentManager({
+    registry: opts.registry ?? new Registry(() => {}),
+    scheduler: new Scheduler(() => opts.limit ?? 4),
+    runners: { sdk: runner, rpc: undefined },
+    agents: () => new Map([["reviewer", reviewer]]),
+    settings: () => DEFAULT_SETTINGS,
+    port: opts.port ?? { sendMessage: (...args) => sent.push(args), appendEntry: (...args) => entries.push(args) },
+    receiverContextWindow: () => opts.contextWindow ?? 200000,
+    cwd: root,
+    sessionDir: join(root, "sessions"),
+    outputDir: opts.outputDir ?? join(root, "out"),
+  });
+  return { manager, runner, sent, entries, root };
+}
+
+const ok = (text: string): ChildResult => ({ text, stopReason: "stop", usage: usage() });
+
+describe("SubagentManager.run", () => {
+  it("runs in the foreground and returns the payload", async () => {
+    const { manager, runner } = setup({ scripts: [[ok("LGTM")]] });
+    const { record, payload } = await manager.run({ agent: "reviewer", task: "review diff" });
+    expect(payload?.text).toBe("LGTM");
+    expect(record).toMatchObject({ handle: "reviewer", status: "completed", runId: 1 });
+    expect(record.usage.cost).toBeCloseTo(0.01);
+    expect(runner.opened[0]!.appendSystemPrompt.join("\n")).toContain("<summary>");
+    expect(runner.sessions[0]!.disposed).toBe(true);
+  });
+
+  it("rejects an unknown agent with the available names", async () => {
+    const { manager } = setup();
+    await expect(manager.run({ agent: "nobody", task: "x" })).rejects.toThrow(/reviewer/);
+  });
+
+  it("marks a run failed on error stop reason", async () => {
+    const { manager } = setup({ scripts: [[{ text: "", stopReason: "error", errorMessage: "rate limited", usage: usage(0) }]] });
+    const { record } = await manager.run({ agent: "reviewer", task: "x" });
+    expect(record.status).toBe("failed");
+    expect(record.error).toBe("rate limited");
+  });
+
+  it("marks a run failed on an empty answer", async () => {
+    const { manager } = setup({ scripts: [[ok("   ")]] });
+    const { record } = await manager.run({ agent: "reviewer", task: "x" });
+    expect(record.status).toBe("failed");
+    expect(record.error).toMatch(/empty/);
+  });
+
+  it("moves large output to a file for the receiver", async () => {
+    const { manager } = setup({ scripts: [[ok("z".repeat(4000))]], contextWindow: 1000 });
+    const { payload } = await manager.run({ agent: "reviewer", task: "x" });
+    expect(payload?.filePath).toBeDefined();
+  });
+});
+
+describe("SubagentManager.resume", () => {
+  it("continues the same session and accumulates usage", async () => {
+    const { manager, runner } = setup({ scripts: [[ok("first")], [ok("second")]] });
+    const first = await manager.run({ agent: "reviewer", task: "x" });
+    const second = await manager.resume("reviewer", "look again");
+    expect(second.payload?.text).toBe("second");
+    expect(second.record.id).toBe(first.record.id);
+    expect(second.record.runId).toBe(2);
+    expect(second.record.usage.cost).toBeCloseTo(0.02);
+    expect(runner.opened[1]!.resumeFile).toBe(first.record.sessionFile);
+    expect(runner.sessions[1]!.prompts).toEqual(["look again"]);
+  });
+
+  it("resume unknown handle lists known handles", async () => {
+    const { manager } = setup({ scripts: [[ok("a")]] });
+    await manager.run({ agent: "reviewer", task: "x" });
+    await expect(manager.resume("ghost", "hi")).rejects.toMatchObject({ code: "unknown_handle", message: expect.stringContaining("reviewer") });
+  });
+
+  it("resume stopped is rejected", async () => {
+    const { manager } = setup({ scripts: [[ok("a")]] });
+    await manager.run({ agent: "reviewer", task: "x" });
+    await manager.stop("reviewer");
+    await expect(manager.resume("reviewer", "hi")).rejects.toMatchObject({ code: "stopped" });
+  });
+
+  it("resume missing session file is rejected", async () => {
+    const { manager } = setup({ scripts: [[ok("a")]] });
+    const { record } = await manager.run({ agent: "reviewer", task: "x" });
+    rmSync(record.sessionFile);
+    await expect(manager.resume("reviewer", "hi")).rejects.toMatchObject({ code: "missing_session" });
+  });
+
+  it("concurrent resume rejected while running", async () => {
+    const { manager, runner } = setup({ hold: true });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    await expect(manager.resume("reviewer", "again")).rejects.toMatchObject({ code: "busy" });
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+  });
+});
+
+describe("steer / interrupt / stop / background", () => {
+  it("steers a running child", async () => {
+    const { manager, runner } = setup({ hold: true });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    await manager.steer("reviewer", "focus on tests");
+    expect(runner.sessions[0]!.steers).toEqual([{ text: "focus on tests", mode: "steer" }]);
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+  });
+
+  it("steer on a finished child says not_running", async () => {
+    const { manager } = setup({ scripts: [[ok("a")]] });
+    await manager.run({ agent: "reviewer", task: "x" });
+    await expect(manager.steer("reviewer", "hi")).rejects.toMatchObject({ code: "not_running" });
+  });
+
+  it("interrupt pauses and the record can be resumed", async () => {
+    const { manager, runner } = setup({ hold: true });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    await manager.interrupt("reviewer");
+    await manager.whenIdle();
+    expect(manager.list()[0]!.status).toBe("paused");
+    expect(runner.sessions[0]!.aborted).toBe(1);
+    const resumed = manager.resume("reviewer", "continue", { background: true });
+    await resumed;
+    runner.sessions[1]!.finish();
+    await manager.whenIdle();
+    expect(manager.list()[0]!.status).toBe("completed");
+  });
+
+  it("stop marks a running child stopped, not paused", async () => {
+    const { manager, runner } = setup({ hold: true });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    await manager.stop("reviewer");
+    await manager.whenIdle();
+    expect(manager.list()[0]!.status).toBe("stopped");
+    expect(runner.sessions[0]!.disposed).toBe(true);
+  });
+
+  it("recoverInterrupted marks orphaned running records paused", () => {
+    const registry = new Registry(() => {});
+    registry.create({ agent: "reviewer", preferredHandle: "reviewer", runner: "sdk", depth: 1, sessionFile: "/x.jsonl", delivery: "share", task: "x" });
+    const { manager } = setup({ registry });
+    expect(manager.recoverInterrupted()).toBe(1);
+    expect(manager.list()[0]!.status).toBe("paused");
+  });
+
+  it("background run delivers through the record's mode", async () => {
+    const { manager, sent, entries } = setup({ scripts: [[ok("done!")]] });
+    const { payload } = await manager.run({ agent: "reviewer", task: "x", background: true, delivery: "private" });
+    expect(payload).toBeUndefined();
+    await manager.whenIdle();
+    expect(sent).toHaveLength(0);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]![0]).toBe("pi-subagents/private");
+    expect((entries[0]![1] as { text: string }).text).toContain("done!");
+  });
+});
+
+describe("fix round 1", () => {
+  it("stop while resume waits for a slot keeps the record stopped", async () => {
+    const registry = new Registry(() => {});
+    const { manager, runner } = setup({ limit: 1, hold: true, registry });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    await manager.interrupt("reviewer");
+    await manager.whenIdle();
+    expect(registry.resolve("reviewer")!.status).toBe("paused");
+    await manager.run({ agent: "reviewer", task: "y", background: true });
+    const p = manager.resume("reviewer", "again", { background: true });
+    await manager.stop("reviewer");
+    await expect(p).rejects.toMatchObject({ code: "stopped" });
+    expect(registry.resolve("reviewer")!.status).toBe("stopped");
+    expect(runner.opened).toHaveLength(2);
+    runner.sessions[1]!.finish();
+    await manager.whenIdle();
+  });
+
+  it("marks the run failed when result handling throws", async () => {
+    const root = mkdtempSync(join(tmpdir(), "mgr-file-"));
+    const blocker = join(root, "blocker");
+    writeFileSync(blocker, "");
+    const { manager } = setup({ scripts: [[ok("z".repeat(4000))]], contextWindow: 1000, outputDir: join(blocker, "out") });
+    const { record } = await manager.run({ agent: "reviewer", task: "x" });
+    expect(record.status).toBe("failed");
+    expect(record.error).toMatch(/result handling failed/);
+  });
+
+  it("keeps the status and records the error when delivery fails", async () => {
+    const port: DeliveryPort = {
+      sendMessage: () => {
+        throw new Error("port down");
+      },
+      appendEntry: () => {},
+    };
+    const { manager } = setup({ scripts: [[ok("done!")]], port });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    await manager.whenIdle();
+    const record = manager.list()[0]!;
+    expect(record.status).toBe("completed");
+    expect(record.error).toMatch(/delivery failed: port down/);
+  });
+
+  it("failed resume restores delivery and error", async () => {
+    const { manager } = setup({ failOpenAt: 1, scripts: [[{ text: "", stopReason: "error", errorMessage: "rate limited", usage: usage(0) }]] });
+    const { record } = await manager.run({ agent: "reviewer", task: "x" });
+    expect(record.status).toBe("failed");
+    await expect(manager.resume("reviewer", "x", { delivery: "private" })).rejects.toThrow("open failed");
+    expect(manager.list()[0]).toMatchObject({ status: "failed", runId: 1, delivery: "share", error: "rate limited" });
+  });
+});
+
+describe("task 9 fix round 1", () => {
+  it("shutdown cancels a run waiting for a slot", async () => {
+    const { manager, runner } = setup({ limit: 1, hold: true });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    const second = manager.run({ agent: "reviewer", task: "y", background: true });
+    const rejected = expect(second).rejects.toThrow();
+    await manager.shutdown();
+    await rejected;
+    expect(runner.opened).toHaveLength(1);
+    expect(runner.sessions[0]!.aborted).toBe(1);
+    await manager.whenIdle();
+  });
+
+  it("rejects new runs after shutdown", async () => {
+    const { manager } = setup();
+    await manager.shutdown();
+    await expect(manager.run({ agent: "reviewer", task: "x" })).rejects.toThrow(/shut down/);
+  });
+});
+
+describe("task 9 fix round 2", () => {
+  it("aborting a queued foreground run rejects it without opening a session", async () => {
+    const { manager, runner } = setup({ limit: 1, hold: true });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    const c = new AbortController();
+    const p = manager.run({ agent: "reviewer", task: "y", signal: c.signal });
+    c.abort();
+    await expect(p).rejects.toMatchObject({ code: "interrupted" });
+    expect(runner.opened).toHaveLength(1);
+    expect(manager.list()).toHaveLength(1);
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+  });
+
+  it("aborting a running foreground run pauses only that run", async () => {
+    const { manager, runner } = setup({ hold: true });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    const c = new AbortController();
+    const b = manager.run({ agent: "reviewer", task: "y", signal: c.signal });
+    await vi.waitFor(() => expect(runner.sessions).toHaveLength(2));
+    c.abort();
+    const { record } = await b;
+    expect(record.status).toBe("paused");
+    expect(runner.sessions[0]!.aborted).toBe(0);
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+  });
+
+  it("aborting a queued resume rolls the record back", async () => {
+    const registry = new Registry(() => {});
+    const { manager, runner } = setup({ limit: 1, hold: true, registry });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    await manager.interrupt("reviewer");
+    await manager.whenIdle();
+    expect(registry.resolve("reviewer")!.status).toBe("paused");
+    await manager.run({ agent: "reviewer", task: "y", background: true });
+    const c = new AbortController();
+    const p = manager.resume("reviewer", "again", { background: true, signal: c.signal });
+    c.abort();
+    await expect(p).rejects.toMatchObject({ code: "interrupted" });
+    expect(registry.resolve("reviewer")).toMatchObject({ status: "paused", runId: 1 });
+    runner.sessions[1]!.finish();
+    await manager.whenIdle();
+  });
+});
+
+describe("final fix wave", () => {
+  it("activeRecords returns running and resuming records", async () => {
+    const { manager, runner } = setup({ hold: true });
+    const { record } = await manager.run({ agent: "reviewer", task: "x", background: true });
+    const active = manager.activeRecords();
+    expect(active).toHaveLength(1);
+    expect(active[0]!.id).toBe(record.id);
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+    expect(manager.activeRecords()).toHaveLength(0);
+  });
+
+  it("background share delivers summary and file path, not the full text", async () => {
+    const { manager, sent, root } = setup({ scripts: [[ok("FULLTEXT-" + "x".repeat(50) + "\n<summary>short</summary>")]] });
+    await manager.run({ agent: "reviewer", task: "x", background: true, delivery: "share" });
+    await manager.whenIdle();
+    expect(sent).toHaveLength(1);
+    const message = sent[0]![0];
+    expect(message.content).toContain("short");
+    expect(message.content).not.toContain("FULLTEXT-");
+    const filePath = (message.details as { filePath?: string }).filePath;
+    expect(filePath).toBeDefined();
+    expect(readFileSync(filePath!, "utf8").startsWith("FULLTEXT-")).toBe(true);
+    expect(readdirSync(join(root, "out"))).toHaveLength(1);
+  });
+
+  it("keeps the root cause when delivery of a failed run fails", async () => {
+    const port: DeliveryPort = {
+      sendMessage: () => {
+        throw new Error("port down");
+      },
+      appendEntry: () => {},
+    };
+    const { manager } = setup({ scripts: [[{ text: "", stopReason: "error", errorMessage: "rate limited", usage: usage(0) }]], port });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    await manager.whenIdle();
+    const record = manager.list()[0]!;
+    expect(record.status).toBe("failed");
+    expect(record.error).toBe("rate limited; delivery failed: port down");
+  });
+});
+
+describe("final fix wave round 2", () => {
+  it("background private keeps short results inline", async () => {
+    const { manager, entries, root } = setup({ scripts: [[ok("FULLTEXT-" + "x".repeat(50))]] });
+    await manager.run({ agent: "reviewer", task: "x", background: true, delivery: "private" });
+    await manager.whenIdle();
+    expect(entries).toHaveLength(1);
+    expect((entries[0]![1] as { text: string }).text).toContain("FULLTEXT-");
+    const outDir = join(root, "out");
+    expect(existsSync(outDir) ? readdirSync(outDir) : []).toHaveLength(0);
+  });
+});
