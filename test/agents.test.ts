@@ -30,7 +30,14 @@ describe("parseAgentFile", () => {
       "user",
     );
     expect(warning).toBeUndefined();
-    expect(agent).toMatchObject({ thinking: "low", runner: "rpc", delivery: "private", handle: "sc", allowedSubagents: ["explore", "oracle"] });
+    expect(agent).toMatchObject({ thinking: "low", runner: "rpc", handle: "sc", allowedSubagents: ["explore", "oracle"] });
+    expect(agent).not.toHaveProperty("delivery");
+  });
+
+  it("ignores a delivery field in frontmatter", () => {
+    const { agent, warning } = parseAgentFile(md("name: a\ndescription: d\ndelivery: private"), "/a/a.md", "user");
+    expect(warning).toBeUndefined();
+    expect(agent).not.toHaveProperty("delivery");
   });
 
   it("keeps an explicit empty allowed_subagents list", () => {

@@ -77,7 +77,8 @@ export class SubagentManager {
     if (this.closed) throw shutDownError();
     const agent = this.requireAgent(req.agent);
     const runner = this.requireRunner(agent.runner ?? this.deps.settings().defaultRunner);
-    const delivery = req.delivery ?? agent.delivery ?? this.deps.settings().defaultDelivery;
+    // Runs started by the main agent's tool are always auto; `delivery` is only passed by internal callers.
+    const delivery = req.delivery ?? "auto";
     const signal = req.signal;
     let release: () => void;
     try {

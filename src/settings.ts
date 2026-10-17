@@ -10,22 +10,26 @@ export interface SubagentSettings {
   maxChildrenPerParent: number;
   /** Maximum nesting depth (used from M6). Same value rules. */
   maxDepth: number;
+  /** Delivery for `@handle` messages without a symbol. Background runs started by the main agent are always auto. */
   defaultDelivery: DeliveryMode;
   defaultRunner: RunnerKind;
   /** Fraction of the receiver's context window above which output goes to a file. */
   contextRatio: number;
-  /** Minutes a queued child result may wait before the user is reminded (used from M2). */
+  /** Minutes a queued child result may wait before the user is reminded (used from M6). */
   pendingResultTimeoutMinutes: number;
+  /** Longest user message quoted with an `@` result; longer messages are truncated with a note. */
+  mentionQuoteMaxChars: number;
 }
 
 export const DEFAULT_SETTINGS: SubagentSettings = Object.freeze({
   maxConcurrent: 4,
   maxChildrenPerParent: 4,
   maxDepth: 2,
-  defaultDelivery: "share",
+  defaultDelivery: "auto",
   defaultRunner: "sdk",
   contextRatio: 0.3,
   pendingResultTimeoutMinutes: 30,
+  mentionQuoteMaxChars: 2000,
 });
 
 const LIMIT_KEYS = ["maxConcurrent", "maxChildrenPerParent", "maxDepth"] as const;
@@ -71,6 +75,12 @@ export function parseSettings(raw: unknown): { settings: SubagentSettings; warni
     const value = input.pendingResultTimeoutMinutes;
     if (typeof value === "number" && value > 0) settings.pendingResultTimeoutMinutes = value;
     else warnings.push(`pendingResultTimeoutMinutes must be > 0; using ${DEFAULT_SETTINGS.pendingResultTimeoutMinutes}`);
+  }
+
+  if (input.mentionQuoteMaxChars !== undefined) {
+    const value = input.mentionQuoteMaxChars;
+    if (typeof value === "number" && Number.isInteger(value) && value > 0) settings.mentionQuoteMaxChars = value;
+    else warnings.push(`mentionQuoteMaxChars must be a positive integer; using ${DEFAULT_SETTINGS.mentionQuoteMaxChars}`);
   }
 
   return { settings, warnings };

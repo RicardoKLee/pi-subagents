@@ -1,8 +1,8 @@
 import { type Static, Type } from "typebox";
 import type { SubagentManager } from "./manager.ts";
 
-const Delivery = Type.Union([Type.Literal("private"), Type.Literal("share"), Type.Literal("auto")]);
-
+// TODO(delivery): background results from the main agent are always delivered with "auto". Add a `delivery`
+// parameter back if a use case appears (plan section 6.5 item 4).
 export const SubagentsParams = Type.Object({
   action: Type.Union(
     [
@@ -19,7 +19,6 @@ export const SubagentsParams = Type.Object({
   task: Type.Optional(Type.String({ description: "Task for a new subagent (run)" })),
   handle: Type.Optional(Type.String({ description: "Existing subagent handle, e.g. reviewer-2 (resume/steer/interrupt/stop)" })),
   message: Type.Optional(Type.String({ description: "Message for resume or steer" })),
-  delivery: Type.Optional(Delivery),
   background: Type.Optional(Type.Boolean({ description: "Return immediately; the result arrives later" })),
   mode: Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("followUp")])),
 });
@@ -55,14 +54,19 @@ async function dispatch(
   signal?: AbortSignal,
 ): Promise<{ text: string; details: Record<string, unknown> }> {
   // `signal` is only added when present so callers without one see the same arguments as before.
+  // Background work started by the main agent always comes back with "auto": it started the work to use the result.
   const extra = {
-    ...(input.delivery ? { delivery: input.delivery } : {}),
-    ...(input.background ? { background: true } : {}),
+    ...(input.background ? { background: true, delivery: "auto" as const } : {}),
     ...(signal ? { signal } : {}),
   };
   switch (input.action) {
     case "run": {
-      const { record, payload } = await manager.run({ agent: need(input.agent, "agent", "run"), task: need(input.task, "task", "run"), ...extra });
+      const { record, payload } = await manager.run({
+        agent: need(input.agent, "agent", "run"),
+        task: need(input.task, "task", "run"),
+        ...(input.background ? { background: true } : {}),
+        ...(signal ? { signal } : {}),
+      });
       const body = payload ? payload.text : "Started in the background; the result will be delivered when it finishes.";
       return { text: `@${record.handle} (${record.status}). Reuse it with action "resume".\n\n${body}`, details: { handle: record.handle, status: record.status } };
     }

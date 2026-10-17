@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { SubagentError, type SubagentManager } from "../src/manager.ts";
-import { executeAction } from "../src/tool.ts";
+import { executeAction, SubagentsParams } from "../src/tool.ts";
 
 const record = { id: "1", handle: "reviewer", agent: "reviewer", status: "completed", runId: 1, usage: { cost: 0.01 } };
 
@@ -81,5 +81,15 @@ describe("executeAction", () => {
   it("surfaces SubagentError messages unchanged", async () => {
     const m = fakeManager({ resume: vi.fn(async () => { throw new SubagentError("stopped", "@reviewer was stopped"); }) });
     await expect(executeAction(m, { action: "resume", handle: "reviewer", message: "x" })).rejects.toThrow("@reviewer was stopped");
+  });
+
+  it("does not expose a delivery parameter", () => {
+    expect(Object.keys(SubagentsParams.properties)).not.toContain("delivery");
+  });
+
+  it("background resume from the tool always uses auto", async () => {
+    const m = fakeManager();
+    await executeAction(m, { action: "resume", handle: "reviewer", message: "again", background: true });
+    expect(m.resume).toHaveBeenCalledWith("reviewer", "again", { background: true, delivery: "auto" });
   });
 });

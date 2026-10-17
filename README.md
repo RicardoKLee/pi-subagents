@@ -13,7 +13,7 @@ pi -e /sandbox/temp/extensions/subagents/src/index.ts
 ```
 
 Agents are Markdown files with frontmatter in `~/.pi/agent/agents/*.md`
-(`name` and `description` are required; optional `model`, `thinking`, `tools`, `handle`, `runner`, `delivery`).
+(`name` and `description` are required; optional `model`, `thinking`, `tools`, `handle`, `runner`).
 
 ## Settings
 
@@ -24,17 +24,18 @@ Optional file `~/.pi/agent/subagents.json`. Missing file means defaults; invalid
 | `maxConcurrent` | `4` | Children running at the same time. Positive = limit, `0` = none allowed, `-1` = unlimited. Extra runs wait for a slot. |
 | `maxChildrenPerParent` | `4` | Same value rules. Read and validated, enforced from M6 (nesting). |
 | `maxDepth` | `2` | Same value rules. Read and validated, enforced from M6 (nesting). |
-| `defaultDelivery` | `"share"` | `private`, `share` or `auto` (see below). |
+| `defaultDelivery` | `"auto"` | `private`, `share` or `auto`. Used for `@handle` messages without a symbol (M2). Background runs started by the main agent always use `auto`. |
 | `defaultRunner` | `"sdk"` | `sdk` or `rpc`. Only `sdk` exists in M1; `rpc` makes runs fail with "not available". |
 | `contextRatio` | `0.3` | In `(0, 1]`. A foreground result larger than this share of the main model's context window is written to a file; the tool returns the summary and the file path. |
-| `pendingResultTimeoutMinutes` | `30` | `> 0`. Read and validated, used from M2. |
+| `pendingResultTimeoutMinutes` | `30` | `> 0`. Read and validated, used from M6. |
+| `mentionQuoteMaxChars` | `2000` | Positive integer. Longest user message quoted with an `@` result; longer messages are cut with a note. |
 
 ## Tool `subagents`
 
 | `action` | Parameters | Effect |
 | --- | --- | --- |
-| `run` | `agent`, `task`, optional `delivery`, `background` | Starts a new subagent and returns its handle. Foreground waits for the result; background returns at once and delivers the result later. |
-| `resume` | `handle`, `message`, optional `delivery`, `background` | Continues a finished or paused subagent in its own session. Unknown, stopped, still-running or session-file-missing handles are rejected. |
+| `run` | `agent`, `task`, optional `background` | Starts a new subagent and returns its handle. Foreground waits for the result; background returns at once and delivers the result later (background results always use auto). |
+| `resume` | `handle`, `message`, optional `background` | Continues a finished or paused subagent in its own session (background results always use auto). Unknown, stopped, still-running or session-file-missing handles are rejected. |
 | `steer` | `handle`, `message`, optional `mode` (`steer` or `followUp`) | Sends guidance to a running subagent. |
 | `interrupt` | `handle` | Pauses a running subagent; it can be resumed. |
 | `stop` | `handle` | Ends a subagent permanently; it can no longer be resumed. |
@@ -45,8 +46,8 @@ Children are asked to end with a `<summary>` tag; without one (or with an empty 
 ## Delivery modes (background results)
 
 - `private`: stored as a custom session entry and shown only in the TUI. It never enters the model context, including compaction and branch summaries.
-- `share` (default): written into the main session without starting a turn. The full output goes to a file; the message contains the summary, the output file path and the child session path.
-- `auto`: same content as `share`, then triggers a follow-up turn.
+- `share`: written into the main session without starting a turn. The full output goes to a file; the message contains the summary, the output file path and the child session path.
+- `auto` (default for @ messages; always used for background runs started by the main agent): same content as `share`, then triggers a follow-up turn.
 
 ## Files
 

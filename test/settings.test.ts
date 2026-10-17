@@ -27,13 +27,28 @@ describe("parseSettings", () => {
 
   it("rejects an unknown delivery mode", () => {
     const { settings, warnings } = parseSettings({ defaultDelivery: "loud" });
-    expect(settings.defaultDelivery).toBe("share");
+    expect(settings.defaultDelivery).toBe("auto");
     expect(warnings[0]).toContain("defaultDelivery");
   });
 
   it("rejects contextRatio outside (0, 1]", () => {
     expect(parseSettings({ contextRatio: 0 }).settings.contextRatio).toBe(0.3);
     expect(parseSettings({ contextRatio: 1 }).settings.contextRatio).toBe(1);
+  });
+
+  it("defaults delivery to auto and the mention quote limit to 2000", () => {
+    expect(DEFAULT_SETTINGS.defaultDelivery).toBe("auto");
+    expect(DEFAULT_SETTINGS.mentionQuoteMaxChars).toBe(2000);
+  });
+
+  it("rejects a non-positive mentionQuoteMaxChars", () => {
+    const { settings, warnings } = parseSettings({ mentionQuoteMaxChars: 0 });
+    expect(settings.mentionQuoteMaxChars).toBe(2000);
+    expect(warnings[0]).toContain("mentionQuoteMaxChars");
+  });
+
+  it("accepts a positive integer mentionQuoteMaxChars", () => {
+    expect(parseSettings({ mentionQuoteMaxChars: 500 }).settings.mentionQuoteMaxChars).toBe(500);
   });
 
   it("warns when the root is not an object", () => {

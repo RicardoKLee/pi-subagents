@@ -239,7 +239,7 @@ describe("fix round 1", () => {
     const { record } = await manager.run({ agent: "reviewer", task: "x" });
     expect(record.status).toBe("failed");
     await expect(manager.resume("reviewer", "x", { delivery: "private" })).rejects.toThrow("open failed");
-    expect(manager.list()[0]).toMatchObject({ status: "failed", runId: 1, delivery: "share", error: "rate limited" });
+    expect(manager.list()[0]).toMatchObject({ status: "failed", runId: 1, delivery: "auto", error: "rate limited" });
   });
 });
 
@@ -348,6 +348,16 @@ describe("final fix wave", () => {
     const record = manager.list()[0]!;
     expect(record.status).toBe("failed");
     expect(record.error).toBe("rate limited; delivery failed: port down");
+  });
+});
+
+describe("delivery defaults", () => {
+  it("background runs started without a delivery mode use auto", async () => {
+    const { manager, sent } = setup({ scripts: [[ok("done!")]] });
+    const { record } = await manager.run({ agent: "reviewer", task: "x", background: true });
+    expect(record.delivery).toBe("auto");
+    await manager.whenIdle();
+    expect(sent[0]![1]).toEqual({ triggerTurn: true, deliverAs: "followUp" });
   });
 });
 
