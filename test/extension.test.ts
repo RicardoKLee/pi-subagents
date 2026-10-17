@@ -189,3 +189,28 @@ describe("@ mentions", () => {
     expect(providers).toHaveLength(1);
   });
 });
+
+describe("/subagents command", () => {
+  it("list and cost append a display-only tree entry", async () => {
+    const { pi, ctx, callTool } = await boot({ scripts: [[ok("first")]] });
+    await callTool({ action: "run", agent: "reviewer", task: "review" });
+    const command = pi.commands.get("subagents");
+    await command.handler("", ctx);
+    await command.handler("cost", ctx);
+    const trees = pi.branch.filter((e: any) => e.customType === "pi-subagents/tree") as any[];
+    expect(trees.map((t) => t.data.view)).toEqual(["list", "cost"]);
+    expect(trees[0].data.text).toContain("@reviewer");
+    expect(trees[1].data.text).toMatch(/total/);
+    expect(pi.sent).toHaveLength(0);
+    expect(pi.entryRenderers.has("pi-subagents/tree")).toBe(true);
+  });
+
+  it("rejects an unknown view and completes the known ones", async () => {
+    const { pi, ctx, notes } = await boot();
+    const command = pi.commands.get("subagents");
+    await command.handler("bogus", ctx);
+    expect(notes.at(-1)).toMatchObject({ type: "error", message: expect.stringContaining("list") });
+    expect(pi.branch.some((e: any) => e.customType === "pi-subagents/tree")).toBe(false);
+    expect(command.getArgumentCompletions("c").map((i: { value: string }) => i.value)).toEqual(["cost"]);
+  });
+});

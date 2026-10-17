@@ -1,5 +1,6 @@
 import { type Static, Type } from "typebox";
 import type { SubagentManager } from "./manager.ts";
+import { renderTree } from "./tree.ts";
 
 // TODO(delivery): background results from the main agent are always delivered with "auto". Add a `delivery`
 // parameter back if a use case appears (plan section 6.5 item 4).
@@ -84,8 +85,8 @@ async function dispatch(
       await manager.stop(need(input.handle, "handle", "stop"));
       return { text: `${input.handle} stopped; it cannot be resumed.`, details: {} };
     case "list": {
-      const rows = manager.list().map((r) => `@${r.handle}  ${r.agent}  ${r.status}  run ${r.runId}  $${r.usage.cost.toFixed(4)}`);
-      return { text: rows.length ? rows.join("\n") : "No subagents yet.", details: { count: rows.length } };
+      const records = manager.list();
+      return { text: renderTree(records, "list"), details: { count: records.length } };
     }
   }
 }

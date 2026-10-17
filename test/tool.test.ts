@@ -44,7 +44,7 @@ describe("executeAction", () => {
 
   it("list renders one line per record", async () => {
     const out = await executeAction(fakeManager(), { action: "list" });
-    expect(out.text).toMatch(/@reviewer\s+reviewer\s+completed/);
+    expect(out.text).toMatch(/^main\n└─ @reviewer\s+reviewer\s+run 1\s+\$0\.0100\s+\[completed\]$/);
   });
 
   it("aborting the tool signal interrupts running subagents", async () => {

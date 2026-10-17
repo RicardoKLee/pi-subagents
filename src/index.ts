@@ -15,6 +15,7 @@ import type { Runner } from "./runner/types.ts";
 import { Scheduler } from "./scheduler.ts";
 import { loadSettings, type SubagentSettings } from "./settings.ts";
 import { executeAction, SubagentsParams, type SubagentsInput } from "./tool.ts";
+import { renderTree, TREE_ENTRY_TYPE, type TreeEntryData, type TreeView } from "./tree.ts";
 
 const PRIVATE_PREVIEW_LINES = 20;
 
@@ -191,6 +192,31 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
       box.addChild(new Text(shown.join("\n"), 0, 0));
       if (shown.length < lines.length) box.addChild(new Text(theme.fg("dim", `… ${lines.length - shown.length} more lines (expand to show)`), 0, 0));
       return box;
+    });
+
+    // /subagents list|cost: a display-only tree entry; custom entries never enter the LLM context.
+    pi.registerEntryRenderer<TreeEntryData>(TREE_ENTRY_TYPE, (entry, _options, theme) => {
+      const data = entry.data;
+      if (!data) return undefined;
+      const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+      box.addChild(new Text(theme.fg("accent", data.view === "cost" ? "[subagents cost]" : "[subagents]"), 0, 0));
+      box.addChild(new Text(data.text, 0, 0));
+      return box;
+    });
+
+    const VIEWS: TreeView[] = ["list", "cost"];
+    pi.registerCommand("subagents", {
+      description: "Show subagents as a tree: /subagents [list|cost]",
+      getArgumentCompletions: (prefix) =>
+        VIEWS.filter((v) => v.startsWith(prefix.trim())).map((v) => ({ value: v, label: v, description: v === "list" ? "status and cost" : "tokens and cost" })),
+      handler: async (args, ctx) => {
+        const view = (args.trim() || "list") as TreeView;
+        if (!VIEWS.includes(view)) {
+          ctx.ui.notify(`pi-subagents: unknown view "${args.trim()}"; use /subagents list or /subagents cost`, "error");
+          return;
+        }
+        pi.appendEntry<TreeEntryData>(TREE_ENTRY_TYPE, { view, text: renderTree(state?.registry.list() ?? [], view) });
+      },
     });
 
     pi.on("session_shutdown", async () => {

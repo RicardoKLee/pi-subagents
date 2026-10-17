@@ -3,7 +3,7 @@
 pi extension: delegate work to named subagents that keep their own session, can be steered
 while running, and can be resumed by handle after they finish.
 
-Status: milestone 1 (M1). Children run in-process through the pi SDK. See
+Status: milestone 2 (M2). Children run in-process through the pi SDK. See
 `/sandbox/temp/plans/pi-subagent-extension-plan.md` for the full plan.
 
 ## Loading
@@ -39,7 +39,10 @@ Optional file `~/.pi/agent/subagents.json`. Missing file means defaults; invalid
 | `steer` | `handle`, `message`, optional `mode` (`steer` or `followUp`) | Sends guidance to a running subagent. |
 | `interrupt` | `handle` | Pauses a running subagent; it can be resumed. |
 | `stop` | `handle` | Ends a subagent permanently; it can no longer be resumed. |
-| `list` | none | Shows all subagents on the current branch with status and usage. |
+| `list` | none | Shows the subagents on the current branch as a tree. |
+
+Statuses: `queued` (waiting for a slot or for its child session to open), `running`, `paused`, `completed`, `failed`, `stopped`.
+An interrupt or stop on a queued run cancels it: the record becomes `stopped` with `cancelled before it started`.
 
 Children are asked to end with a `<summary>` tag; without one (or with an empty one) the first 1200 characters are used as the summary.
 
@@ -49,12 +52,31 @@ Children are asked to end with a `<summary>` tag; without one (or with an empty 
 - `share`: written into the main session without starting a turn. The full output goes to a file; the message contains the summary, the output file path and the child session path.
 - `auto` (default for @ messages; always used for background runs started by the main agent): same content as `share`, then triggers a follow-up turn.
 
+## Mentions (TUI only)
+
+Start a message with `@<handle>` to talk to an existing subagent without going through the main model:
+it is steered when running and resumed when paused, completed or failed. `@sub:<handle>` does the same and
+always means a subagent; use it when a file or directory in the cwd has the same name (files win for the bare form).
+
+A symbol right after the handle picks the delivery for this message only:
+`@reviewer? ...` private, `@reviewer! ...` auto, `@reviewer~ ...` share. Without a symbol `defaultDelivery` is used.
+The question is quoted with the result. `@main <message>` sends the message to the main session.
+Mentions are only recognised at the start of a message, typed in the TUI (not RPC, print mode or other extensions).
+
+## Command
+
+- `/subagents list` (default): the subagents on the current branch as a tree under `main`, with handle, agent, run,
+  cost (parents also show their subtree total), the first line of an error, and the status at the end of the line.
+- `/subagents cost`: the same tree with input, output, cache read and cache write tokens and cost, plus a total line.
+
+Both are shown in the TUI only; they are custom entries and never enter the model context.
+
 ## Files
 
 With a session directory: child sessions in `<sessionDir>/subagents/`, large outputs in `<sessionDir>/subagents/outputs/`,
 and a read-only snapshot `<sessionDir>/<sessionId>.subagents.json` (never used for recovery; session entries are authoritative).
 
-## Known limits (M1)
+## Known limits (M2)
 
 - Esc pauses subagents only while the `subagents` tool call is executing. Background children keep running after Esc; use `interrupt` or `stop`.
 - After `/fork` or `/tree`, each branch resumes a subagent from the point its own record last ended, so branches do not see each other's later turns. Their turns are written to the same child session file as separate branches; two pi processes resuming the same handle at the same time write to that file without a lock.
@@ -62,4 +84,7 @@ and a read-only snapshot `<sessionDir>/<sessionId>.subagents.json` (never used f
 - `private` results are visible only in the TUI; in print, JSON or RPC mode they are not displayed.
 - After `/reload` or a restart, records that were running are marked `paused` and can be resumed.
 - After `/tree`, a still-running record carried over to the new branch may share its handle with a record already on that branch. `@handle` resolution is then ambiguous; use the record id, or wait for the run to finish.
-- Not yet available: RPC runner, `@handle` mentions in the editor, chains, nested subagents. These are planned for later milestones.
+- Messages typed while the main session is compacting are queued by pi; an `@` message then runs after compaction.
+- Mentions in print or RPC mode are passed to the main session unchanged.
+- `@` completion uses pi's autocomplete hook; how it behaves after `/reload` or `/new` has not been verified.
+- Not yet available: RPC runner, chains, nested subagents. These are planned for later milestones.
