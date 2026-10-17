@@ -23,7 +23,12 @@ export async function handleRoute(route: Route, deps: RouteDeps): Promise<InputE
     case "steer":
       try {
         await manager.steer(route.handle, route.message, "steer", { mention: true, ...(route.delivery ? { delivery: route.delivery } : {}) });
-        notify(`added to @${route.handle} while it runs${route.delivery ? ` (${route.delivery})` : ""}`, "info");
+        notify(
+          route.delivery === "private"
+            ? `added to @${route.handle} privately; it is not quoted to the main session, but the answer may still reflect it`
+            : `added to @${route.handle} while it runs${route.delivery ? "; the run keeps its own delivery" : ""}`,
+          "info",
+        );
       } catch (error) {
         notify((error as Error).message, "error");
       }

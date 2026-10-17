@@ -523,15 +523,17 @@ describe("mention asks", () => {
     expect(sent[0]![0].content).toContain("[user added while it was running @reviewer]\nfocus on tests");
   });
 
-  it("a mention steer can switch the delivery of the running run", async () => {
-    const { manager, runner, sent, entries } = setup({ hold: true, scripts: [[ok("done")]] });
+  it("a private mention steer is not quoted in a shared result and does not change the run's delivery", async () => {
+    const { manager, runner, sent } = setup({ hold: true, scripts: [[ok("done")]] });
     await manager.run({ agent: "reviewer", task: "x", background: true });
     await manager.steer("reviewer", "keep it to me", "steer", { mention: true, delivery: "private" });
-    expect(manager.list()[0]!.delivery).toBe("private");
+    await manager.steer("reviewer", "also check tests", "steer", { mention: true, delivery: "auto" });
+    expect(manager.list()[0]!.delivery).toBe("auto");
     runner.sessions[0]!.finish();
     await manager.whenIdle();
-    expect(sent).toHaveLength(0);
-    expect((entries[0]![1] as { text: string }).text).toContain("keep it to me");
+    expect(sent).toHaveLength(1);
+    expect(sent[0]![0].content).not.toContain("keep it to me");
+    expect(sent[0]![0].content).toContain("also check tests");
   });
 
   it("truncates a long mention question", async () => {
@@ -551,6 +553,103 @@ describe("mention asks", () => {
     const { payload } = await pending;
     expect(payload!.text).toContain("[user added while it was running @reviewer]\nadd a test");
     expect(payload!.text).toContain("final");
+  });
+});
+
+describe("fix round", () => {
+  it("a private run quotes its private steers in its own private entry", async () => {
+    const { manager, runner, entries } = setup({ hold: true, scripts: [[ok("done")]] });
+    await manager.run({ agent: "reviewer", task: "x", background: true, delivery: "private" });
+    await manager.steer("reviewer", "keep it to me", "steer", { mention: true, delivery: "private" });
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+    expect((entries[0]![1] as { text: string }).text).toContain("keep it to me");
+  });
+
+  it("a shared run does not quote private steers and keeps its share delivery", async () => {
+    // Arrange
+    const { manager, runner, sent, entries } = setup({ hold: true, scripts: [[ok("done")]] });
+    await manager.run({ agent: "reviewer", task: "x", background: true, delivery: "share" });
+    // Act
+    await manager.steer("reviewer", "keep it to me", "steer", { mention: true, delivery: "private" });
+    await manager.steer("reviewer", "also check tests", "steer", { mention: true, delivery: "auto" });
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+    // Assert
+    expect(manager.list()[0]!.delivery).toBe("share");
+    expect(entries).toHaveLength(0);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]![1]).toEqual({ triggerTurn: false });
+    expect(sent[0]![0].content).not.toContain("keep it to me");
+    expect(sent[0]![0].content).toContain("also check tests");
+  });
+
+  it("a foreground result never quotes private steers", async () => {
+    const { manager, runner } = setup({ hold: true, scripts: [[ok("final")]] });
+    const pending = manager.run({ agent: "reviewer", task: "x" });
+    await vi.waitFor(() => expect(runner.sessions).toHaveLength(1));
+    await manager.steer("reviewer", "secret", "steer", { mention: true, delivery: "private" });
+    runner.sessions[0]!.finish();
+    const { payload } = await pending;
+    expect(payload!.text).not.toContain("secret");
+    expect(payload!.text).toContain("final");
+  });
+
+  it("steer on a resume that has not started yet says it is waiting", async () => {
+    const { manager, runner } = setup({ limit: 1, hold: true });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    await manager.interrupt("reviewer");
+    await manager.whenIdle();
+    await manager.run({ agent: "reviewer", task: "y", background: true });
+    const p = manager.resume("reviewer", "again", { background: true });
+    await expect(manager.steer("reviewer", "hint")).rejects.toMatchObject({ code: "busy", message: expect.stringContaining("waiting to resume") });
+    runner.sessions[1]!.finish();
+    await p;
+    runner.sessions[2]!.finish();
+    await manager.whenIdle();
+  });
+
+  it("keeps the child leaf when result handling fails", async () => {
+    const blocker = join(mkdtempSync(join(tmpdir(), "mgr-leaf-")), "blocker");
+    writeFileSync(blocker, "");
+    const { manager, runner } = setup({ hold: true, scripts: [[ok("z".repeat(4000))]], contextWindow: 1000, outputDir: join(blocker, "out") });
+    const pending = manager.run({ agent: "reviewer", task: "x" });
+    await vi.waitFor(() => expect(runner.sessions).toHaveLength(1));
+    runner.sessions[0]!.leafId = "leaf-x";
+    runner.sessions[0]!.finish();
+    const { record } = await pending;
+    expect(record.status).toBe("failed");
+    expect(record.childLeafId).toBe("leaf-x");
+  });
+
+  it("a cancel whose status cannot be persisted still keeps the run from starting", async () => {
+    let failPersist = false;
+    const registry = new Registry(() => {
+      if (failPersist) throw new Error("persist failed");
+    });
+    const { manager, runner } = setup({ limit: 1, hold: true, registry });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    const second = manager.run({ agent: "reviewer", task: "y", background: true });
+    const rejected = expect(second).rejects.toMatchObject({ code: "stopped" });
+    failPersist = true;
+    await expect(manager.stop("reviewer-2")).rejects.toThrow("persist failed");
+    failPersist = false;
+    runner.sessions[0]!.finish();
+    await rejected;
+    await manager.whenIdle();
+    expect(runner.opened).toHaveLength(1);
+  });
+
+  it("interrupt reports whether it paused or cancelled", async () => {
+    const { manager, runner } = setup({ limit: 1, hold: true });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    const second = manager.run({ agent: "reviewer", task: "y", background: true });
+    const rejected = expect(second).rejects.toMatchObject({ code: "stopped" });
+    expect(await manager.interrupt("reviewer-2")).toBe("cancelled");
+    await rejected;
+    expect(await manager.interrupt("reviewer")).toBe("paused");
+    await manager.whenIdle();
+    expect(runner.opened).toHaveLength(1);
   });
 });
 

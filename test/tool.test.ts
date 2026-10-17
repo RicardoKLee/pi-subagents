@@ -87,6 +87,12 @@ describe("executeAction", () => {
     expect(Object.keys(SubagentsParams.properties)).not.toContain("delivery");
   });
 
+  it("interrupt on a queued run says it was cancelled", async () => {
+    const m = fakeManager({ interrupt: vi.fn(async () => "cancelled") });
+    const out = await executeAction(m, { action: "interrupt", handle: "reviewer-2" });
+    expect(out.text).toContain("cancelled and cannot be resumed");
+  });
+
   it("background resume from the tool always uses auto", async () => {
     const m = fakeManager();
     await executeAction(m, { action: "resume", handle: "reviewer", message: "again", background: true });

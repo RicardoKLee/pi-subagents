@@ -78,9 +78,14 @@ async function dispatch(
     case "steer":
       await manager.steer(need(input.handle, "handle", "steer"), need(input.message, "message", "steer"), input.mode ?? "steer");
       return { text: `Steering message delivered to ${input.handle}.`, details: {} };
-    case "interrupt":
-      await manager.interrupt(need(input.handle, "handle", "interrupt"));
-      return { text: `${input.handle} interrupted; it is paused and can be resumed.`, details: {} };
+    case "interrupt": {
+      const outcome = await manager.interrupt(need(input.handle, "handle", "interrupt"));
+      const text =
+        outcome === "cancelled"
+          ? `${input.handle} had not started yet; it is cancelled and cannot be resumed.`
+          : `${input.handle} interrupted; it is paused and can be resumed.`;
+      return { text, details: {} };
+    }
     case "stop":
       await manager.stop(need(input.handle, "handle", "stop"));
       return { text: `${input.handle} stopped; it cannot be resumed.`, details: {} };

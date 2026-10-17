@@ -117,6 +117,30 @@ describe("@ mentions", () => {
     expect(pi.sent[0]!.message.content).toContain("[user added while it was running @reviewer]\nalso check tests");
   });
 
+  it("@handle? on a running subagent keeps the question out of the main session", async () => {
+    const { pi, ctx, notes, runner, callTool } = await boot({ hold: true, scripts: [[ok("done")]] });
+    await callTool({ action: "run", agent: "reviewer", task: "review", background: true });
+    await input(pi, ctx, "@reviewer? what does this flag mean");
+    expect(notes.some((n) => n.message.includes("privately"))).toBe(true);
+    runner.sessions[0]!.finish();
+    await vi.waitFor(() => expect(pi.sent).toHaveLength(1));
+    expect(pi.sent[0]!.message.content).not.toContain("what does this flag mean");
+  });
+
+  it("@handle~ on a running subagent quotes the instruction but keeps the run's own delivery", async () => {
+    // Arrange
+    const { pi, ctx, notes, runner, callTool } = await boot({ hold: true, scripts: [[ok("done")]] });
+    await callTool({ action: "run", agent: "reviewer", task: "review", background: true });
+    // Act
+    await input(pi, ctx, "@reviewer~ also check tests");
+    runner.sessions[0]!.finish();
+    await vi.waitFor(() => expect(pi.sent).toHaveLength(1));
+    // Assert
+    expect(notes.some((n) => n.message.includes("the run keeps its own delivery"))).toBe(true);
+    expect(pi.sent[0]!.options).toEqual({ triggerTurn: true, deliverAs: "followUp" });
+    expect(pi.sent[0]!.message.content).toContain("also check tests");
+  });
+
   it("passes unknown bare handles through and reports unknown @sub: handles", async () => {
     const { pi, ctx, notes, callTool } = await boot({ scripts: [[ok("first")]] });
     await callTool({ action: "run", agent: "reviewer", task: "review" });

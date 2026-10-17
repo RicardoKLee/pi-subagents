@@ -28,6 +28,8 @@ export interface Ask {
   kind: "ask" | "steer";
   /** Already truncated by quoteAsk. */
   text: string;
+  /** Sent with `?` while the run was going: only for the user; never quoted where the main model can see it. */
+  private?: boolean;
 }
 
 /** Keeps at most `maxChars` characters of a quoted user message and notes how much was cut. */

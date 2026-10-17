@@ -63,6 +63,8 @@ export class SubagentManager {
   private readonly claims = new Map<string, { intent?: "stop"; controller: AbortController }>();
   /** Runs that have a record but no child session yet (waiting for a slot or opening); aborting cancels them. */
   private readonly queued = new Map<string, AbortController>();
+  /** Queued runs cancelled by interrupt/stop; checked even if persisting the cancel failed. */
+  private readonly cancelled = new Set<string>();
   private closed = false;
   /** Aborted on shutdown so queued run/resume calls stop waiting for a slot. */
   private readonly lifetime = new AbortController();
@@ -240,9 +242,13 @@ export class SubagentManager {
     const record = this.requireRecord(handle);
     if (record.status === "queued") throw new SubagentError("not_running", `@${record.handle} is queued and has not started yet`);
     const live = this.live.get(record.id);
+    if (!live && this.claims.has(record.id)) {
+      throw new SubagentError("busy", `@${record.handle} is waiting to resume; send the message again once it is running`);
+    }
     if (!live) throw new SubagentError("not_running", `@${record.handle} is ${record.status}; use resume to continue it`);
     // Record the instruction first so a run that finishes right after the steer still quotes it.
-    const ask = opts.mention ? this.ask("steer", message) : undefined;
+    // The symbol applies to this instruction only: `?` keeps it out of anything the main model sees.
+    const ask = opts.mention ? { ...this.ask("steer", message), ...(opts.delivery === "private" ? { private: true } : {}) } : undefined;
     if (ask) live.asks.push(ask);
     try {
       await live.session.steer(message, mode);
@@ -250,16 +256,17 @@ export class SubagentManager {
       if (ask) live.asks.splice(live.asks.indexOf(ask), 1);
       throw error;
     }
-    if (opts.delivery && opts.delivery !== record.delivery) this.deps.registry.update(record.id, { delivery: opts.delivery });
   }
 
-  async interrupt(handle: string): Promise<void> {
+  /** "cancelled" when the run had not started (nothing to resume), "paused" when a running child was interrupted. */
+  async interrupt(handle: string): Promise<"paused" | "cancelled"> {
     const record = this.requireRecord(handle);
-    if (this.cancelQueued(record)) return;
+    if (this.cancelQueued(record)) return "cancelled";
     const live = this.live.get(record.id);
     if (!live) throw new SubagentError("not_running", `@${record.handle} is ${record.status}`);
     live.intent = "interrupt";
     await live.session.abort();
+    return "paused";
   }
 
   async stop(handle: string): Promise<void> {
@@ -358,7 +365,12 @@ export class SubagentManager {
       } catch (error) {
         // Never leave the record stuck in "running" or let a background job reject.
         const message = `result handling failed: ${(error as Error).message}`;
-        const failed = this.deps.registry.update(record.id, { status: "failed", error: message, lastSummary: message });
+        const failed = this.deps.registry.update(record.id, {
+          status: "failed",
+          error: message,
+          lastSummary: message,
+          ...(leafId ? { childLeafId: leafId } : {}),
+        });
         const note = `@${failed.handle} failed: ${message}`;
         return { record: failed, payload: { text: note, summary: note } };
       }
@@ -399,8 +411,12 @@ export class SubagentManager {
     }
     let record = registry.update(id, { status, error, lastSummary: payload.summary, ...(leafId ? { childLeafId: leafId } : {}) });
     // A foreground caller (the main agent) gets the instructions that were added while it waited.
-    if (!background && live.asks.length) payload = { ...payload, text: `${renderAsks(current.handle, live.asks)}\n\n${payload.text}` };
+    // Private instructions are never shown to it.
+    const shown = live.asks.filter((a) => !a.private);
+    if (!background && shown.length) payload = { ...payload, text: `${renderAsks(current.handle, shown)}\n\n${payload.text}` };
     if (background && status !== "stopped" && status !== "paused") {
+      // Only a private run's own private entry may quote private instructions.
+      const quoted = record.delivery === "private" ? live.asks : shown;
       try {
         deliver(this.deps.port, record.delivery, {
           handle: record.handle,
@@ -409,7 +425,7 @@ export class SubagentManager {
           text: payload.text,
           sessionFile: record.sessionFile,
           ...(payload.filePath ? { filePath: payload.filePath } : {}),
-          ...(live.asks.length ? { asks: live.asks } : {}),
+          ...(quoted.length ? { asks: quoted } : {}),
         });
       } catch (deliveryError) {
         // Delivery is a side channel: keep the run's status, record why it was not delivered.
@@ -450,16 +466,22 @@ export class SubagentManager {
   private cancelQueued(record: SubagentRecord): boolean {
     const controller = this.queued.get(record.id);
     if (!controller) return false;
-    this.deps.registry.update(record.id, { status: "stopped", error: "cancelled before it started" });
-    controller.abort();
+    this.cancelled.add(record.id);
+    try {
+      this.deps.registry.update(record.id, { status: "stopped", error: "cancelled before it started" });
+    } finally {
+      // Cancel even when persisting the status failed, so the run never starts.
+      controller.abort();
+    }
     return true;
   }
 
   /** Records why a run never reached its child session and returns the error the caller should see. */
   private settleQueued(id: string, cause: unknown, signal?: AbortSignal): unknown {
     const record = this.deps.registry.get(id);
+    const wasCancelled = this.cancelled.delete(id);
     try {
-      if (record?.status === "stopped") return new SubagentError("stopped", `@${record.handle} was cancelled before it started`);
+      if (wasCancelled || record?.status === "stopped") return new SubagentError("stopped", `@${record?.handle ?? id} was cancelled before it started`);
       if (this.closed) {
         this.deps.registry.update(id, { status: "failed", error: "cut off by shutdown before it started" });
         return cause;
