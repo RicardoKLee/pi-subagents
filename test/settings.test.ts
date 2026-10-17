@@ -1,8 +1,10 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { DEFAULT_SETTINGS, limitAllows, loadSettings, parseSettings } from "../src/settings.ts";
+import { cleanupTempDirs, tempDir } from "./tmp.ts";
+
+afterAll(cleanupTempDirs);
 
 describe("parseSettings", () => {
   it("returns defaults for an empty object", () => {
@@ -60,12 +62,12 @@ describe("parseSettings", () => {
 
 describe("loadSettings", () => {
   it("returns defaults without warnings when the file is missing", () => {
-    const dir = mkdtempSync(join(tmpdir(), "subagents-"));
+    const dir = tempDir("subagents-");
     expect(loadSettings(join(dir, "missing.json"))).toEqual({ settings: DEFAULT_SETTINGS, warnings: [] });
   });
 
   it("warns on malformed JSON", () => {
-    const dir = mkdtempSync(join(tmpdir(), "subagents-"));
+    const dir = tempDir("subagents-");
     const file = join(dir, "subagents.json");
     writeFileSync(file, "{ not json");
     const { settings, warnings } = loadSettings(file);

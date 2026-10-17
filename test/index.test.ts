@@ -1,7 +1,7 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import type { AgentDef } from "../src/agents.ts";
 import { rebuildForBranch, subagentPaths } from "../src/index.ts";
 import { SubagentManager } from "../src/manager.ts";
@@ -9,6 +9,9 @@ import { REGISTRY_ENTRY_TYPE, Registry, type SubagentRecord } from "../src/regis
 import { Scheduler } from "../src/scheduler.ts";
 import { DEFAULT_SETTINGS } from "../src/settings.ts";
 import { FakeRunner, FakeSession } from "./fakes.ts";
+import { cleanupTempDirs, tempDir } from "./tmp.ts";
+
+afterAll(cleanupTempDirs);
 
 describe("subagentPaths", () => {
   it("keeps everything under the session directory when there is one", () => {
@@ -33,7 +36,7 @@ const reviewer: AgentDef = { name: "reviewer", description: "r", systemPrompt: "
 
 /** Real Registry + SubagentManager with held fake children; persisted records are collected as session entries. */
 function setup() {
-  const root = mkdtempSync(join(tmpdir(), "idx-"));
+  const root = tempDir("idx-");
   const persisted: { type: "custom"; customType: string; data: SubagentRecord }[] = [];
   const registry = new Registry((record) => persisted.push({ type: "custom", customType: REGISTRY_ENTRY_TYPE, data: record }));
   const runner = new FakeRunner((_spec, n) => {

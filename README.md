@@ -25,7 +25,7 @@ Optional file `~/.pi/agent/subagents.json`. Missing file means defaults; invalid
 | `maxChildrenPerParent` | `4` | Same value rules. Read and validated, enforced from M6 (nesting). |
 | `maxDepth` | `2` | Same value rules. Read and validated, enforced from M6 (nesting). |
 | `defaultDelivery` | `"auto"` | `private`, `share` or `auto`. Used for `@handle` messages without a symbol (M2). Background runs started by the main agent always use `auto`. |
-| `defaultRunner` | `"sdk"` | `sdk` or `rpc`. Only `sdk` exists in M1; `rpc` makes runs fail with "not available". |
+| `defaultRunner` | `"sdk"` | `sdk` or `rpc`. Only `sdk` exists so far (the RPC runner is planned for M3); `rpc` makes runs fail with "not available". |
 | `contextRatio` | `0.3` | In `(0, 1]`. A foreground result larger than this share of the main model's context window is written to a file; the tool returns the summary and the file path. |
 | `pendingResultTimeoutMinutes` | `30` | `> 0`. Read and validated, used from M6. |
 | `mentionQuoteMaxChars` | `2000` | Positive integer. Longest user message quoted with an `@` result; longer messages are cut with a note. |
@@ -60,6 +60,7 @@ always means a subagent; use it when a file or directory in the cwd has the same
 
 A symbol right after the handle picks the delivery for this message only:
 `@reviewer? ...` private, `@reviewer! ...` auto, `@reviewer~ ...` share. Without a symbol `defaultDelivery` is used.
+A symbol on a mention that reaches a running subagent applies to that instruction only; the run keeps its delivery. With ? the instruction is never quoted to the main session, but the subagent's answer may still reflect it.
 The question is quoted with the result. `@main <message>` sends the message to the main session.
 Mentions are only recognised at the start of a message, typed in the TUI (not RPC, print mode or other extensions).
 
@@ -87,4 +88,6 @@ and a read-only snapshot `<sessionDir>/<sessionId>.subagents.json` (never used f
 - Messages typed while the main session is compacting are queued by pi; an `@` message then runs after compaction.
 - Mentions in print or RPC mode are passed to the main session unchanged.
 - `@` completion uses pi's autocomplete hook; how it behaves after `/reload` or `/new` has not been verified.
+- An instruction sent with @ just as the subagent finishes may be quoted with the result even though the subagent did not act on it.
+- Records created before M2 have no pinned child leaf; the first resume on each branch after /fork or /tree can still see the other branch once.
 - Not yet available: RPC runner, chains, nested subagents. These are planned for later milestones.

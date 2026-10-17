@@ -1,8 +1,10 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { loadAgents, parseAgentFile } from "../src/agents.ts";
+import { cleanupTempDirs, tempDir } from "./tmp.ts";
+
+afterAll(cleanupTempDirs);
 
 const md = (front: string, body = "You are a reviewer.") => `---\n${front}\n---\n${body}\n`;
 
@@ -66,7 +68,7 @@ describe("parseAgentFile", () => {
 
 describe("loadAgents", () => {
   function dirs() {
-    const root = mkdtempSync(join(tmpdir(), "agents-"));
+    const root = tempDir("agents-");
     const user = join(root, "user");
     const project = join(root, "project");
     mkdirSync(user);

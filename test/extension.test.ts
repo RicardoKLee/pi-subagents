@@ -1,13 +1,15 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { PRIVATE_ENTRY_TYPE } from "../src/delivery.ts";
 import { createExtension } from "../src/index.ts";
 import type { ChildResult } from "../src/runner/types.ts";
 import { FakePi, fakeCtx } from "./fake-pi.ts";
 import { FakeRunner, FakeSession, usage } from "./fakes.ts";
+import { cleanupTempDirs, tempDir } from "./tmp.ts";
+
+afterAll(cleanupTempDirs);
 
 const REVIEWER = "---\nname: reviewer\ndescription: Reviews code\n---\nReview.";
 
@@ -15,7 +17,7 @@ const REVIEWER = "---\nname: reviewer\ndescription: Reviews code\n---\nReview.";
 export async function boot(
   opts: { hold?: boolean; scripts?: ChildResult[][]; extraAgents?: Record<string, string>; hasUI?: boolean; branch?: unknown[] } = {},
 ) {
-  const root = mkdtempSync(join(tmpdir(), "ext-"));
+  const root = tempDir("ext-");
   const agentDir = join(root, "agent");
   mkdirSync(join(agentDir, "agents"), { recursive: true });
   writeFileSync(join(agentDir, "agents", "reviewer.md"), REVIEWER);

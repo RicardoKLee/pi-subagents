@@ -1,8 +1,10 @@
-import { mkdtempSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { estimateTokens, extractSummary, preparePayload } from "../src/output.ts";
+import { cleanupTempDirs, tempDir } from "./tmp.ts";
+
+afterAll(cleanupTempDirs);
 
 describe("estimateTokens", () => {
   it("uses roughly four characters per token", () => {
@@ -34,7 +36,7 @@ describe("extractSummary", () => {
 });
 
 describe("preparePayload", () => {
-  const outputDir = () => mkdtempSync(join(tmpdir(), "out-"));
+  const outputDir = () => tempDir("out-");
 
   it("inlines output at or below the threshold", () => {
     const p = preparePayload({ text: "a".repeat(1200), receiverContextWindow: 1000, ratio: 0.3, outputDir: outputDir(), label: "r" });

@@ -1,7 +1,6 @@
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import type { AgentDef } from "../src/agents.ts";
 import type { DeliveryPort } from "../src/delivery.ts";
 import { SubagentError, SubagentManager } from "../src/manager.ts";
@@ -10,6 +9,9 @@ import type { ChildResult } from "../src/runner/types.ts";
 import { Scheduler } from "../src/scheduler.ts";
 import { DEFAULT_SETTINGS, type SubagentSettings } from "../src/settings.ts";
 import { FakeRunner, FakeSession, usage } from "./fakes.ts";
+import { cleanupTempDirs, tempDir } from "./tmp.ts";
+
+afterAll(cleanupTempDirs);
 
 const reviewer: AgentDef = { name: "reviewer", description: "r", systemPrompt: "Review.", source: "user", filePath: "/a/reviewer.md" };
 
@@ -27,7 +29,7 @@ function setup(
     settings?: Partial<SubagentSettings>;
   } = {},
 ) {
-  const root = mkdtempSync(join(tmpdir(), "mgr-"));
+  const root = tempDir("mgr-");
   const scripts = opts.scripts ?? [];
   const runner = new FakeRunner((spec, n) => {
     if (n === opts.failOpenAt) throw new Error("open failed");
@@ -211,7 +213,7 @@ describe("fix round 1", () => {
   });
 
   it("marks the run failed when result handling throws", async () => {
-    const root = mkdtempSync(join(tmpdir(), "mgr-file-"));
+    const root = tempDir("mgr-file-");
     const blocker = join(root, "blocker");
     writeFileSync(blocker, "");
     const { manager } = setup({ scripts: [[ok("z".repeat(4000))]], contextWindow: 1000, outputDir: join(blocker, "out") });
@@ -610,7 +612,7 @@ describe("fix round", () => {
   });
 
   it("keeps the child leaf when result handling fails", async () => {
-    const blocker = join(mkdtempSync(join(tmpdir(), "mgr-leaf-")), "blocker");
+    const blocker = join(tempDir("mgr-leaf-"), "blocker");
     writeFileSync(blocker, "");
     const { manager, runner } = setup({ hold: true, scripts: [[ok("z".repeat(4000))]], contextWindow: 1000, outputDir: join(blocker, "out") });
     const pending = manager.run({ agent: "reviewer", task: "x" });
