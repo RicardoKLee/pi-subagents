@@ -8,7 +8,7 @@ import { SubagentError, SubagentManager } from "../src/manager.ts";
 import { REGISTRY_ENTRY_TYPE, Registry, type SubagentRecord } from "../src/registry.ts";
 import type { ChildResult } from "../src/runner/types.ts";
 import { Scheduler } from "../src/scheduler.ts";
-import { DEFAULT_SETTINGS } from "../src/settings.ts";
+import { DEFAULT_SETTINGS, type SubagentSettings } from "../src/settings.ts";
 import { FakeRunner, FakeSession, usage } from "./fakes.ts";
 
 const reviewer: AgentDef = { name: "reviewer", description: "r", systemPrompt: "Review.", source: "user", filePath: "/a/reviewer.md" };
@@ -24,6 +24,7 @@ function setup(
     port?: DeliveryPort;
     /** Zero-based open index at which FakeRunner.open rejects with "open failed". */
     failOpenAt?: number;
+    settings?: Partial<SubagentSettings>;
   } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), "mgr-"));
@@ -41,7 +42,7 @@ function setup(
     scheduler: new Scheduler(() => opts.limit ?? 4),
     runners: { sdk: runner, rpc: undefined },
     agents: () => new Map([["reviewer", reviewer]]),
-    settings: () => DEFAULT_SETTINGS,
+    settings: () => ({ ...DEFAULT_SETTINGS, ...opts.settings }),
     port: opts.port ?? { sendMessage: (...args) => sent.push(args), appendEntry: (...args) => entries.push(args) },
     receiverContextWindow: () => opts.contextWindow ?? 200000,
     cwd: root,
@@ -490,5 +491,65 @@ describe("leaf pinning", () => {
     await manager.run({ agent: "reviewer", task: "x" });
     await manager.resume("reviewer", "again");
     expect(runner.opened[1]).not.toHaveProperty("resumeLeafId");
+  });
+});
+
+describe("mention asks", () => {
+  it("quotes the question of a mention resume in the delivered result", async () => {
+    const { manager, sent } = setup({ scripts: [[ok("first")], [ok("yes, it is")]] });
+    await manager.run({ agent: "reviewer", task: "x" });
+    await manager.resume("reviewer", "is the null check right?", { background: true, delivery: "auto", mention: true });
+    await manager.whenIdle();
+    const content = sent[0]![0].content;
+    expect(content).toContain("[user asked @reviewer]\nis the null check right?");
+    expect(content).toContain("yes, it is");
+  });
+
+  it("does not quote a resume started by the tool", async () => {
+    const { manager, sent } = setup({ scripts: [[ok("first")], [ok("second")]] });
+    await manager.run({ agent: "reviewer", task: "x" });
+    await manager.resume("reviewer", "again", { background: true, delivery: "auto" });
+    await manager.whenIdle();
+    expect(sent[0]![0].content).not.toContain("[user asked");
+  });
+
+  it("quotes a mention steer in the result of the running run", async () => {
+    const { manager, runner, sent } = setup({ hold: true, scripts: [[ok("done with tests")]] });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    await manager.steer("reviewer", "focus on tests", "steer", { mention: true });
+    expect(runner.sessions[0]!.steers).toEqual([{ text: "focus on tests", mode: "steer" }]);
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+    expect(sent[0]![0].content).toContain("[user added while it was running @reviewer]\nfocus on tests");
+  });
+
+  it("a mention steer can switch the delivery of the running run", async () => {
+    const { manager, runner, sent, entries } = setup({ hold: true, scripts: [[ok("done")]] });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    await manager.steer("reviewer", "keep it to me", "steer", { mention: true, delivery: "private" });
+    expect(manager.list()[0]!.delivery).toBe("private");
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+    expect(sent).toHaveLength(0);
+    expect((entries[0]![1] as { text: string }).text).toContain("keep it to me");
+  });
+
+  it("truncates a long mention question", async () => {
+    const { manager, sent } = setup({ scripts: [[ok("first")], [ok("second")]], settings: { mentionQuoteMaxChars: 5 } });
+    await manager.run({ agent: "reviewer", task: "x" });
+    await manager.resume("reviewer", "abcdefghij", { background: true, delivery: "auto", mention: true });
+    await manager.whenIdle();
+    expect(sent[0]![0].content).toContain("abcde\n[... 5 more characters not shown]");
+  });
+
+  it("a foreground run returns the instructions added while it ran", async () => {
+    const { manager, runner } = setup({ hold: true, scripts: [[ok("final")]] });
+    const pending = manager.run({ agent: "reviewer", task: "x" });
+    await vi.waitFor(() => expect(runner.sessions).toHaveLength(1));
+    await manager.steer("reviewer", "add a test", "steer", { mention: true });
+    runner.sessions[0]!.finish();
+    const { payload } = await pending;
+    expect(payload!.text).toContain("[user added while it was running @reviewer]\nadd a test");
+    expect(payload!.text).toContain("final");
   });
 });

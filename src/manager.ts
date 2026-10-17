@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import type { AgentDef } from "./agents.ts";
-import { deliver, type DeliveryPort } from "./delivery.ts";
+import { type Ask, deliver, type DeliveryPort, quoteAsk, renderAsks } from "./delivery.ts";
 import { type Payload, preparePayload, SUMMARY_INSTRUCTION } from "./output.ts";
 import type { Registry, RunStatus, SubagentRecord } from "./registry.ts";
 import type { ChildResult, ChildSession, Runner } from "./runner/types.ts";
@@ -50,6 +50,8 @@ export interface RunOutcome {
 interface Live {
   session: ChildSession;
   intent?: "interrupt" | "stop";
+  /** User messages sent through `@` for this run, quoted with its result. */
+  asks: Ask[];
 }
 
 export class SubagentManager {
@@ -132,7 +134,7 @@ export class SubagentManager {
   async resume(
     handle: string,
     message: string,
-    opts: { delivery?: DeliveryMode; background?: boolean; signal?: AbortSignal } = {},
+    opts: { delivery?: DeliveryMode; background?: boolean; signal?: AbortSignal; mention?: boolean } = {},
   ): Promise<RunOutcome> {
     if (this.closed) throw shutDownError();
     const record = this.requireRecord(handle);
@@ -221,15 +223,29 @@ export class SubagentManager {
       await session.dispose().catch(() => {});
       throw stoppedWhileWaiting();
     }
-    return this.execute(claimed, session, message, release, opts.background ?? false, signal);
+    return this.execute(claimed, session, message, release, opts.background ?? false, signal, opts.mention ? [this.ask("ask", message)] : []);
   }
 
-  async steer(handle: string, message: string, mode: "steer" | "followUp" = "steer"): Promise<void> {
+  async steer(
+    handle: string,
+    message: string,
+    mode: "steer" | "followUp" = "steer",
+    opts: { mention?: boolean; delivery?: DeliveryMode } = {},
+  ): Promise<void> {
     const record = this.requireRecord(handle);
     if (record.status === "queued") throw new SubagentError("not_running", `@${record.handle} is queued and has not started yet`);
     const live = this.live.get(record.id);
     if (!live) throw new SubagentError("not_running", `@${record.handle} is ${record.status}; use resume to continue it`);
-    await live.session.steer(message, mode);
+    // Record the instruction first so a run that finishes right after the steer still quotes it.
+    const ask = opts.mention ? this.ask("steer", message) : undefined;
+    if (ask) live.asks.push(ask);
+    try {
+      await live.session.steer(message, mode);
+    } catch (error) {
+      if (ask) live.asks.splice(live.asks.indexOf(ask), 1);
+      throw error;
+    }
+    if (opts.delivery && opts.delivery !== record.delivery) this.deps.registry.update(record.id, { delivery: opts.delivery });
   }
 
   async interrupt(handle: string): Promise<void> {
@@ -302,8 +318,9 @@ export class SubagentManager {
     release: () => void,
     background: boolean,
     signal?: AbortSignal,
+    asks: Ask[] = [],
   ): Promise<RunOutcome> {
-    const live: Live = { session };
+    const live: Live = { session, asks };
     this.live.set(record.id, live);
     // Only a foreground call is still waiting on its tool signal; a background call has already returned.
     const callSignal = background ? undefined : signal;
@@ -376,6 +393,8 @@ export class SubagentManager {
       payload = { text: note, summary: note };
     }
     let record = registry.update(id, { status, error, lastSummary: payload.summary, ...(leafId ? { childLeafId: leafId } : {}) });
+    // A foreground caller (the main agent) gets the instructions that were added while it waited.
+    if (!background && live.asks.length) payload = { ...payload, text: `${renderAsks(current.handle, live.asks)}\n\n${payload.text}` };
     if (background && status !== "stopped" && status !== "paused") {
       try {
         deliver(this.deps.port, record.delivery, {
@@ -385,6 +404,7 @@ export class SubagentManager {
           text: payload.text,
           sessionFile: record.sessionFile,
           ...(payload.filePath ? { filePath: payload.filePath } : {}),
+          ...(live.asks.length ? { asks: live.asks } : {}),
         });
       } catch (deliveryError) {
         // Delivery is a side channel: keep the run's status, record why it was not delivered.
@@ -399,6 +419,10 @@ export class SubagentManager {
       }
     }
     return { record, payload };
+  }
+
+  private ask(kind: Ask["kind"], text: string): Ask {
+    return { kind, text: quoteAsk(text, this.deps.settings().mentionQuoteMaxChars) };
   }
 
   /** Interrupt or stop on a run still waiting for a slot or a session: nothing has started, so it is cancelled for good. */
