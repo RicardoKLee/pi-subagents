@@ -1,10 +1,14 @@
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { loadAgents } from "./agents.ts";
+import { mentionProvider } from "./complete.ts";
 import { PRIVATE_ENTRY_TYPE, type PrivateEntryData } from "./delivery.ts";
+import { handleRoute } from "./input.ts";
 import { SubagentManager } from "./manager.ts";
+import { routeMention } from "./mention.ts";
 import { REGISTRY_ENTRY_TYPE, Registry, writeSnapshot } from "./registry.ts";
 import { type ModelResolver, SdkRunner } from "./runner/sdk.ts";
 import type { Runner } from "./runner/types.ts";
@@ -66,6 +70,12 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
   return (pi: ExtensionAPI): void => {
     const agentDir = opts.agentDir ?? getAgentDir();
     let state: State | undefined;
+    /** The UI the autocomplete wrapper was installed on; pi resets wrappers when it rebuilds the extension UI. */
+    let completionUi: unknown;
+    const fileExists = (raw: string) => {
+      const cwd = state?.ctx.cwd;
+      return !!cwd && !isAbsolute(raw) && existsSync(resolvePath(cwd, raw));
+    };
 
     function resolveModel(ctx: ExtensionContext, spec: string | undefined) {
       if (!spec) return ctx.model;
@@ -120,11 +130,24 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
         sessionDir: childDir,
         outputDir,
         onDeliveryError: (record, message) => notify(`result of @${record.handle} was not delivered: ${message}`, "warning"),
+        onRecordCreated: (record) => {
+          if (existsSync(join(ctx.cwd, record.handle))) {
+            warnOnce(`@${record.handle} has the same name as a file in ${ctx.cwd}; use @sub:${record.handle} to reach the subagent`);
+          }
+        },
       });
       state = { manager, registry, ctx, settings, ...(snapshotFile ? { snapshotFile } : {}) };
       for (const w of warnings) warnOnce(w);
       const recovered = manager.recoverInterrupted();
       if (recovered) notify(`${recovered} subagent(s) were cut off by reload/restart and are now paused`, "warning");
+      if (ctx.hasUI && completionUi !== ctx.ui) {
+        completionUi = ctx.ui;
+        ctx.ui.addAutocompleteProvider((current) =>
+          mentionProvider(current, () =>
+            (state?.registry.list() ?? []).map((r) => ({ handle: r.handle, agent: r.agent, status: r.status, clash: fileExists(r.handle) })),
+          ),
+        );
+      }
     });
 
     // /tree only fires session_tree: rebuild the registry for the new branch (see rebuildForBranch).
@@ -135,6 +158,26 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
         ctx.ui.notify(`pi-subagents: ${paused} subagent(s) from another branch were not running and are now paused`, "warning");
       }
       writeSnapshotSafely(state.snapshotFile, state.registry);
+    });
+
+    // `@handle message` in the TUI goes straight to the subagent; everything else (and other sources) passes through.
+    pi.on("input", async (event, ctx) => {
+      if (!state || event.source !== "interactive" || !ctx.hasUI) return { action: "continue" };
+      const current = state;
+      const route = routeMention(event.text, {
+        resolve: (handle) => current.registry.resolve(handle),
+        known: () => current.registry.list().map((r) => r.handle),
+        fileExists,
+        defaultDelivery: current.settings.defaultDelivery,
+      });
+      const notify = (message: string, type: "info" | "warning" | "error" = "info") => {
+        try {
+          ctx.ui.notify(`pi-subagents: ${message}`, type);
+        } catch {
+          // A stale context after shutdown must not break a background callback.
+        }
+      };
+      return handleRoute(route, { manager: current.manager, notify, images: Boolean(event.images?.length) });
     });
 
     // Private results are custom entries: shown in the TUI only, never part of the LLM context.

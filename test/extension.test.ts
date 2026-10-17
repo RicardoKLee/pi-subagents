@@ -1,6 +1,7 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PRIVATE_ENTRY_TYPE } from "../src/delivery.ts";
 import { createExtension } from "../src/index.ts";
@@ -74,5 +75,117 @@ describe("extension wiring", () => {
     const note = notes.find((n) => n.message.includes("port down"))!;
     expect(note.message).toContain("@reviewer");
     expect(note.type).toBe("warning");
+  });
+});
+
+const input = (pi: FakePi, ctx: ExtensionContext, text: string, extra: Record<string, unknown> = {}) =>
+  pi.emit("input", { type: "input", text, source: "interactive", ...extra }, ctx).then((r) => r[0]);
+
+describe("@ mentions", () => {
+  it("@handle resumes a finished subagent in the background and quotes the question", async () => {
+    const { pi, ctx, notes, callTool } = await boot({ scripts: [[ok("first")], [ok("yes, it is")]] });
+    await callTool({ action: "run", agent: "reviewer", task: "review" });
+    expect(await input(pi, ctx, "@reviewer is the null check right?")).toEqual({ action: "handled" });
+    expect(notes.some((n) => n.message.includes("sent to @reviewer (auto)"))).toBe(true);
+    await vi.waitFor(() => expect(pi.sent).toHaveLength(1));
+    expect(pi.sent[0]!.message.content).toContain("[user asked @reviewer]\nis the null check right?");
+    expect(pi.sent[0]!.message.content).toContain("yes, it is");
+    expect(pi.sent[0]!.options).toEqual({ triggerTurn: true, deliverAs: "followUp" });
+  });
+
+  it("~ shares without a turn and ? keeps the result private", async () => {
+    const { pi, ctx, callTool } = await boot({ scripts: [[ok("first")], [ok("shared")], [ok("private one")]] });
+    await callTool({ action: "run", agent: "reviewer", task: "review" });
+    await input(pi, ctx, "@reviewer~ think");
+    await vi.waitFor(() => expect(pi.sent).toHaveLength(1));
+    expect(pi.sent[0]!.options).toEqual({ triggerTurn: false });
+    await input(pi, ctx, "@reviewer? what is RAII");
+    await vi.waitFor(() => expect(pi.branch.some((e: any) => e.customType === "pi-subagents/private")).toBe(true));
+    const entry = pi.branch.find((e: any) => e.customType === "pi-subagents/private") as any;
+    expect(entry.data.text).toContain("what is RAII");
+    expect(pi.sent).toHaveLength(1);
+  });
+
+  it("@handle steers a running subagent", async () => {
+    const { pi, ctx, notes, runner, callTool } = await boot({ hold: true, scripts: [[ok("done")]] });
+    await callTool({ action: "run", agent: "reviewer", task: "review", background: true });
+    expect(await input(pi, ctx, "@reviewer also check tests")).toEqual({ action: "handled" });
+    expect(runner.sessions[0]!.steers).toEqual([{ text: "also check tests", mode: "steer" }]);
+    expect(notes.some((n) => n.message.includes("added to @reviewer"))).toBe(true);
+    runner.sessions[0]!.finish();
+    await vi.waitFor(() => expect(pi.sent).toHaveLength(1));
+    expect(pi.sent[0]!.message.content).toContain("[user added while it was running @reviewer]\nalso check tests");
+  });
+
+  it("passes unknown bare handles through and reports unknown @sub: handles", async () => {
+    const { pi, ctx, notes, callTool } = await boot({ scripts: [[ok("first")]] });
+    await callTool({ action: "run", agent: "reviewer", task: "review" });
+    expect(await input(pi, ctx, "@nobody hi")).toEqual({ action: "continue" });
+    expect(await input(pi, ctx, "@sub:nobody hi")).toEqual({ action: "handled" });
+    expect(notes.at(-1)).toMatchObject({ message: expect.stringContaining("Known: @reviewer"), type: "error" });
+  });
+
+  it("file wins over a bare handle", async () => {
+    const { pi, ctx, cwd, callTool } = await boot({ scripts: [[ok("first")], [ok("second")]] });
+    await callTool({ action: "run", agent: "reviewer", task: "review" });
+    mkdirSync(join(cwd, "reviewer"));
+    expect(await input(pi, ctx, "@reviewer hi")).toEqual({ action: "continue" });
+    expect(await input(pi, ctx, "@sub:reviewer hi")).toEqual({ action: "handled" });
+  });
+
+  it("@main strips the prefix", async () => {
+    const { pi, ctx } = await boot();
+    expect(await input(pi, ctx, "@main hello there")).toEqual({ action: "transform", text: "hello there" });
+  });
+
+  it("ignores rpc and extension input and sessions without a UI", async () => {
+    const { pi, ctx, runner, callTool, cwd, root } = await boot({ scripts: [[ok("first")]] });
+    await callTool({ action: "run", agent: "reviewer", task: "review" });
+    expect(await input(pi, ctx, "@reviewer again", { source: "rpc" })).toEqual({ action: "continue" });
+    expect(await input(pi, ctx, "@reviewer again", { source: "extension" })).toEqual({ action: "continue" });
+    const { ctx: noUi } = fakeCtx(pi, { cwd, sessionDir: join(root, "sessions"), hasUI: false });
+    expect(await input(pi, noUi, "@reviewer again")).toEqual({ action: "continue" });
+    expect(runner.opened).toHaveLength(1);
+  });
+
+  it("reports a missing session or a stopped subagent without starting a run", async () => {
+    const { pi, ctx, notes, runner, callTool } = await boot({ scripts: [[ok("first")]] });
+    await callTool({ action: "run", agent: "reviewer", task: "review" });
+    rmSync(runner.sessions[0]!.sessionFile);
+    expect(await input(pi, ctx, "@reviewer again")).toEqual({ action: "handled" });
+    expect(notes.at(-1)).toMatchObject({ message: expect.stringContaining("missing"), type: "error" });
+    await callTool({ action: "stop", handle: "reviewer" });
+    await input(pi, ctx, "@reviewer again");
+    expect(notes.at(-1)).toMatchObject({ message: expect.stringContaining("stopped"), type: "error" });
+    expect(runner.opened).toHaveLength(1);
+  });
+
+  it("warns that images are not forwarded", async () => {
+    const { pi, ctx, notes, callTool } = await boot({ scripts: [[ok("first")], [ok("second")]] });
+    await callTool({ action: "run", agent: "reviewer", task: "review" });
+    await input(pi, ctx, "@reviewer look", { images: [{ type: "image", data: "x", mimeType: "image/png" }] });
+    expect(notes.some((n) => n.message.includes("images") && n.type === "warning")).toBe(true);
+  });
+
+  it("asks for a message after the handle", async () => {
+    const { pi, ctx, notes, callTool } = await boot({ scripts: [[ok("first")]] });
+    await callTool({ action: "run", agent: "reviewer", task: "review" });
+    expect(await input(pi, ctx, "@reviewer")).toEqual({ action: "handled" });
+    expect(notes.at(-1)).toMatchObject({ message: expect.stringContaining("write a message after @reviewer"), type: "error" });
+  });
+
+  it("warns once when a new handle clashes with a file in the cwd", async () => {
+    const { ctx, notes, cwd, callTool } = await boot({ scripts: [[ok("first")]] });
+    mkdirSync(join(cwd, "reviewer"));
+    await callTool({ action: "run", agent: "reviewer", task: "review" });
+    const clash = notes.filter((n) => n.message.includes("@sub:reviewer"));
+    expect(clash).toHaveLength(1);
+    expect(ctx).toBeDefined();
+  });
+
+  it("installs the autocomplete provider once per UI", async () => {
+    const { pi, ctx, providers } = await boot();
+    await pi.emit("session_start", { type: "session_start" }, ctx);
+    expect(providers).toHaveLength(1);
   });
 });

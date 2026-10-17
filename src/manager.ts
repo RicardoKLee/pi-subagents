@@ -30,6 +30,8 @@ export interface ManagerDeps {
   outputDir: string;
   /** Called when a background result could not be delivered (the error is also recorded on the record). */
   onDeliveryError?: (record: SubagentRecord, message: string) => void;
+  /** Called once a new record exists (queued); used to warn about handles that clash with files. */
+  onRecordCreated?: (record: SubagentRecord) => void;
 }
 
 export interface RunRequest {
@@ -96,6 +98,11 @@ export class SubagentManager {
       task: req.task,
       status: "queued",
     });
+    try {
+      this.deps.onRecordCreated?.(queuedRecord);
+    } catch {
+      // Informational only.
+    }
     const id = queuedRecord.id;
     const controller = new AbortController();
     this.queued.set(id, controller);
@@ -136,19 +143,7 @@ export class SubagentManager {
     message: string,
     opts: { delivery?: DeliveryMode; background?: boolean; signal?: AbortSignal; mention?: boolean } = {},
   ): Promise<RunOutcome> {
-    if (this.closed) throw shutDownError();
-    const record = this.requireRecord(handle);
-    if (record.status === "stopped") throw new SubagentError("stopped", `@${record.handle} was stopped and cannot be resumed; start a new subagent instead`);
-    if (record.status === "queued") throw new SubagentError("busy", `@${record.handle} is queued and has not started yet`);
-    if (record.status === "running" || this.live.has(record.id)) {
-      throw new SubagentError("busy", `@${record.handle} is still running; use steer to guide it`);
-    }
-    if (!record.sessionFile) throw new SubagentError("missing_session", `@${record.handle} never started, so there is no session to resume`);
-    if (!existsSync(record.sessionFile)) {
-      throw new SubagentError("missing_session", `session file for @${record.handle} is missing: ${record.sessionFile}`);
-    }
-    const agent = this.requireAgent(record.agent);
-    const runner = this.requireRunner(record.runner);
+    const { record, agent, runner } = this.preflight(handle);
     // Snapshot taken before the claim so a failed resume can be rolled back fully.
     const previous: { status: RunStatus; runId: number; delivery: DeliveryMode; error: string | undefined } = {
       status: record.status,
@@ -224,6 +219,16 @@ export class SubagentManager {
       throw stoppedWhileWaiting();
     }
     return this.execute(claimed, session, message, release, opts.background ?? false, signal, opts.mention ? [this.ask("ask", message)] : []);
+  }
+
+  /** The error resume() would reject with right away, if any; lets fire-and-forget callers report it immediately. */
+  checkResumable(handle: string): Error | undefined {
+    try {
+      this.preflight(handle);
+      return undefined;
+    } catch (error) {
+      return error as Error;
+    }
   }
 
   async steer(
@@ -419,6 +424,22 @@ export class SubagentManager {
       }
     }
     return { record, payload };
+  }
+
+  /** Synchronous checks shared by resume and checkResumable; throws the error resume would reject with. */
+  private preflight(handle: string): { record: SubagentRecord; agent: AgentDef; runner: Runner } {
+    if (this.closed) throw shutDownError();
+    const record = this.requireRecord(handle);
+    if (record.status === "stopped") throw new SubagentError("stopped", `@${record.handle} was stopped and cannot be resumed; start a new subagent instead`);
+    if (record.status === "queued") throw new SubagentError("busy", `@${record.handle} is queued and has not started yet`);
+    if (record.status === "running" || this.live.has(record.id)) {
+      throw new SubagentError("busy", `@${record.handle} is still running; use steer to guide it`);
+    }
+    if (!record.sessionFile) throw new SubagentError("missing_session", `@${record.handle} never started, so there is no session to resume`);
+    if (!existsSync(record.sessionFile)) {
+      throw new SubagentError("missing_session", `session file for @${record.handle} is missing: ${record.sessionFile}`);
+    }
+    return { record, agent: this.requireAgent(record.agent), runner: this.requireRunner(record.runner) };
   }
 
   private ask(kind: Ask["kind"], text: string): Ask {

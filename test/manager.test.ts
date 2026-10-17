@@ -553,3 +553,17 @@ describe("mention asks", () => {
     expect(payload!.text).toContain("final");
   });
 });
+
+describe("checkResumable", () => {
+  it("reports the reason a resume would fail without starting anything", async () => {
+    const { manager, runner } = setup({ scripts: [[ok("first")]] });
+    expect(manager.checkResumable("nobody")).toMatchObject({ code: "unknown_handle" });
+    await manager.run({ agent: "reviewer", task: "x" });
+    expect(manager.checkResumable("reviewer")).toBeUndefined();
+    rmSync(runner.sessions[0]!.sessionFile);
+    expect(manager.checkResumable("reviewer")).toMatchObject({ code: "missing_session" });
+    await manager.stop("reviewer");
+    expect(manager.checkResumable("reviewer")).toMatchObject({ code: "stopped" });
+    expect(runner.opened).toHaveLength(1);
+  });
+});
