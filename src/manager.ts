@@ -189,6 +189,7 @@ export class SubagentManager {
           cwd: this.deps.cwd,
           sessionDir: this.deps.sessionDir,
           resumeFile: record.sessionFile,
+          ...(record.childLeafId ? { resumeLeafId: record.childLeafId } : {}),
           appendSystemPrompt: [agent.systemPrompt, SUMMARY_INSTRUCTION].filter(Boolean),
         });
         if (this.closed) {
@@ -312,6 +313,7 @@ export class SubagentManager {
     };
     const job = (async (): Promise<RunOutcome> => {
       let result: ChildResult;
+      let leafId: string | undefined;
       try {
         if (callSignal?.aborted) onCallAbort();
         else callSignal?.addEventListener("abort", onCallAbort, { once: true });
@@ -320,12 +322,17 @@ export class SubagentManager {
         result = { text: "", stopReason: "error", errorMessage: (error as Error).message, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } };
       } finally {
         callSignal?.removeEventListener("abort", onCallAbort);
+        try {
+          leafId = session.leafId;
+        } catch {
+          // A broken session simply leaves the previous leaf in place.
+        }
         this.live.delete(record.id);
         release();
         await session.dispose().catch(() => {});
       }
       try {
-        return this.finish(record.id, result, live, background);
+        return this.finish(record.id, result, live, background, leafId);
       } catch (error) {
         // Never leave the record stuck in "running" or let a background job reject.
         const message = `result handling failed: ${(error as Error).message}`;
@@ -340,7 +347,7 @@ export class SubagentManager {
     return job;
   }
 
-  private finish(id: string, result: ChildResult, live: Live, background: boolean): RunOutcome {
+  private finish(id: string, result: ChildResult, live: Live, background: boolean, leafId?: string): RunOutcome {
     const registry = this.deps.registry;
     registry.addUsage(id, result.usage);
     let status: RunStatus;
@@ -368,7 +375,7 @@ export class SubagentManager {
       const note = `@${current.handle} ${status}${error ? `: ${error}` : ""}`;
       payload = { text: note, summary: note };
     }
-    let record = registry.update(id, { status, error, lastSummary: payload.summary });
+    let record = registry.update(id, { status, error, lastSummary: payload.summary, ...(leafId ? { childLeafId: leafId } : {}) });
     if (background && status !== "stopped" && status !== "paused") {
       try {
         deliver(this.deps.port, record.delivery, {

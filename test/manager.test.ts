@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { AgentDef } from "../src/agents.ts";
 import type { DeliveryPort } from "../src/delivery.ts";
 import { SubagentError, SubagentManager } from "../src/manager.ts";
-import { Registry } from "../src/registry.ts";
+import { REGISTRY_ENTRY_TYPE, Registry, type SubagentRecord } from "../src/registry.ts";
 import type { ChildResult } from "../src/runner/types.ts";
 import { Scheduler } from "../src/scheduler.ts";
 import { DEFAULT_SETTINGS } from "../src/settings.ts";
@@ -455,5 +455,40 @@ describe("queued runs", () => {
     await second;
     runner.sessions[1]!.finish();
     await manager.whenIdle();
+  });
+});
+
+describe("leaf pinning", () => {
+  it("records the child leaf and resumes from it on every branch", async () => {
+    const persisted: SubagentRecord[] = [];
+    const registry = new Registry((r) => persisted.push(r));
+    const { manager, runner } = setup({ registry, hold: true });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    runner.sessions[0]!.leafId = "leaf-a";
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+    expect(registry.resolve("reviewer")!.childLeafId).toBe("leaf-a");
+    const branchA = persisted.map((data) => ({ type: "custom", customType: REGISTRY_ENTRY_TYPE, data }));
+
+    await manager.resume("reviewer", "again", { background: true });
+    expect(runner.opened[1]!.resumeLeafId).toBe("leaf-a");
+    runner.sessions[1]!.leafId = "leaf-b";
+    runner.sessions[1]!.finish();
+    await manager.whenIdle();
+    expect(registry.resolve("reviewer")!.childLeafId).toBe("leaf-b");
+
+    // Back on branch A (e.g. after /tree): the record there still points at leaf-a.
+    registry.reload(branchA);
+    await manager.resume("reviewer", "from branch a", { background: true });
+    expect(runner.opened[2]!.resumeLeafId).toBe("leaf-a");
+    runner.sessions[2]!.finish();
+    await manager.whenIdle();
+  });
+
+  it("does not pass a leaf when the record has none", async () => {
+    const { manager, runner } = setup({ scripts: [[ok("first")], [ok("second")]] });
+    await manager.run({ agent: "reviewer", task: "x" });
+    await manager.resume("reviewer", "again");
+    expect(runner.opened[1]).not.toHaveProperty("resumeLeafId");
   });
 });

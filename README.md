@@ -57,7 +57,7 @@ and a read-only snapshot `<sessionDir>/<sessionId>.subagents.json` (never used f
 ## Known limits (M1)
 
 - Esc pauses subagents only while the `subagents` tool call is executing. Background children keep running after Esc; use `interrupt` or `stop`.
-- After `/fork` or `/tree`, both branches point to the same child session files; resuming the same handle on two branches writes to one file.
+- After `/fork` or `/tree`, each branch resumes a subagent from the point its own record last ended, so branches do not see each other's later turns. Their turns are written to the same child session file as separate branches; two pi processes resuming the same handle at the same time write to that file without a lock.
 - Without a session directory (in-memory session), child sessions and outputs go to `<tmpdir>/pi-subagents/<sessionId>/` and no snapshot is written.
 - `private` results are visible only in the TUI; in print, JSON or RPC mode they are not displayed.
 - After `/reload` or a restart, records that were running are marked `paused` and can be resumed.

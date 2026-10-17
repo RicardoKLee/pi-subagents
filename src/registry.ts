@@ -25,6 +25,8 @@ export interface SubagentRecord {
   parentId?: string;
   depth: number;
   sessionFile: string;
+  /** Leaf entry of the child session when its last run ended; resume continues from here. */
+  childLeafId?: string;
   /** Increments on every resume. */
   runId: number;
   status: RunStatus;
@@ -51,7 +53,7 @@ export interface NewRecord {
 }
 
 export type RecordPatch = Partial<
-  Pick<SubagentRecord, "status" | "runId" | "lastSummary" | "error" | "delivery" | "task" | "sessionFile">
+  Pick<SubagentRecord, "status" | "runId" | "lastSummary" | "error" | "delivery" | "task" | "sessionFile" | "childLeafId">
 >;
 
 function isRecord(value: unknown): value is SubagentRecord {

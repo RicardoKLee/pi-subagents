@@ -1,4 +1,4 @@
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Api, createProvider, type Model } from "@earendil-works/pi-ai";
@@ -90,5 +90,45 @@ describe("SdkRunner", () => {
     expect(result.stopReason).toBe("error");
     expect(result.errorMessage).toContain("boom");
     await s.dispose();
+  });
+
+  it("resumes from a pinned leaf without the later branch", async () => {
+    const seen: string[] = [];
+    faux.setResponses([
+      fauxAssistantMessage("noted kiwi"),
+      fauxAssistantMessage("noted mango"),
+      (context) => {
+        seen.push(context.messages.map((m) => JSON.stringify(m)).join("\n"));
+        return fauxAssistantMessage("kiwi");
+      },
+    ]);
+    const { runner: r, spec } = runner();
+    const first = await r.open(spec);
+    await first.prompt("remember the word kiwi");
+    const file = first.sessionFile;
+    const kiwiLeaf = first.leafId;
+    expect(kiwiLeaf).toBeTruthy();
+    await first.dispose();
+
+    const other = await r.open({ ...spec, resumeFile: file });
+    await other.prompt("remember the word mango");
+    await other.dispose();
+
+    const pinned = await r.open({ ...spec, resumeFile: file, resumeLeafId: kiwiLeaf });
+    await pinned.prompt("which word?");
+    await pinned.dispose();
+    expect(seen[0]).toContain("kiwi");
+    expect(seen[0]).not.toContain("mango");
+    expect(readFileSync(file, "utf8")).toContain("mango");
+  });
+
+  it("rejects an unknown pinned leaf", async () => {
+    faux.setResponses([fauxAssistantMessage("first")]);
+    const { runner: r, spec } = runner();
+    const first = await r.open(spec);
+    await first.prompt("hello");
+    const file = first.sessionFile;
+    await first.dispose();
+    await expect(r.open({ ...spec, resumeFile: file, resumeLeafId: "no-such-entry" })).rejects.toThrow(/not found/);
   });
 });
