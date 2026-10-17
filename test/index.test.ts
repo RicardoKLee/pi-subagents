@@ -81,4 +81,14 @@ describe("rebuildForBranch", () => {
     runner.sessions[0]!.finish();
     await manager.whenIdle();
   });
+
+  it("rebuildForBranch explains why a record was paused", async () => {
+    const { manager, registry, runner, persisted } = setup();
+    const { record } = await manager.run({ agent: "reviewer", task: "x", background: true });
+    const runningEntry = persisted[0]!;
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+    rebuildForBranch(manager, registry, [runningEntry]);
+    expect(registry.resolve(record.handle)!.error).toBe("left running on another branch");
+  });
 });

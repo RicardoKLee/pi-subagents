@@ -1,0 +1,72 @@
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+
+type Handler = (event: any, ctx: ExtensionContext) => unknown;
+
+/** Minimal stand-in for ExtensionAPI: records registrations and mirrors appendEntry into `branch`. */
+export class FakePi {
+  readonly handlers = new Map<string, Handler[]>();
+  readonly tools = new Map<string, any>();
+  readonly commands = new Map<string, any>();
+  readonly entryRenderers = new Map<string, any>();
+  readonly sent: { message: any; options: any }[] = [];
+  readonly branch: unknown[] = [];
+  /** When set, sendMessage throws this error (simulates a failing delivery port). */
+  failSend?: Error;
+
+  asApi(): ExtensionAPI {
+    const api = {
+      on: (event: string, handler: Handler) => {
+        const list = this.handlers.get(event) ?? [];
+        list.push(handler);
+        this.handlers.set(event, list);
+        return () => {};
+      },
+      registerTool: (tool: any) => void this.tools.set(tool.name, tool),
+      registerCommand: (name: string, options: any) => void this.commands.set(name, { name, ...options }),
+      registerEntryRenderer: (type: string, renderer: any) => void this.entryRenderers.set(type, renderer),
+      appendEntry: (customType: string, data: unknown) => void this.branch.push({ type: "custom", customType, data }),
+      sendMessage: (message: any, options: any) => {
+        if (this.failSend) throw this.failSend;
+        this.sent.push({ message, options });
+      },
+    };
+    return api as unknown as ExtensionAPI;
+  }
+
+  /** Calls every handler for `event` in order and returns their results. */
+  async emit(event: string, payload: unknown, ctx: ExtensionContext): Promise<unknown[]> {
+    const results: unknown[] = [];
+    for (const handler of this.handlers.get(event) ?? []) results.push(await handler(payload, ctx));
+    return results;
+  }
+}
+
+export interface FakeCtxOptions {
+  cwd: string;
+  sessionDir: string;
+  sessionId?: string;
+  hasUI?: boolean;
+}
+
+/** ExtensionContext stand-in whose session branch is `pi.branch`; notify calls and autocomplete factories are recorded. */
+export function fakeCtx(pi: FakePi, opts: FakeCtxOptions) {
+  const notes: { message: string; type?: string }[] = [];
+  const providers: unknown[] = [];
+  const ui = {
+    notify: (message: string, type?: string) => void notes.push({ message, type }),
+    addAutocompleteProvider: (factory: unknown) => void providers.push(factory),
+  };
+  const ctx = {
+    ui,
+    hasUI: opts.hasUI ?? true,
+    cwd: opts.cwd,
+    model: undefined,
+    modelRegistry: { find: () => undefined },
+    sessionManager: {
+      getBranch: () => pi.branch,
+      getSessionDir: () => opts.sessionDir,
+      getSessionId: () => opts.sessionId ?? "main-session",
+    },
+  } as unknown as ExtensionContext;
+  return { ctx, notes, providers };
+}

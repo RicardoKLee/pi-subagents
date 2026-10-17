@@ -28,6 +28,8 @@ export interface ManagerDeps {
   cwd: string;
   sessionDir: string;
   outputDir: string;
+  /** Called when a background result could not be delivered (the error is also recorded on the record). */
+  onDeliveryError?: (record: SubagentRecord, message: string) => void;
 }
 
 export interface RunRequest {
@@ -259,12 +261,12 @@ export class SubagentManager {
     await this.interruptAll();
   }
 
-  /** After /reload or restart no child is live; any "running" record was cut off. */
-  recoverInterrupted(): number {
+  /** After /reload, restart or a branch switch no child is live for these records; any "running" one was cut off. */
+  recoverInterrupted(reason = "interrupted by reload or restart"): number {
     let count = 0;
     for (const r of this.deps.registry.list()) {
       if (r.status === "running" && !this.live.has(r.id) && !this.claims.has(r.id)) {
-        this.deps.registry.update(r.id, { status: "paused", error: "interrupted by reload or restart" });
+        this.deps.registry.update(r.id, { status: "paused", error: reason });
         count++;
       }
     }
@@ -363,7 +365,13 @@ export class SubagentManager {
       } catch (deliveryError) {
         // Delivery is a side channel: keep the run's status, record why it was not delivered.
         // Keep the run's own error (e.g. why it failed) in front of the delivery error.
-        record = registry.update(id, { error: `${error ? `${error}; ` : ""}delivery failed: ${(deliveryError as Error).message}` });
+        const message = (deliveryError as Error).message;
+        record = registry.update(id, { error: `${error ? `${error}; ` : ""}delivery failed: ${message}` });
+        try {
+          this.deps.onDeliveryError?.(record, message);
+        } catch {
+          // The notifier must never turn a finished run into a failed one.
+        }
       }
     }
     return { record, payload };
