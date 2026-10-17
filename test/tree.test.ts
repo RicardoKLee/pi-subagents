@@ -64,6 +64,43 @@ describe("renderTree list", () => {
   it("says so when there are no subagents", () => {
     expect(renderTree([], "list")).toBe("No subagents yet.");
   });
+
+  it("shows records whose parents form a cycle as roots instead of dropping them", () => {
+    const text = renderTree(
+      [
+        rec({ handle: "a", parentId: "b", createdAt: 1 }),
+        rec({ handle: "b", parentId: "a", createdAt: 2 }),
+        rec({ handle: "c", parentId: "a", createdAt: 3 }),
+        rec({ handle: "self", parentId: "self", createdAt: 4 }),
+      ],
+      "list",
+    );
+    const lines = text.split("\n");
+    expect(lines[1]).toMatch(/^├─ @a /);
+    expect(lines[2]).toMatch(/^│  └─ @c /);
+    expect(lines[3]).toMatch(/^├─ @b /);
+    expect(lines[4]).toMatch(/^└─ @self /);
+  });
+
+  it("shows every member of a longer cycle as a root and keeps children hanging off the cycle", () => {
+    // Arrange: a → b → c → a, plus d whose parent c is in the cycle but d itself is not.
+    const records = [
+      rec({ handle: "a", parentId: "b", createdAt: 1 }),
+      rec({ handle: "b", parentId: "c", createdAt: 2 }),
+      rec({ handle: "c", parentId: "a", createdAt: 3 }),
+      rec({ handle: "d", parentId: "c", createdAt: 4 }),
+    ];
+
+    // Act
+    const lines = renderTree(records, "list").split("\n");
+
+    // Assert
+    expect(lines).toHaveLength(5);
+    expect(lines[1]).toMatch(/^├─ @a /);
+    expect(lines[2]).toMatch(/^├─ @b /);
+    expect(lines[3]).toMatch(/^└─ @c /);
+    expect(lines[4]).toMatch(/^\s+└─ @d /);
+  });
 });
 
 describe("renderTree cost", () => {

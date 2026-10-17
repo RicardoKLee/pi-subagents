@@ -57,6 +57,13 @@ function ctx(records: SubagentRecord[], files: string[] = [], defaultDelivery: R
 }
 
 describe("routeMention", () => {
+  it("@main with a delivery symbol is reported, not sent to the main model", () => {
+    for (const text of ["@main? hi", "@main! hi", "@main~ hi"]) {
+      expect(routeMention(text, ctx([]))).toEqual({ action: "error", message: "@main takes no delivery symbol; write @main <message>" });
+    }
+    expect(routeMention("@main? hi", ctx([], ["main"]))).toEqual({ action: "pass" });
+  });
+
   it("resumes a finished subagent with the default delivery", () => {
     expect(routeMention("@reviewer again", ctx([record("reviewer", "completed")]))).toEqual({
       action: "resume",

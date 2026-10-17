@@ -140,7 +140,9 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
       state = { manager, registry, ctx, settings, ...(snapshotFile ? { snapshotFile } : {}) };
       for (const w of warnings) warnOnce(w);
       const recovered = manager.recoverInterrupted();
-      if (recovered) notify(`${recovered} subagent(s) were cut off by reload/restart and are now paused`, "warning");
+      if (recovered) {
+        notify(`${recovered} subagent(s) were cut off by reload/restart: running ones are paused, queued ones were cancelled`, "warning");
+      }
       if (ctx.hasUI && completionUi !== ctx.ui) {
         completionUi = ctx.ui;
         ctx.ui.addAutocompleteProvider((current) =>
@@ -156,7 +158,10 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
       if (!state) return;
       const paused = rebuildForBranch(state.manager, state.registry, ctx.sessionManager.getBranch());
       if (paused > 0 && ctx.hasUI) {
-        ctx.ui.notify(`pi-subagents: ${paused} subagent(s) from another branch were not running and are now paused`, "warning");
+        ctx.ui.notify(
+          `pi-subagents: ${paused} subagent(s) from another branch were not running: running ones are paused, queued ones were cancelled`,
+          "warning",
+        );
       }
       writeSnapshotSafely(state.snapshotFile, state.registry);
     });

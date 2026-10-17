@@ -12,7 +12,9 @@ import { FakeRunner, FakeSession, usage } from "./fakes.ts";
 const REVIEWER = "---\nname: reviewer\ndescription: Reviews code\n---\nReview.";
 
 /** Boots the extension against a FakePi with a FakeRunner; one held or scripted child per open. */
-export async function boot(opts: { hold?: boolean; scripts?: ChildResult[][]; extraAgents?: Record<string, string>; hasUI?: boolean } = {}) {
+export async function boot(
+  opts: { hold?: boolean; scripts?: ChildResult[][]; extraAgents?: Record<string, string>; hasUI?: boolean; branch?: unknown[] } = {},
+) {
   const root = mkdtempSync(join(tmpdir(), "ext-"));
   const agentDir = join(root, "agent");
   mkdirSync(join(agentDir, "agents"), { recursive: true });
@@ -29,6 +31,7 @@ export async function boot(opts: { hold?: boolean; scripts?: ChildResult[][]; ex
   });
   const pi = new FakePi();
   createExtension({ agentDir, createRunner: () => runner })(pi.asApi());
+  pi.branch.push(...(opts.branch ?? []));
   const { ctx, notes, providers } = fakeCtx(pi, { cwd, sessionDir, hasUI: opts.hasUI ?? true });
   await pi.emit("session_start", { type: "session_start" }, ctx);
   const tool = pi.tools.get("subagents");
@@ -75,6 +78,51 @@ describe("extension wiring", () => {
     const note = notes.find((n) => n.message.includes("port down"))!;
     expect(note.message).toContain("@reviewer");
     expect(note.type).toBe("warning");
+  });
+
+  it("the reload notice does not call cancelled queued runs paused", async () => {
+    const queued = {
+      type: "custom",
+      customType: "pi-subagents/registry",
+      data: {
+        id: "q1", handle: "reviewer", agent: "reviewer", runner: "sdk", depth: 1, sessionFile: "", runId: 1,
+        status: "queued", delivery: "auto", task: "t", createdAt: 1, updatedAt: 1,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+      },
+    };
+    const { notes, callTool } = await boot({ branch: [queued] });
+    const note = notes.find((n) => n.message.includes("reload/restart"))!;
+    expect(note.message).toContain("queued ones were cancelled");
+    expect(note.message).not.toMatch(/are now paused$/);
+    expect((await callTool({ action: "list" })).content[0].text).toContain("[stopped]");
+  });
+
+  it("the /tree notice says running records are paused and queued ones cancelled", async () => {
+    // Arrange: a booted session, then a branch switch that brings in a stale running and a stale queued record.
+    const { pi, ctx, notes, callTool } = await boot();
+    const entry = (id: string, handle: string, status: string) => ({
+      type: "custom",
+      customType: "pi-subagents/registry",
+      data: {
+        id, handle, agent: "reviewer", runner: "sdk", depth: 1, sessionFile: "", runId: 1,
+        status, delivery: "auto", task: "t", createdAt: 1, updatedAt: 1,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+      },
+    });
+    pi.branch.push(entry("r1", "runner", "running"), entry("q1", "waiter", "queued"));
+
+    // Act
+    await pi.emit("session_tree", { type: "session_tree" }, ctx);
+
+    // Assert
+    const note = notes.find((n) => n.message.includes("from another branch"))!;
+    expect(note.message).toBe(
+      "pi-subagents: 2 subagent(s) from another branch were not running: running ones are paused, queued ones were cancelled",
+    );
+    expect(note.type).toBe("warning");
+    const list = (await callTool({ action: "list" })).content[0].text;
+    expect(list).toMatch(/@runner .*\[paused\]/);
+    expect(list).toMatch(/@waiter .*\[stopped\]/);
   });
 });
 

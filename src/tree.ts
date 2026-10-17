@@ -24,12 +24,24 @@ function subtree(node: Node): Usage {
   return node.children.reduce((acc, child) => sum(acc, subtree(child)), node.record.usage);
 }
 
+/** True when following parentId from `id` leads back to `id` (a corrupt registry); such records are shown as roots. */
+function inCycle(id: string, parentOf: Map<string, string | undefined>): boolean {
+  const seen = new Set<string>();
+  for (let cur = parentOf.get(id); cur !== undefined && parentOf.has(cur); cur = parentOf.get(cur)) {
+    if (cur === id) return true;
+    if (seen.has(cur)) return false;
+    seen.add(cur);
+  }
+  return false;
+}
+
 function forest(records: readonly SubagentRecord[]): Node[] {
   const sorted = [...records].sort((a, b) => a.createdAt - b.createdAt);
   const nodes = new Map(sorted.map((r) => [r.id, { record: r, children: [] as Node[] }]));
   const roots: Node[] = [];
+  const parentOf = new Map(sorted.map((r) => [r.id, r.parentId]));
   for (const node of nodes.values()) {
-    const parent = node.record.parentId ? nodes.get(node.record.parentId) : undefined;
+    const parent = node.record.parentId && !inCycle(node.record.id, parentOf) ? nodes.get(node.record.parentId) : undefined;
     // Records whose parent is not on this branch are shown as roots rather than dropped.
     (parent ? parent.children : roots).push(node);
   }

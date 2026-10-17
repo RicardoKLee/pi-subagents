@@ -66,7 +66,8 @@ export function routeMention(text: string, ctx: RouteContext): Route {
 
   if (handle === MAIN_HANDLE) {
     if (form === "ns") return { action: "error", message: "@sub:main is reserved for the main session; write @main or just the message" };
-    if (ctx.fileExists(raw) || delivery || !message) return { action: "pass" };
+    if (ctx.fileExists(raw) || !message) return { action: "pass" };
+    if (delivery) return { action: "error", message: "@main takes no delivery symbol; write @main <message>" };
     return { action: "main", text: message };
   }
   if (form === "bare" && ctx.fileExists(raw)) return { action: "pass" };
