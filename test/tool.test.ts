@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { SubagentError, type SubagentManager } from "../src/manager.ts";
-import { executeAction } from "../src/tool.ts";
+import { executeAction, SubagentsParams } from "../src/tool.ts";
 
 const record = { id: "1", handle: "reviewer", agent: "reviewer", status: "completed", runId: 1, usage: { cost: 0.01 } };
 
@@ -44,7 +44,7 @@ describe("executeAction", () => {
 
   it("list renders one line per record", async () => {
     const out = await executeAction(fakeManager(), { action: "list" });
-    expect(out.text).toMatch(/@reviewer\s+reviewer\s+completed/);
+    expect(out.text).toMatch(/^main\n└─ @reviewer\s+reviewer\s+run 1\s+\$0\.0100\s+\[completed\]$/);
   });
 
   it("aborting the tool signal interrupts running subagents", async () => {
@@ -81,5 +81,21 @@ describe("executeAction", () => {
   it("surfaces SubagentError messages unchanged", async () => {
     const m = fakeManager({ resume: vi.fn(async () => { throw new SubagentError("stopped", "@reviewer was stopped"); }) });
     await expect(executeAction(m, { action: "resume", handle: "reviewer", message: "x" })).rejects.toThrow("@reviewer was stopped");
+  });
+
+  it("does not expose a delivery parameter", () => {
+    expect(Object.keys(SubagentsParams.properties)).not.toContain("delivery");
+  });
+
+  it("interrupt on a queued run says it was cancelled", async () => {
+    const m = fakeManager({ interrupt: vi.fn(async () => "cancelled") });
+    const out = await executeAction(m, { action: "interrupt", handle: "reviewer-2" });
+    expect(out.text).toContain("cancelled and cannot be resumed");
+  });
+
+  it("background resume from the tool always uses auto", async () => {
+    const m = fakeManager();
+    await executeAction(m, { action: "resume", handle: "reviewer", message: "again", background: true });
+    expect(m.resume).toHaveBeenCalledWith("reviewer", "again", { background: true, delivery: "auto" });
   });
 });

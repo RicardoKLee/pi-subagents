@@ -8,6 +8,8 @@ export class FakeSession implements ChildSession {
   readonly steers: { text: string; mode: string }[] = [];
   aborted = 0;
   disposed = false;
+  /** Tests set this to simulate the child session's current leaf entry. */
+  leafId: string | undefined;
   private pending?: (r: ChildResult) => void;
   private held?: ChildResult;
 

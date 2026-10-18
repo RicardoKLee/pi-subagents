@@ -1,10 +1,12 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
-import type { DeliveryMode, RunnerKind } from "./settings.ts";
+import type { RunnerKind } from "./settings.ts";
 
 export type AgentScope = "user" | "project" | "both";
 
+// TODO(delivery): a per-agent default delivery (symbol > agent frontmatter > global setting) may be added when a
+// use case appears; see the plan, section 6.5 item 4. Until then `delivery` in frontmatter is ignored like any unknown field.
 export interface AgentDef {
   name: string;
   description: string;
@@ -12,7 +14,6 @@ export interface AgentDef {
   model?: string;
   thinking?: string;
   runner?: RunnerKind;
-  delivery?: DeliveryMode;
   handle?: string;
   /** undefined = may spawn any agent; [] = may spawn none (enforced from M6). */
   allowedSubagents?: string[];
@@ -55,11 +56,6 @@ export function parseAgentFile(
   if (frontmatter.runner !== undefined) {
     if (frontmatter.runner === "sdk" || frontmatter.runner === "rpc") agent.runner = frontmatter.runner;
     else problems.push("runner must be sdk or rpc");
-  }
-  if (frontmatter.delivery !== undefined) {
-    const d = frontmatter.delivery;
-    if (d === "private" || d === "share" || d === "auto") agent.delivery = d;
-    else problems.push("delivery must be private, share or auto");
   }
   if (frontmatter.allowed_subagents !== undefined) {
     const list = toList(frontmatter.allowed_subagents);

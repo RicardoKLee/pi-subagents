@@ -1,9 +1,11 @@
-import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { allocateHandle } from "../src/handles.ts";
 import { REGISTRY_ENTRY_TYPE, Registry, type SubagentRecord, writeSnapshot } from "../src/registry.ts";
+import { cleanupTempDirs, tempDir } from "./tmp.ts";
+
+afterAll(cleanupTempDirs);
 
 const base = { agent: "reviewer", runner: "sdk" as const, depth: 1, sessionFile: "/s/a.jsonl", delivery: "share" as const, task: "review" };
 
@@ -80,6 +82,11 @@ describe("Registry", () => {
     expect(rebuilt.create({ ...base, preferredHandle: "reviewer" }).handle).toBe("reviewer-2");
   });
 
+  it("create can start a record as queued", () => {
+    const r = new Registry(() => {}).create({ ...base, preferredHandle: "reviewer", status: "queued" });
+    expect(r.status).toBe("queued");
+  });
+
   it("reload replaces records with the given branch", () => {
     const { registry, persisted } = make();
     const a = registry.create({ ...base, preferredHandle: "a" });
@@ -98,7 +105,7 @@ describe("Registry", () => {
 
 describe("writeSnapshot", () => {
   it("writes the records atomically as JSON", () => {
-    const dir = mkdtempSync(join(tmpdir(), "snap-"));
+    const dir = tempDir("snap-");
     const file = join(dir, "s.subagents.json");
     const { registry } = (() => {
       const registry = new Registry(() => {});

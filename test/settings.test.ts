@@ -1,8 +1,10 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { DEFAULT_SETTINGS, limitAllows, loadSettings, parseSettings } from "../src/settings.ts";
+import { cleanupTempDirs, tempDir } from "./tmp.ts";
+
+afterAll(cleanupTempDirs);
 
 describe("parseSettings", () => {
   it("returns defaults for an empty object", () => {
@@ -27,13 +29,28 @@ describe("parseSettings", () => {
 
   it("rejects an unknown delivery mode", () => {
     const { settings, warnings } = parseSettings({ defaultDelivery: "loud" });
-    expect(settings.defaultDelivery).toBe("share");
+    expect(settings.defaultDelivery).toBe("auto");
     expect(warnings[0]).toContain("defaultDelivery");
   });
 
   it("rejects contextRatio outside (0, 1]", () => {
     expect(parseSettings({ contextRatio: 0 }).settings.contextRatio).toBe(0.3);
     expect(parseSettings({ contextRatio: 1 }).settings.contextRatio).toBe(1);
+  });
+
+  it("defaults delivery to auto and the mention quote limit to 2000", () => {
+    expect(DEFAULT_SETTINGS.defaultDelivery).toBe("auto");
+    expect(DEFAULT_SETTINGS.mentionQuoteMaxChars).toBe(2000);
+  });
+
+  it("rejects a non-positive mentionQuoteMaxChars", () => {
+    const { settings, warnings } = parseSettings({ mentionQuoteMaxChars: 0 });
+    expect(settings.mentionQuoteMaxChars).toBe(2000);
+    expect(warnings[0]).toContain("mentionQuoteMaxChars");
+  });
+
+  it("accepts a positive integer mentionQuoteMaxChars", () => {
+    expect(parseSettings({ mentionQuoteMaxChars: 500 }).settings.mentionQuoteMaxChars).toBe(500);
   });
 
   it("warns when the root is not an object", () => {
@@ -45,12 +62,12 @@ describe("parseSettings", () => {
 
 describe("loadSettings", () => {
   it("returns defaults without warnings when the file is missing", () => {
-    const dir = mkdtempSync(join(tmpdir(), "subagents-"));
+    const dir = tempDir("subagents-");
     expect(loadSettings(join(dir, "missing.json"))).toEqual({ settings: DEFAULT_SETTINGS, warnings: [] });
   });
 
   it("warns on malformed JSON", () => {
-    const dir = mkdtempSync(join(tmpdir(), "subagents-"));
+    const dir = tempDir("subagents-");
     const file = join(dir, "subagents.json");
     writeFileSync(file, "{ not json");
     const { settings, warnings } = loadSettings(file);

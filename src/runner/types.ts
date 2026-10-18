@@ -11,6 +11,8 @@ export interface ChildSpec {
   sessionDir: string;
   /** Existing child session file to continue (resume). */
   resumeFile?: string;
+  /** Entry in `resumeFile` to continue from; without it the session continues from its last entry. */
+  resumeLeafId?: string;
   appendSystemPrompt: string[];
 }
 
@@ -24,6 +26,8 @@ export interface ChildResult {
 
 export interface ChildSession {
   readonly sessionFile: string;
+  /** Current leaf entry of the child session (where the next turn attaches), if any. */
+  readonly leafId: string | undefined;
   /** Resolves when the child is idle after handling `text`. */
   prompt(text: string): Promise<ChildResult>;
   steer(text: string, mode: "steer" | "followUp"): Promise<void>;

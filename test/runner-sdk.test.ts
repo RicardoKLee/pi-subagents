@@ -1,12 +1,14 @@
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { type Api, createProvider, type Model } from "@earendil-works/pi-ai";
+import { type Api, createProvider, InMemoryCredentialStore, InMemoryModelsStore, type Model } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, getApiProvider, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { AgentDef } from "../src/agents.ts";
 import { SdkRunner } from "../src/runner/sdk.ts";
+import { cleanupTempDirs, tempDir } from "./tmp.ts";
+
+afterAll(cleanupTempDirs);
 
 /**
  * compat's registerFauxProvider only registers the API implementation, not a provider entry, so a
@@ -14,7 +16,13 @@ import { SdkRunner } from "../src/runner/sdk.ts";
  * that streams through the registered faux API implementation.
  */
 async function fauxRuntime(agentDir: string, model: Model<any>): Promise<ModelRuntime> {
-  const runtime = await ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: join(agentDir, "models.json") });
+  // In-memory stores: registerNativeProvider starts an unawaited refresh that would otherwise recreate
+  // auth.json / models-store.json under agentDir after afterAll has removed it.
+  const runtime = await ModelRuntime.create({
+    credentials: new InMemoryCredentialStore(),
+    modelsStore: new InMemoryModelsStore(),
+    modelsPath: join(agentDir, "models.json"),
+  });
   const api = getApiProvider(model.api as Api);
   if (!api) throw new Error(`no API implementation registered for "${String(model.api)}"`);
   runtime.registerNativeProvider(
@@ -35,12 +43,12 @@ describe("SdkRunner", () => {
   const faux = registerFauxProvider({ provider: "faux", models: [{ id: "faux-1", contextWindow: 100000 }] });
   let modelRuntime: ModelRuntime;
   beforeAll(async () => {
-    modelRuntime = await fauxRuntime(join(mkdtempSync(join(tmpdir(), "sdk-runtime-")), "agent"), faux.getModel());
+    modelRuntime = await fauxRuntime(join(tempDir("sdk-runtime-"), "agent"), faux.getModel());
   });
   afterEach(() => faux.setResponses([]));
 
   function runner() {
-    const root = mkdtempSync(join(tmpdir(), "sdk-"));
+    const root = tempDir("sdk-");
     return {
       root,
       runner: new SdkRunner({ agentDir: join(root, "agent"), resolveModel: () => faux.getModel(), modelRuntime }),
@@ -90,5 +98,45 @@ describe("SdkRunner", () => {
     expect(result.stopReason).toBe("error");
     expect(result.errorMessage).toContain("boom");
     await s.dispose();
+  });
+
+  it("resumes from a pinned leaf without the later branch", async () => {
+    const seen: string[] = [];
+    faux.setResponses([
+      fauxAssistantMessage("noted kiwi"),
+      fauxAssistantMessage("noted mango"),
+      (context) => {
+        seen.push(context.messages.map((m) => JSON.stringify(m)).join("\n"));
+        return fauxAssistantMessage("kiwi");
+      },
+    ]);
+    const { runner: r, spec } = runner();
+    const first = await r.open(spec);
+    await first.prompt("remember the word kiwi");
+    const file = first.sessionFile;
+    const kiwiLeaf = first.leafId;
+    expect(kiwiLeaf).toBeTruthy();
+    await first.dispose();
+
+    const other = await r.open({ ...spec, resumeFile: file });
+    await other.prompt("remember the word mango");
+    await other.dispose();
+
+    const pinned = await r.open({ ...spec, resumeFile: file, resumeLeafId: kiwiLeaf });
+    await pinned.prompt("which word?");
+    await pinned.dispose();
+    expect(seen[0]).toContain("kiwi");
+    expect(seen[0]).not.toContain("mango");
+    expect(readFileSync(file, "utf8")).toContain("mango");
+  });
+
+  it("rejects an unknown pinned leaf", async () => {
+    faux.setResponses([fauxAssistantMessage("first")]);
+    const { runner: r, spec } = runner();
+    const first = await r.open(spec);
+    await first.prompt("hello");
+    const file = first.sessionFile;
+    await first.dispose();
+    await expect(r.open({ ...spec, resumeFile: file, resumeLeafId: "no-such-entry" })).rejects.toThrow(/not found/);
   });
 });

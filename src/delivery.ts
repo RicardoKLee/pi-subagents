@@ -23,6 +23,27 @@ export interface PrivateEntryData {
   filePath?: string;
 }
 
+/** A user message that reached this run through `@`: the question that started it, or an instruction added while it ran. */
+export interface Ask {
+  kind: "ask" | "steer";
+  /** Already truncated by quoteAsk. */
+  text: string;
+  /** Sent with `?` while the run was going: only for the user; never quoted where the main model can see it. */
+  private?: boolean;
+}
+
+/** Keeps at most `maxChars` characters of a quoted user message and notes how much was cut. */
+export function quoteAsk(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars)}\n[... ${text.length - maxChars} more characters not shown]`;
+}
+
+export function renderAsks(handle: string, asks: readonly Ask[]): string {
+  return asks
+    .map((a) => `${a.kind === "ask" ? `[user asked @${handle}]` : `[user added while it was running @${handle}]`}\n${a.text}`)
+    .join("\n\n");
+}
+
 export interface ResultEnvelope {
   handle: string;
   agent: string;
@@ -32,10 +53,13 @@ export interface ResultEnvelope {
   /** Child session file, so the full transcript stays reachable from the main session. */
   sessionFile: string;
   filePath?: string;
+  /** User messages sent through `@` for this run; quoted before the result so the receiver knows what was asked. */
+  asks?: Ask[];
 }
 
 function render(env: ResultEnvelope): string {
-  return `[subagent @${env.handle} (${env.agent}) ${env.status}]\n${env.text}\n\nSession: ${env.sessionFile}`;
+  const result = `[subagent @${env.handle} (${env.agent}) ${env.status}]\n${env.text}\n\nSession: ${env.sessionFile}`;
+  return env.asks?.length ? `${renderAsks(env.handle, env.asks)}\n\n${result}` : result;
 }
 
 export function deliver(port: DeliveryPort, mode: DeliveryMode, env: ResultEnvelope): void {

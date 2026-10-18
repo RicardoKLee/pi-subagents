@@ -36,6 +36,10 @@ class SdkChildSession implements ChildSession {
     return file;
   }
 
+  get leafId(): string | undefined {
+    return this.session.sessionManager.getLeafId() ?? undefined;
+  }
+
   async prompt(text: string): Promise<ChildResult> {
     const before = totals(this.session);
     await this.session.prompt(text, { source: "extension" });
@@ -84,6 +88,8 @@ export class SdkRunner implements Runner {
     });
     await resourceLoader.reload();
     const sessionManager = spec.resumeFile ? SessionManager.open(spec.resumeFile) : SessionManager.create(spec.cwd, spec.sessionDir);
+    // Continue from the entry this record last ended on, not from whatever another branch appended later.
+    if (spec.resumeLeafId) sessionManager.branch(spec.resumeLeafId);
     const { session } = await createAgentSession({
       cwd: spec.cwd,
       agentDir: this.opts.agentDir,
