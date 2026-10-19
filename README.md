@@ -108,5 +108,4 @@ and a read-only snapshot `<sessionDir>/<sessionId>.subagents.json` (never used f
 - Records created before M2 have no pinned child leaf; the first resume on each branch after /fork or /tree can still see the other branch once.
 - Not yet available: chains, nested subagents. These are planned for later milestones.
 - An RPC child starts in about a second; resuming a resident child has no start-up cost.
-- Two pi processes resuming the same subagent at the same time write to the same child session file without a lock.
 - RPC children load no extensions until nesting (M6).
