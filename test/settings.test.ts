@@ -58,6 +58,18 @@ describe("parseSettings", () => {
     expect(settings).toEqual(DEFAULT_SETTINGS);
     expect(warnings).toHaveLength(1);
   });
+
+  it("defaults maxResident to 8 and accepts 0 and -1", () => {
+    expect(DEFAULT_SETTINGS.maxResident).toBe(8);
+    expect(parseSettings({ maxResident: 0 }).settings.maxResident).toBe(0);
+    expect(parseSettings({ maxResident: -1 }).settings.maxResident).toBe(-1);
+  });
+
+  it("rejects an invalid maxResident", () => {
+    const { settings, warnings } = parseSettings({ maxResident: -2 });
+    expect(settings.maxResident).toBe(8);
+    expect(warnings[0]).toContain("maxResident");
+  });
 });
 
 describe("loadSettings", () => {

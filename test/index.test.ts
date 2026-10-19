@@ -1,13 +1,13 @@
 import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import type { AgentDef } from "../src/agents.ts";
 import { rebuildForBranch, subagentPaths } from "../src/index.ts";
 import { SubagentManager } from "../src/manager.ts";
 import { REGISTRY_ENTRY_TYPE, Registry, type SubagentRecord } from "../src/registry.ts";
 import { Scheduler } from "../src/scheduler.ts";
-import { DEFAULT_SETTINGS } from "../src/settings.ts";
+import { DEFAULT_SETTINGS, type SubagentSettings } from "../src/settings.ts";
 import { FakeRunner, FakeSession } from "./fakes.ts";
 import { cleanupTempDirs, tempDir } from "./tmp.ts";
 
@@ -35,7 +35,7 @@ describe("subagentPaths", () => {
 const reviewer: AgentDef = { name: "reviewer", description: "r", systemPrompt: "Review.", source: "user", filePath: "/a/reviewer.md" };
 
 /** Real Registry + SubagentManager with held fake children; persisted records are collected as session entries. */
-function setup() {
+function setup(settings: Partial<SubagentSettings> = {}) {
   const root = tempDir("idx-");
   const persisted: { type: "custom"; customType: string; data: SubagentRecord }[] = [];
   const registry = new Registry((record) => persisted.push({ type: "custom", customType: REGISTRY_ENTRY_TYPE, data: record }));
@@ -49,7 +49,7 @@ function setup() {
     scheduler: new Scheduler(() => 4),
     runners: { sdk: runner, rpc: undefined },
     agents: () => new Map([["reviewer", reviewer]]),
-    settings: () => DEFAULT_SETTINGS,
+    settings: () => ({ ...DEFAULT_SETTINGS, maxResident: 0, ...settings }),
     port: { sendMessage: () => {}, appendEntry: () => {} },
     receiverContextWindow: () => 200000,
     cwd: root,
@@ -94,5 +94,15 @@ describe("rebuildForBranch", () => {
     await manager.whenIdle();
     rebuildForBranch(manager, registry, [runningEntry]);
     expect(registry.resolve(record.handle)!.error).toBe("left running on another branch");
+  });
+
+  it("rebuildForBranch closes resident children whose record left the branch", async () => {
+    const { manager, registry, runner } = setup({ maxResident: 4 });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+    expect(runner.sessions[0]!.disposed).toBe(false);
+    rebuildForBranch(manager, registry, []);
+    await vi.waitFor(() => expect(runner.sessions[0]!.disposed).toBe(true));
   });
 });

@@ -10,6 +10,8 @@ export interface SubagentSettings {
   maxChildrenPerParent: number;
   /** Maximum nesting depth (used from M6). Same value rules. */
   maxDepth: number;
+  /** Child sessions kept open between turns (running ones included). Positive = limit, 0 = close after every turn, -1 = unlimited. */
+  maxResident: number;
   /** Delivery for `@handle` messages without a symbol. Background runs started by the main agent are always auto. */
   defaultDelivery: DeliveryMode;
   defaultRunner: RunnerKind;
@@ -25,6 +27,7 @@ export const DEFAULT_SETTINGS: SubagentSettings = Object.freeze({
   maxConcurrent: 4,
   maxChildrenPerParent: 4,
   maxDepth: 2,
+  maxResident: 8,
   defaultDelivery: "auto",
   defaultRunner: "sdk",
   contextRatio: 0.3,
@@ -32,7 +35,7 @@ export const DEFAULT_SETTINGS: SubagentSettings = Object.freeze({
   mentionQuoteMaxChars: 2000,
 });
 
-const LIMIT_KEYS = ["maxConcurrent", "maxChildrenPerParent", "maxDepth"] as const;
+const LIMIT_KEYS = ["maxConcurrent", "maxChildrenPerParent", "maxDepth", "maxResident"] as const;
 
 function isLimit(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= -1;

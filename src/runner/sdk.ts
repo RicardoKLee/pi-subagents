@@ -4,13 +4,37 @@ import {
   createAgentSession,
   DefaultResourceLoader,
   type ModelRuntime,
+  ProjectTrustStore,
   SessionManager,
   SettingsManager,
+  hasTrustRequiringProjectResources,
 } from "@earendil-works/pi-coding-agent";
 import type { Usage } from "../registry.ts";
-import type { ChildResult, ChildSession, ChildSpec, Runner, StopReason } from "./types.ts";
+import { type TurnMessage, turnResult } from "./result.ts";
+import type { ChildResult, ChildSession, ChildSpec, Runner } from "./types.ts";
 
 export type ModelResolver = (spec: string | undefined) => Model<any> | undefined;
+
+export interface SdkRunnerOptions {
+  agentDir: string;
+  resolveModel: ModelResolver;
+  modelRuntime?: ModelRuntime;
+  /** The main session's project trust; undefined decides the way a `pi --mode rpc` child without -a/-na would. */
+  projectTrusted?: () => boolean | undefined;
+}
+
+/**
+ * Project trust for a child pi starts without -a/-na and without a UI (pi's resolveProjectTrusted is not exported,
+ * so this repeats its non-interactive path from the exported pieces): nothing to gate = trusted; otherwise the saved
+ * trust.json decision; otherwise the user's defaultProjectTrust, where "ask" cannot be asked and means untrusted.
+ */
+export function defaultProjectTrust(cwd: string, agentDir: string): boolean {
+  if (!hasTrustRequiringProjectResources(cwd)) return true;
+  const saved = new ProjectTrustStore(agentDir).get(cwd);
+  if (saved !== null) return saved;
+  // Only the user's (global) settings can set defaultProjectTrust; keep the untrusted project's file out of this read.
+  return SettingsManager.create(cwd, agentDir, { projectTrusted: false }).getDefaultProjectTrust() === "always";
+}
 
 function totals(session: AgentSession): Usage {
   const s = session.getSessionStats();
@@ -27,8 +51,20 @@ function delta(after: Usage, before: Usage): Usage {
   };
 }
 
-class SdkChildSession implements ChildSession {
+/** Exported for tests (driven by a fake AgentSession); production code opens sessions through SdkRunner. */
+export class SdkChildSession implements ChildSession {
+  private disposed = false;
+
   constructor(private readonly session: AgentSession) {}
+
+  get alive(): boolean {
+    return !this.disposed;
+  }
+
+  /** An in-process session never ends on its own. */
+  onExit(): () => void {
+    return () => {};
+  }
 
   get sessionFile(): string {
     const file = this.session.sessionFile;
@@ -42,18 +78,21 @@ class SdkChildSession implements ChildSession {
 
   async prompt(text: string): Promise<ChildResult> {
     const before = totals(this.session);
-    await this.session.prompt(text, { source: "extension" });
-    await this.session.waitForIdle();
-    const last = [...this.session.messages].reverse().find((m) => (m as { role?: string }).role === "assistant") as
-      | { stopReason?: string; errorMessage?: string }
-      | undefined;
-    const stopReason = (last?.stopReason ?? "stop") as StopReason;
-    return {
-      text: this.session.getLastAssistantText() ?? "",
-      stopReason,
-      ...(last?.errorMessage ? { errorMessage: last.errorMessage } : {}),
-      usage: delta(totals(this.session), before),
-    };
+    // This turn's messages come from its own events, not from a slice of `messages`: compaction during the
+    // turn rewrites the history, so an index taken before the prompt says nothing afterwards (same as the RPC runner).
+    const turn: TurnMessage[] = [];
+    let aborted = false;
+    const unsubscribe = this.session.subscribe((event) => {
+      if (event.type === "message_end" && event.message.role === "assistant") turn.push(event.message);
+      else if (event.type === "agent_settled") aborted = event.aborted;
+    });
+    try {
+      await this.session.prompt(text, { source: "extension" });
+      await this.session.waitForIdle();
+    } finally {
+      unsubscribe();
+    }
+    return { ...turnResult(turn, aborted), usage: delta(totals(this.session), before) };
   }
 
   async steer(text: string, mode: "steer" | "followUp"): Promise<void> {
@@ -66,6 +105,7 @@ class SdkChildSession implements ChildSession {
   }
 
   async dispose(): Promise<void> {
+    this.disposed = true;
     this.session.dispose();
   }
 }
@@ -73,12 +113,16 @@ class SdkChildSession implements ChildSession {
 export class SdkRunner implements Runner {
   readonly kind = "sdk" as const;
 
-  constructor(private readonly opts: { agentDir: string; resolveModel: ModelResolver; modelRuntime?: ModelRuntime }) {}
+  constructor(private readonly opts: SdkRunnerOptions) {}
 
   async open(spec: ChildSpec): Promise<ChildSession> {
     const model = this.opts.resolveModel(spec.agent.model);
     if (!model) throw new Error(`cannot resolve model "${spec.agent.model ?? "(inherit)"}" for agent ${spec.agent.name}`);
-    const settingsManager = SettingsManager.inMemory();
+    // Project settings (shellCommandPrefix, npmCommand, packages, ...) and project resources only load for a trusted
+    // project, as in the main session; SettingsManager.create would otherwise trust every project.
+    const projectTrusted = this.opts.projectTrusted?.() ?? defaultProjectTrust(spec.cwd, this.opts.agentDir);
+    // Same user settings as a normal pi run (and as the RPC runner's child process).
+    const settingsManager = SettingsManager.create(spec.cwd, this.opts.agentDir, { projectTrusted });
     const resourceLoader = new DefaultResourceLoader({
       cwd: spec.cwd,
       agentDir: this.opts.agentDir,

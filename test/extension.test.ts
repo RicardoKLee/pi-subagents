@@ -1,10 +1,10 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type ExtensionContext, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { PRIVATE_ENTRY_TYPE } from "../src/delivery.ts";
 import { createExtension } from "../src/index.ts";
-import type { ChildResult } from "../src/runner/types.ts";
+import type { ChildResult, ChildSpec, Runner } from "../src/runner/types.ts";
 import { FakePi, fakeCtx } from "./fake-pi.ts";
 import { FakeRunner, FakeSession, usage } from "./fakes.ts";
 import { cleanupTempDirs, tempDir } from "./tmp.ts";
@@ -15,12 +15,21 @@ const REVIEWER = "---\nname: reviewer\ndescription: Reviews code\n---\nReview.";
 
 /** Boots the extension against a FakePi with a FakeRunner; one held or scripted child per open. */
 export async function boot(
-  opts: { hold?: boolean; scripts?: ChildResult[][]; extraAgents?: Record<string, string>; hasUI?: boolean; branch?: unknown[] } = {},
+  opts: {
+    hold?: boolean;
+    scripts?: ChildResult[][];
+    extraAgents?: Record<string, string>;
+    hasUI?: boolean;
+    branch?: unknown[];
+    settings?: Record<string, unknown>;
+    rpcRunner?: Runner;
+  } = {},
 ) {
   const root = tempDir("ext-");
   const agentDir = join(root, "agent");
   mkdirSync(join(agentDir, "agents"), { recursive: true });
   writeFileSync(join(agentDir, "agents", "reviewer.md"), REVIEWER);
+  writeFileSync(join(agentDir, "subagents.json"), JSON.stringify({ maxResident: 0, ...opts.settings }));
   for (const [name, content] of Object.entries(opts.extraAgents ?? {})) writeFileSync(join(agentDir, "agents", name), content);
   const cwd = join(root, "project");
   const sessionDir = join(root, "sessions");
@@ -32,13 +41,17 @@ export async function boot(
     return new FakeSession(file, opts.scripts?.[n] ?? [], opts.hold ?? false);
   });
   const pi = new FakePi();
-  createExtension({ agentDir, createRunner: () => runner })(pi.asApi());
+  createExtension({
+    agentDir,
+    createRunner: () => runner,
+    ...(opts.rpcRunner ? { createRpcRunner: () => opts.rpcRunner! } : {}),
+  })(pi.asApi());
   pi.branch.push(...(opts.branch ?? []));
   const { ctx, notes, providers } = fakeCtx(pi, { cwd, sessionDir, hasUI: opts.hasUI ?? true });
   await pi.emit("session_start", { type: "session_start" }, ctx);
   const tool = pi.tools.get("subagents");
   const callTool = (params: Record<string, unknown>) => tool.execute("call-1", params, undefined, undefined, ctx);
-  return { pi, ctx, notes, providers, runner, callTool, root, cwd, agentDir };
+  return { pi, ctx, notes, providers, runner, callTool, root, cwd, agentDir, rpcRunner: opts.rpcRunner };
 }
 
 const ok = (text: string): ChildResult => ({ text, stopReason: "stop", usage: usage() });
@@ -125,6 +138,30 @@ describe("extension wiring", () => {
     const list = (await callTool({ action: "list" })).content[0].text;
     expect(list).toMatch(/@runner .*\[paused\]/);
     expect(list).toMatch(/@waiter .*\[stopped\]/);
+  });
+
+  it("uses the injected rpc runner for agents with runner: rpc", async () => {
+    const rpcOpened: ChildSpec[] = [];
+    const inner = new FakeRunner((_spec, n) => {
+      const file = join(tempDir("rpc-"), `child-${n}.jsonl`);
+      writeFileSync(file, "", { flag: "a" });
+      return new FakeSession(file, [{ text: "rpc answer", stopReason: "stop", usage: usage() }], false);
+    });
+    const rpcRunner: Runner = {
+      kind: "rpc",
+      open: (spec) => {
+        rpcOpened.push(spec);
+        return inner.open(spec);
+      },
+    };
+    const { runner, callTool } = await boot({
+      rpcRunner,
+      extraAgents: { "rpcer.md": "---\nname: rpcer\ndescription: Runs over rpc\nrunner: rpc\n---\nRpc." },
+    });
+    const out = await callTool({ action: "run", agent: "rpcer", task: "x" });
+    expect(out.content[0].text).toContain("rpc answer");
+    expect(rpcOpened).toHaveLength(1);
+    expect(runner.opened).toHaveLength(0);
   });
 });
 
@@ -287,4 +324,52 @@ describe("/subagents command", () => {
     expect(pi.branch.some((e: any) => e.customType === "pi-subagents/tree")).toBe(false);
     expect(command.getArgumentCompletions("c").map((i: { value: string }) => i.value)).toEqual(["cost"]);
   });
+
+  it("accepts a view name in any case", async () => {
+    const { pi, ctx } = await boot();
+    await pi.commands.get("subagents").handler("COST", ctx);
+    const trees = pi.branch.filter((e: any) => e.customType === "pi-subagents/tree") as any[];
+    expect(trees.map((t) => t.data.view)).toEqual(["cost"]);
+  });
+
+  it("says a stray slash argument was not run", async () => {
+    const { pi, ctx, notes } = await boot();
+    const command = pi.commands.get("subagents");
+    await command.handler("/debug-agent", ctx);
+    expect(notes.at(-1)).toMatchObject({ type: "error", message: expect.stringContaining("was not run") });
+    expect(pi.branch.some((e: any) => e.customType === "pi-subagents/tree")).toBe(false);
+  });
+});
+
+describe("default SDK runner", () => {
+  for (const trusted of [true, false]) {
+    it(`should_open_children_with_projectTrusted_${trusted}_when_the_main_session_ctx_reports_${trusted}`, async () => {
+      // Arrange: the real SdkRunner (no createRunner); capture the trust it hands to SettingsManager, then stop the open there.
+      const root = tempDir("ext-trust-");
+      const agentDir = join(root, "agent");
+      const cwd = join(root, "project");
+      mkdirSync(join(agentDir, "agents"), { recursive: true });
+      mkdirSync(cwd, { recursive: true });
+      writeFileSync(join(agentDir, "agents", "reviewer.md"), REVIEWER);
+      const seen: unknown[] = [];
+      vi.spyOn(SettingsManager, "create").mockImplementation((_cwd, _agentDir, options) => {
+        seen.push(options?.projectTrusted);
+        throw new Error("stop after settings");
+      });
+      const pi = new FakePi();
+      createExtension({ agentDir })(pi.asApi());
+      const { ctx } = fakeCtx(pi, { cwd, sessionDir: join(root, "sessions") });
+      Object.assign(ctx, { model: { provider: "p", id: "m", contextWindow: 1000 }, isProjectTrusted: () => trusted });
+      await pi.emit("session_start", { type: "session_start" }, ctx);
+
+      // Act: the run fails at the stubbed SettingsManager.create, after the trust was handed over
+      await expect(
+        pi.tools.get("subagents").execute("call-1", { action: "run", agent: "reviewer", task: "x" }, undefined, undefined, ctx),
+      ).rejects.toThrow("stop after settings");
+
+      // Assert
+      expect(seen).toEqual([trusted]);
+      await pi.emit("session_shutdown", { type: "session_shutdown" }, ctx);
+    });
+  }
 });

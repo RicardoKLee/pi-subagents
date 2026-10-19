@@ -10,6 +10,7 @@ import { handleRoute } from "./input.ts";
 import { SubagentManager } from "./manager.ts";
 import { routeMention } from "./mention.ts";
 import { REGISTRY_ENTRY_TYPE, Registry, writeSnapshot } from "./registry.ts";
+import { RpcRunner } from "./runner/rpc.ts";
 import { type ModelResolver, SdkRunner } from "./runner/sdk.ts";
 import type { Runner } from "./runner/types.ts";
 import { Scheduler } from "./scheduler.ts";
@@ -32,6 +33,8 @@ export interface ExtensionOptions {
   agentDir?: string;
   /** Defaults to the in-process SDK runner. Tests inject a fake runner. */
   createRunner?: (resolveModel: ModelResolver) => Runner;
+  /** Defaults to the RPC runner (resident `pi --mode rpc` children). Tests inject a fake. */
+  createRpcRunner?: (resolveModel: ModelResolver) => Runner;
 }
 
 /** Where child sessions, large outputs and the snapshot live; sessionless (in-memory) sessions use a temp dir and no snapshot. */
@@ -55,6 +58,7 @@ export function rebuildForBranch(manager: SubagentManager, registry: Registry, b
   const active = manager.activeRecords();
   registry.reload(branch);
   for (const r of active) registry.restore(r);
+  manager.pruneIdle();
   return manager.recoverInterrupted("left running on another branch");
 }
 
@@ -111,11 +115,22 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
         writeSnapshotSafely(snapshotFile, registry);
       });
       const modelResolver: ModelResolver = (spec) => resolveModel(state?.ctx ?? ctx, spec);
-      const sdk = opts.createRunner ? opts.createRunner(modelResolver) : new SdkRunner({ agentDir, resolveModel: modelResolver });
+      const sdk = opts.createRunner
+        ? opts.createRunner(modelResolver)
+        : new SdkRunner({ agentDir, resolveModel: modelResolver, projectTrusted: () => (state?.ctx ?? ctx).isProjectTrusted?.() });
+      const rpc = opts.createRpcRunner
+        ? opts.createRpcRunner(modelResolver)
+        : new RpcRunner({
+            resolveModel: (spec) => {
+              const model = modelResolver(spec);
+              return model ? { provider: model.provider, id: model.id } : undefined;
+            },
+            projectTrusted: () => (state?.ctx ?? ctx).isProjectTrusted?.(),
+          });
       const manager = new SubagentManager({
         registry,
         scheduler: new Scheduler(() => settings.maxConcurrent),
-        runners: { sdk, rpc: undefined },
+        runners: { sdk, rpc },
         agents: () => {
           const loaded = loadAgents({ userDir: join(agentDir, "agents"), projectDir: join(ctx.cwd, ".pi", "agents"), scope: "user" });
           for (const w of loaded.warnings) warnOnce(w);
@@ -213,11 +228,14 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
     pi.registerCommand("subagents", {
       description: "Show subagents as a tree: /subagents [list|cost]",
       getArgumentCompletions: (prefix) =>
-        VIEWS.filter((v) => v.startsWith(prefix.trim())).map((v) => ({ value: v, label: v, description: v === "list" ? "status and cost" : "tokens and cost" })),
+        VIEWS.filter((v) => v.startsWith(prefix.trim().toLowerCase())).map((v) => ({ value: v, label: v, description: v === "list" ? "status and cost" : "tokens and cost" })),
       handler: async (args, ctx) => {
-        const view = (args.trim() || "list") as TreeView;
+        const raw = args.trim();
+        const view = (raw.toLowerCase() || "list") as TreeView;
         if (!VIEWS.includes(view)) {
-          ctx.ui.notify(`pi-subagents: unknown view "${args.trim()}"; use /subagents list or /subagents cost`, "error");
+          // A leading "/" usually means two commands were typed on one line (e.g. "/subagents /debug-agent").
+          const hint = raw.includes("/") ? `${raw} was not run; type it on its own line` : "use /subagents list or /subagents cost";
+          ctx.ui.notify(`pi-subagents: unknown view "${raw}"; ${hint}`, "error");
           return;
         }
         pi.appendEntry<TreeEntryData>(TREE_ENTRY_TYPE, { view, text: renderTree(state?.registry.list() ?? [], view) });
