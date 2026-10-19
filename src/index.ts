@@ -228,11 +228,14 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
     pi.registerCommand("subagents", {
       description: "Show subagents as a tree: /subagents [list|cost]",
       getArgumentCompletions: (prefix) =>
-        VIEWS.filter((v) => v.startsWith(prefix.trim())).map((v) => ({ value: v, label: v, description: v === "list" ? "status and cost" : "tokens and cost" })),
+        VIEWS.filter((v) => v.startsWith(prefix.trim().toLowerCase())).map((v) => ({ value: v, label: v, description: v === "list" ? "status and cost" : "tokens and cost" })),
       handler: async (args, ctx) => {
-        const view = (args.trim() || "list") as TreeView;
+        const raw = args.trim();
+        const view = (raw.toLowerCase() || "list") as TreeView;
         if (!VIEWS.includes(view)) {
-          ctx.ui.notify(`pi-subagents: unknown view "${args.trim()}"; use /subagents list or /subagents cost`, "error");
+          // A leading "/" usually means two commands were typed on one line (e.g. "/subagents /debug-agent").
+          const hint = raw.includes("/") ? `${raw} was not run; type it on its own line` : "use /subagents list or /subagents cost";
+          ctx.ui.notify(`pi-subagents: unknown view "${raw}"; ${hint}`, "error");
           return;
         }
         pi.appendEntry<TreeEntryData>(TREE_ENTRY_TYPE, { view, text: renderTree(state?.registry.list() ?? [], view) });

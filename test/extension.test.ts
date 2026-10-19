@@ -324,6 +324,21 @@ describe("/subagents command", () => {
     expect(pi.branch.some((e: any) => e.customType === "pi-subagents/tree")).toBe(false);
     expect(command.getArgumentCompletions("c").map((i: { value: string }) => i.value)).toEqual(["cost"]);
   });
+
+  it("accepts a view name in any case", async () => {
+    const { pi, ctx } = await boot();
+    await pi.commands.get("subagents").handler("COST", ctx);
+    const trees = pi.branch.filter((e: any) => e.customType === "pi-subagents/tree") as any[];
+    expect(trees.map((t) => t.data.view)).toEqual(["cost"]);
+  });
+
+  it("says a stray slash argument was not run", async () => {
+    const { pi, ctx, notes } = await boot();
+    const command = pi.commands.get("subagents");
+    await command.handler("/debug-agent", ctx);
+    expect(notes.at(-1)).toMatchObject({ type: "error", message: expect.stringContaining("was not run") });
+    expect(pi.branch.some((e: any) => e.customType === "pi-subagents/tree")).toBe(false);
+  });
 });
 
 describe("default SDK runner", () => {
