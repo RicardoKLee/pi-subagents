@@ -3,8 +3,8 @@
 pi extension: delegate work to named subagents that keep their own session, can be steered
 while running, and can be resumed by handle after they finish.
 
-Status: milestone 2 (M2). Children run in-process through the pi SDK. See
-`/sandbox/temp/plans/pi-subagent-extension-plan.md` for the full plan.
+Status: milestone 3 (M3). Children run in-process through the pi SDK or as resident
+`pi --mode rpc` child processes. See `/sandbox/temp/plans/pi-subagent-extension-plan.md` for the full plan.
 
 ## Loading
 
@@ -24,11 +24,27 @@ Optional file `~/.pi/agent/subagents.json`. Missing file means defaults; invalid
 | `maxConcurrent` | `4` | Children running at the same time. Positive = limit, `0` = none allowed, `-1` = unlimited. Extra runs wait for a slot. |
 | `maxChildrenPerParent` | `4` | Same value rules. Read and validated, enforced from M6 (nesting). |
 | `maxDepth` | `2` | Same value rules. Read and validated, enforced from M6 (nesting). |
+| `maxResident` | `8` | Child sessions kept open between turns, running ones included. Positive = limit, `0` = close after every turn, `-1` = unlimited. The least recently used idle child is closed first; resuming it later reopens its session file. |
 | `defaultDelivery` | `"auto"` | `private`, `share` or `auto`. Used for `@handle` messages without a symbol (M2). Background runs started by the main agent always use `auto`. |
-| `defaultRunner` | `"sdk"` | `sdk` or `rpc`. Only `sdk` exists so far (the RPC runner is planned for M3); `rpc` makes runs fail with "not available". |
+| `defaultRunner` | `"sdk"` | `sdk` (in-process) or `rpc` (a resident `pi --mode rpc` child process per subagent). An agent's `runner:` frontmatter overrides it. Existing records keep the runner they were created with. |
 | `contextRatio` | `0.3` | In `(0, 1]`. A foreground result larger than this share of the main model's context window is written to a file; the tool returns the summary and the file path. |
 | `pendingResultTimeoutMinutes` | `30` | `> 0`. Read and validated, used from M6. |
 | `mentionQuoteMaxChars` | `2000` | Positive integer. Longest user message quoted with an `@` result; longer messages are cut with a note. |
+
+## Runners
+
+Both runners read the user's settings (`~/.pi/agent/settings.json`), so `defaultTools`, retry and the rest apply to a
+child exactly as to a normal pi run. Either way the child session stays resident between turns and is reused by the
+next `resume`.
+
+`rpc` starts one `pi --mode rpc` child process per subagent, with `-ne` so it loads no extensions; the model, thinking
+level, tool list and appended system prompt come from the agent definition. The child exits when the subagent is
+stopped, when the main session ends (exit, `/new`, `/resume`, fork or `/reload`), or when `maxResident` evicts it.
+
+If an idle RPC child dies, the next resume starts a new one from its session file, so the crash is invisible. If it
+dies while a turn is running, that turn fails with the exit code and the tail of the child's stderr.
+
+When pi's `cli.js` cannot be located, set `PI_SUBAGENTS_PI_CLI` to its path.
 
 ## Tool `subagents`
 
@@ -77,7 +93,7 @@ Both are shown in the TUI only; they are custom entries and never enter the mode
 With a session directory: child sessions in `<sessionDir>/subagents/`, large outputs in `<sessionDir>/subagents/outputs/`,
 and a read-only snapshot `<sessionDir>/<sessionId>.subagents.json` (never used for recovery; session entries are authoritative).
 
-## Known limits (M2)
+## Known limits
 
 - Esc pauses subagents only while the `subagents` tool call is executing. Background children keep running after Esc; use `interrupt` or `stop`.
 - After `/fork` or `/tree`, each branch resumes a subagent from the point its own record last ended, so branches do not see each other's later turns. Their turns are written to the same child session file as separate branches; two pi processes resuming the same handle at the same time write to that file without a lock.
@@ -90,4 +106,7 @@ and a read-only snapshot `<sessionDir>/<sessionId>.subagents.json` (never used f
 - `@` completion uses pi's autocomplete hook; how it behaves after `/reload` or `/new` has not been verified.
 - An instruction sent with @ just as the subagent finishes may be quoted with the result even though the subagent did not act on it.
 - Records created before M2 have no pinned child leaf; the first resume on each branch after /fork or /tree can still see the other branch once.
-- Not yet available: RPC runner, chains, nested subagents. These are planned for later milestones.
+- Not yet available: chains, nested subagents. These are planned for later milestones.
+- An RPC child starts in about a second; resuming a resident child has no start-up cost.
+- Two pi processes resuming the same subagent at the same time write to the same child session file without a lock.
+- RPC children load no extensions until nesting (M6).

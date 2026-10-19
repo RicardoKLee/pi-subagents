@@ -10,6 +10,7 @@ import { handleRoute } from "./input.ts";
 import { SubagentManager } from "./manager.ts";
 import { routeMention } from "./mention.ts";
 import { REGISTRY_ENTRY_TYPE, Registry, writeSnapshot } from "./registry.ts";
+import { RpcRunner } from "./runner/rpc.ts";
 import { type ModelResolver, SdkRunner } from "./runner/sdk.ts";
 import type { Runner } from "./runner/types.ts";
 import { Scheduler } from "./scheduler.ts";
@@ -32,6 +33,8 @@ export interface ExtensionOptions {
   agentDir?: string;
   /** Defaults to the in-process SDK runner. Tests inject a fake runner. */
   createRunner?: (resolveModel: ModelResolver) => Runner;
+  /** Defaults to the RPC runner (resident `pi --mode rpc` children). Tests inject a fake. */
+  createRpcRunner?: (resolveModel: ModelResolver) => Runner;
 }
 
 /** Where child sessions, large outputs and the snapshot live; sessionless (in-memory) sessions use a temp dir and no snapshot. */
@@ -115,10 +118,19 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
       const sdk = opts.createRunner
         ? opts.createRunner(modelResolver)
         : new SdkRunner({ agentDir, resolveModel: modelResolver, projectTrusted: () => (state?.ctx ?? ctx).isProjectTrusted?.() });
+      const rpc = opts.createRpcRunner
+        ? opts.createRpcRunner(modelResolver)
+        : new RpcRunner({
+            resolveModel: (spec) => {
+              const model = modelResolver(spec);
+              return model ? { provider: model.provider, id: model.id } : undefined;
+            },
+            projectTrusted: () => (state?.ctx ?? ctx).isProjectTrusted?.(),
+          });
       const manager = new SubagentManager({
         registry,
         scheduler: new Scheduler(() => settings.maxConcurrent),
-        runners: { sdk, rpc: undefined },
+        runners: { sdk, rpc },
         agents: () => {
           const loaded = loadAgents({ userDir: join(agentDir, "agents"), projectDir: join(ctx.cwd, ".pi", "agents"), scope: "user" });
           for (const w of loaded.warnings) warnOnce(w);
