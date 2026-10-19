@@ -1,6 +1,6 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type ExtensionContext, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { PRIVATE_ENTRY_TYPE } from "../src/delivery.ts";
 import { createExtension } from "../src/index.ts";
@@ -295,4 +295,37 @@ describe("/subagents command", () => {
     expect(pi.branch.some((e: any) => e.customType === "pi-subagents/tree")).toBe(false);
     expect(command.getArgumentCompletions("c").map((i: { value: string }) => i.value)).toEqual(["cost"]);
   });
+});
+
+describe("default SDK runner", () => {
+  for (const trusted of [true, false]) {
+    it(`should_open_children_with_projectTrusted_${trusted}_when_the_main_session_ctx_reports_${trusted}`, async () => {
+      // Arrange: the real SdkRunner (no createRunner); capture the trust it hands to SettingsManager, then stop the open there.
+      const root = tempDir("ext-trust-");
+      const agentDir = join(root, "agent");
+      const cwd = join(root, "project");
+      mkdirSync(join(agentDir, "agents"), { recursive: true });
+      mkdirSync(cwd, { recursive: true });
+      writeFileSync(join(agentDir, "agents", "reviewer.md"), REVIEWER);
+      const seen: unknown[] = [];
+      vi.spyOn(SettingsManager, "create").mockImplementation((_cwd, _agentDir, options) => {
+        seen.push(options?.projectTrusted);
+        throw new Error("stop after settings");
+      });
+      const pi = new FakePi();
+      createExtension({ agentDir })(pi.asApi());
+      const { ctx } = fakeCtx(pi, { cwd, sessionDir: join(root, "sessions") });
+      Object.assign(ctx, { model: { provider: "p", id: "m", contextWindow: 1000 }, isProjectTrusted: () => trusted });
+      await pi.emit("session_start", { type: "session_start" }, ctx);
+
+      // Act: the run fails at the stubbed SettingsManager.create, after the trust was handed over
+      await expect(
+        pi.tools.get("subagents").execute("call-1", { action: "run", agent: "reviewer", task: "x" }, undefined, undefined, ctx),
+      ).rejects.toThrow("stop after settings");
+
+      // Assert
+      expect(seen).toEqual([trusted]);
+      await pi.emit("session_shutdown", { type: "session_shutdown" }, ctx);
+    });
+  }
 });

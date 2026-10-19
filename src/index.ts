@@ -112,7 +112,9 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
         writeSnapshotSafely(snapshotFile, registry);
       });
       const modelResolver: ModelResolver = (spec) => resolveModel(state?.ctx ?? ctx, spec);
-      const sdk = opts.createRunner ? opts.createRunner(modelResolver) : new SdkRunner({ agentDir, resolveModel: modelResolver });
+      const sdk = opts.createRunner
+        ? opts.createRunner(modelResolver)
+        : new SdkRunner({ agentDir, resolveModel: modelResolver, projectTrusted: () => (state?.ctx ?? ctx).isProjectTrusted?.() });
       const manager = new SubagentManager({
         registry,
         scheduler: new Scheduler(() => settings.maxConcurrent),

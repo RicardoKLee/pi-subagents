@@ -4,6 +4,13 @@ import type { RunnerKind } from "../settings.ts";
 
 export type StopReason = "stop" | "length" | "toolUse" | "error" | "aborted";
 
+const STOP_REASONS: readonly StopReason[] = ["stop", "length", "toolUse", "error", "aborted"];
+
+/** pi-ai also has "pending" and "deferred"; anything unknown counts as a normal stop. */
+export function toStopReason(value: unknown): StopReason {
+  return STOP_REASONS.includes(value as StopReason) ? (value as StopReason) : "stop";
+}
+
 export interface ChildSpec {
   agent: AgentDef;
   cwd: string;
