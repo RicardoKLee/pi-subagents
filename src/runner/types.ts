@@ -28,10 +28,21 @@ export interface ChildSession {
   readonly sessionFile: string;
   /** Current leaf entry of the child session (where the next turn attaches), if any. */
   readonly leafId: string | undefined;
+  /** False once disposed or once the child ended on its own; a dead session is never reused. */
+  readonly alive: boolean;
+  /**
+   * Called if the child ends on its own (crash, killed process); not called for dispose(). Returns an unsubscribe function.
+   * The owner still calls dispose() after an exit to release whatever is left (listeners, pipes, a process to reap).
+   */
+  onExit(listener: (reason: string) => void): () => void;
   /** Resolves when the child is idle after handling `text`. */
   prompt(text: string): Promise<ChildResult>;
   steer(text: string, mode: "steer" | "followUp"): Promise<void>;
   abort(): Promise<void>;
+  /**
+   * Closes the child and resolves once it is gone (process exited, session file no longer written).
+   * Must be idempotent and must work after the child has exited on its own (see onExit).
+   */
   dispose(): Promise<void>;
 }
 

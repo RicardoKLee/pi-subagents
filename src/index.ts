@@ -55,6 +55,7 @@ export function rebuildForBranch(manager: SubagentManager, registry: Registry, b
   const active = manager.activeRecords();
   registry.reload(branch);
   for (const r of active) registry.restore(r);
+  manager.pruneIdle();
   return manager.recoverInterrupted("left running on another branch");
 }
 

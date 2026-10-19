@@ -15,12 +15,20 @@ const REVIEWER = "---\nname: reviewer\ndescription: Reviews code\n---\nReview.";
 
 /** Boots the extension against a FakePi with a FakeRunner; one held or scripted child per open. */
 export async function boot(
-  opts: { hold?: boolean; scripts?: ChildResult[][]; extraAgents?: Record<string, string>; hasUI?: boolean; branch?: unknown[] } = {},
+  opts: {
+    hold?: boolean;
+    scripts?: ChildResult[][];
+    extraAgents?: Record<string, string>;
+    hasUI?: boolean;
+    branch?: unknown[];
+    settings?: Record<string, unknown>;
+  } = {},
 ) {
   const root = tempDir("ext-");
   const agentDir = join(root, "agent");
   mkdirSync(join(agentDir, "agents"), { recursive: true });
   writeFileSync(join(agentDir, "agents", "reviewer.md"), REVIEWER);
+  writeFileSync(join(agentDir, "subagents.json"), JSON.stringify({ maxResident: 0, ...opts.settings }));
   for (const [name, content] of Object.entries(opts.extraAgents ?? {})) writeFileSync(join(agentDir, "agents", name), content);
   const cwd = join(root, "project");
   const sessionDir = join(root, "sessions");

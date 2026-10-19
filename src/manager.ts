@@ -6,6 +6,7 @@ import type { Registry, RunStatus, SubagentRecord } from "./registry.ts";
 import type { ChildResult, ChildSession, Runner } from "./runner/types.ts";
 import { type Scheduler, SubagentsDisabledError } from "./scheduler.ts";
 import type { DeliveryMode, RunnerKind, SubagentSettings } from "./settings.ts";
+import { limitAllows } from "./settings.ts";
 
 export type SubagentErrorCode = "unknown_agent" | "unknown_handle" | "stopped" | "busy" | "not_running" | "missing_session" | "interrupted";
 
@@ -65,6 +66,12 @@ export class SubagentManager {
   private readonly queued = new Map<string, AbortController>();
   /** Queued runs cancelled by interrupt/stop; checked even if persisting the cancel failed. */
   private readonly cancelled = new Set<string>();
+  /** Children kept open between turns, keyed by record id; insertion order = least recently used first. */
+  private readonly idle = new Map<string, ChildSession>();
+  /** Children being disposed, keyed by record id; a reopen of the same session file waits for this first. */
+  private readonly closing = new Map<string, Promise<void>>();
+  /** Sessions whose onExit is already wired (a session is parked many times). */
+  private readonly watched = new WeakSet<ChildSession>();
   private closed = false;
   /** Aborted on shutdown so queued run/resume calls stop waiting for a slot. */
   private readonly lifetime = new AbortController();
@@ -133,7 +140,7 @@ export class SubagentManager {
     if (this.closed || controller.signal.aborted || signal?.aborted) {
       // Shutdown, a cancel by handle, or the calling tool's abort happened while the session was opening.
       release();
-      await session.dispose().catch(() => {});
+      await this.close(id, session);
       throw this.settleQueued(id, this.closed ? shutDownError() : runInterruptedError(), signal);
     }
     const running = this.deps.registry.update(id, { status: "running", sessionFile: session.sessionFile });
@@ -183,22 +190,25 @@ export class SubagentManager {
     try {
       release = await this.deps.scheduler.acquire(claim.controller.signal);
       try {
-        session = await runner.open({
-          agent,
-          cwd: this.deps.cwd,
-          sessionDir: this.deps.sessionDir,
-          resumeFile: record.sessionFile,
-          ...(record.childLeafId ? { resumeLeafId: record.childLeafId } : {}),
-          appendSystemPrompt: [agent.systemPrompt, SUMMARY_INSTRUCTION].filter(Boolean),
-        });
+        session =
+          (await this.takeIdle(record)) ??
+          // takeIdle has waited for any close of this record still in flight, so the file has no other writer.
+          (await runner.open({
+            agent,
+            cwd: this.deps.cwd,
+            sessionDir: this.deps.sessionDir,
+            resumeFile: record.sessionFile,
+            ...(record.childLeafId ? { resumeLeafId: record.childLeafId } : {}),
+            appendSystemPrompt: [agent.systemPrompt, SUMMARY_INSTRUCTION].filter(Boolean),
+          }));
         if (this.closed) {
           // Shutdown during open: dispose here; release and rollback run in the handlers below.
-          await session.dispose().catch(() => {});
+          await this.close(record.id, session);
           throw shutDownError();
         }
         if (signal?.aborted && claim.intent !== "stop") {
           // The calling tool was aborted while the session was opening; release and rollback run below.
-          await session.dispose().catch(() => {});
+          await this.close(record.id, session);
           throw interruptedWhileWaiting();
         }
       } catch (error) {
@@ -217,7 +227,7 @@ export class SubagentManager {
     this.claims.delete(record.id);
     if (claim.intent === "stop") {
       release();
-      await session.dispose().catch(() => {});
+      await this.close(record.id, session);
       throw stoppedWhileWaiting();
     }
     return this.execute(claimed, session, message, release, opts.background ?? false, signal, opts.mention ? [this.ask("ask", message)] : []);
@@ -272,21 +282,27 @@ export class SubagentManager {
   async stop(handle: string): Promise<void> {
     const record = this.requireRecord(handle);
     if (this.cancelQueued(record)) return;
-    const claim = this.claims.get(record.id);
-    if (claim) {
-      // A resume is still waiting for a slot or a session; cancel it.
-      claim.intent = "stop";
-      claim.controller.abort();
-      this.markStopped(record.id);
-      return;
+    // Start closing the idle child synchronously (before any await), and return only once it has finished closing.
+    const closingIdle = this.closeIdle(record.id);
+    try {
+      const claim = this.claims.get(record.id);
+      if (claim) {
+        // A resume is still waiting for a slot or a session; cancel it.
+        claim.intent = "stop";
+        claim.controller.abort();
+        this.markStopped(record.id);
+        return;
+      }
+      const live = this.live.get(record.id);
+      if (live) {
+        live.intent = "stop";
+        await live.session.abort();
+        return;
+      }
+      if (record.status !== "stopped") this.deps.registry.update(record.id, { status: "stopped" });
+    } finally {
+      await closingIdle;
     }
-    const live = this.live.get(record.id);
-    if (live) {
-      live.intent = "stop";
-      await live.session.abort();
-      return;
-    }
-    if (record.status !== "stopped") this.deps.registry.update(record.id, { status: "stopped" });
   }
 
   /** Called when the main session is shutting down or the user aborts. */
@@ -300,6 +316,15 @@ export class SubagentManager {
     this.lifetime.abort();
     for (const claim of this.claims.values()) claim.controller.abort();
     await this.interruptAll();
+    for (const id of [...this.idle.keys()]) void this.closeIdle(id);
+    // Idle children and children already closing (evicted, pruned, stopped); interrupted live children close as their
+    // runs end, which whenIdle() waits for.
+    await Promise.all([...this.closing.values()]);
+  }
+
+  /** After a branch switch: close idle children whose record is no longer on this branch (tracked by whenIdle/shutdown). */
+  pruneIdle(): void {
+    for (const id of [...this.idle.keys()]) if (!this.deps.registry.get(id)) void this.closeIdle(id);
   }
 
   /** After /reload, restart or a branch switch no child is live for these records; settle the ones that were cut off. */
@@ -334,6 +359,7 @@ export class SubagentManager {
   ): Promise<RunOutcome> {
     const live: Live = { session, asks };
     this.live.set(record.id, live);
+    this.evictIdle();
     // Only a foreground call is still waiting on its tool signal; a background call has already returned.
     const callSignal = background ? undefined : signal;
     const onCallAbort = () => {
@@ -358,7 +384,8 @@ export class SubagentManager {
         }
         this.live.delete(record.id);
         release();
-        await session.dispose().catch(() => {});
+        // A child that is not kept has finished closing before the run ends, as in M2.
+        await this.park(record.id, session, live);
       }
       try {
         return this.finish(record.id, result, live, background, leafId);
@@ -440,6 +467,95 @@ export class SubagentManager {
       }
     }
     return { record, payload };
+  }
+
+  /** After a turn: keep the child for the next resume, or close it (stopped, shut down, dead, or maxResident 0). */
+  private async park(id: string, session: ChildSession, live: Live): Promise<void> {
+    const keep = live.intent !== "stop" && !this.closed && session.alive && this.deps.settings().maxResident !== 0;
+    if (!keep) {
+      await this.close(id, session);
+      return;
+    }
+    if (!this.watched.has(session)) {
+      this.watched.add(session);
+      // A child that dies while idle is dropped and still disposed (dispose is idempotent and allowed after exit);
+      // the next resume opens a new one from the session file. A running child that dies is closed by park().
+      session.onExit(() => {
+        if (this.idle.get(id) !== session) return;
+        this.idle.delete(id);
+        void this.close(id, session);
+      });
+    }
+    this.idle.delete(id);
+    this.idle.set(id, session);
+    this.evictIdle();
+  }
+
+  /**
+   * Closes least recently used idle children while live + idle exceeds maxResident. Running children are never evicted.
+   * The closes are not awaited here (a run need not wait for another record's child); whenIdle/shutdown and a resume of
+   * the evicted record wait for them.
+   */
+  private evictIdle(): void {
+    const limit = this.deps.settings().maxResident;
+    for (const [id, session] of this.idle) {
+      if (limitAllows(limit, this.live.size + this.idle.size - 1)) break;
+      this.idle.delete(id);
+      void this.close(id, session);
+    }
+  }
+
+  /**
+   * The idle child for a resume if it is alive and still at the record's leaf; otherwise it is closed. Before returning
+   * undefined it waits for every close of this record still in flight (this one, or an earlier eviction/stop/exit),
+   * so the session file has no other writer when the runner reopens (and possibly pins) it.
+   */
+  private async takeIdle(record: SubagentRecord): Promise<ChildSession | undefined> {
+    const session = this.idle.get(record.id);
+    if (session) {
+      this.idle.delete(record.id);
+      let sameLeaf = false;
+      try {
+        sameLeaf = session.alive && record.childLeafId !== undefined && session.leafId === record.childLeafId;
+      } catch {
+        // An unreadable leaf counts as a mismatch: close the child and reopen from the session file.
+      }
+      if (sameLeaf) return session;
+      void this.close(record.id, session);
+    }
+    await this.closing.get(record.id);
+    return undefined;
+  }
+
+  /** Closes the idle child of a record, if any; resolves once every close of that record has finished. */
+  private closeIdle(id: string): Promise<void> {
+    const session = this.idle.get(id);
+    if (session) {
+      this.idle.delete(id);
+      return this.close(id, session);
+    }
+    return this.closing.get(id) ?? Promise.resolve();
+  }
+
+  /**
+   * The only way a child session is disposed. The close is tracked in `work` (whenIdle/shutdown wait for it) and in
+   * `closing` by record id (a reopen of the same session file waits for it). Never rejects.
+   */
+  private close(id: string, session: ChildSession): Promise<void> {
+    const previous = this.closing.get(id);
+    let disposing: Promise<void>;
+    try {
+      disposing = session.dispose().catch(() => {});
+    } catch {
+      disposing = Promise.resolve();
+    }
+    const done: Promise<void> = (previous ? Promise.all([previous, disposing]).then(() => {}) : disposing).finally(() => {
+      if (this.closing.get(id) === done) this.closing.delete(id);
+      this.work.delete(done);
+    });
+    this.closing.set(id, done);
+    this.work.add(done);
+    return done;
   }
 
   /** Synchronous checks shared by resume and checkResumable; throws the error resume would reject with. */

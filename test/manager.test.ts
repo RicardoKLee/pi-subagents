@@ -27,6 +27,8 @@ function setup(
     /** Zero-based open index at which FakeRunner.open rejects with "open failed". */
     failOpenAt?: number;
     settings?: Partial<SubagentSettings>;
+    /** How long each FakeSession.dispose() takes. */
+    disposeDelayMs?: number;
   } = {},
 ) {
   const root = tempDir("mgr-");
@@ -35,7 +37,9 @@ function setup(
     if (n === opts.failOpenAt) throw new Error("open failed");
     const file = spec.resumeFile ?? join(root, `child-${n}.jsonl`);
     writeFileSync(file, "", { flag: "a" });
-    return new FakeSession(file, scripts[n] ?? [], opts.hold ?? false);
+    const session = new FakeSession(file, scripts[n] ?? [], opts.hold ?? false);
+    session.disposeDelayMs = opts.disposeDelayMs ?? 0;
+    return session;
   });
   const sent: Parameters<DeliveryPort["sendMessage"]>[] = [];
   const entries: Parameters<DeliveryPort["appendEntry"]>[] = [];
@@ -44,7 +48,7 @@ function setup(
     scheduler: new Scheduler(() => opts.limit ?? 4),
     runners: { sdk: runner, rpc: undefined },
     agents: () => new Map([["reviewer", reviewer]]),
-    settings: () => ({ ...DEFAULT_SETTINGS, ...opts.settings }),
+    settings: () => ({ ...DEFAULT_SETTINGS, maxResident: 0, ...opts.settings }),
     port: opts.port ?? { sendMessage: (...args) => sent.push(args), appendEntry: (...args) => entries.push(args) },
     receiverContextWindow: () => opts.contextWindow ?? 200000,
     cwd: root,
@@ -666,5 +670,398 @@ describe("checkResumable", () => {
     await manager.stop("reviewer");
     expect(manager.checkResumable("reviewer")).toMatchObject({ code: "stopped" });
     expect(runner.opened).toHaveLength(1);
+  });
+});
+
+describe("resident children", () => {
+  it("resume reuses an idle child instead of opening a new one", async () => {
+    const { manager, runner } = setup({ hold: true, settings: { maxResident: 4 } });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    runner.sessions[0]!.leafId = "leaf-a";
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+    expect(runner.sessions[0]!.disposed).toBe(false);
+    await manager.resume("reviewer", "again", { background: true });
+    expect(runner.opened).toHaveLength(1);
+    expect(runner.sessions[0]!.prompts).toEqual(["x", "again"]);
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+    await manager.shutdown();
+    expect(runner.sessions[0]!.disposed).toBe(true);
+  });
+
+  it("maxResident 0 closes the child after every turn", async () => {
+    const { manager, runner } = setup({ scripts: [[ok("first")], [ok("second")]], settings: { maxResident: 0 } });
+    await manager.run({ agent: "reviewer", task: "x" });
+    expect(runner.sessions[0]!.disposed).toBe(true);
+    await manager.resume("reviewer", "again");
+    expect(runner.opened).toHaveLength(2);
+  });
+
+  it("restarts a resident child whose leaf no longer matches the record", async () => {
+    const persisted: SubagentRecord[] = [];
+    const registry = new Registry((r) => persisted.push(r));
+    const { manager, runner } = setup({ hold: true, registry, settings: { maxResident: 4 } });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    runner.sessions[0]!.leafId = "leaf-a";
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+    const branchA = persisted.map((data) => ({ type: "custom", customType: REGISTRY_ENTRY_TYPE, data }));
+    await manager.resume("reviewer", "on branch b", { background: true });
+    runner.sessions[0]!.leafId = "leaf-b";
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+
+    // Back on branch A: the record says leaf-a, the resident child is at leaf-b.
+    registry.reload(branchA);
+    await manager.resume("reviewer", "on branch a", { background: true });
+    expect(runner.sessions[0]!.disposed).toBe(true);
+    expect(runner.opened).toHaveLength(2);
+    expect(runner.opened[1]!.resumeLeafId).toBe("leaf-a");
+    runner.sessions[1]!.finish();
+    await manager.whenIdle();
+    await manager.shutdown();
+  });
+
+  it("evicts the least recently used idle child above maxResident", async () => {
+    const { manager, runner } = setup({ scripts: [[ok("a")], [ok("b")]], settings: { maxResident: 1 } });
+    await manager.run({ agent: "reviewer", task: "x" });
+    expect(runner.sessions[0]!.disposed).toBe(false);
+    await manager.run({ agent: "reviewer", task: "y" });
+    expect(runner.sessions[0]!.disposed).toBe(true);
+    expect(runner.sessions[1]!.disposed).toBe(false);
+    await manager.shutdown();
+  });
+
+  it("never evicts running children, even above maxResident", async () => {
+    const { manager, runner } = setup({ hold: true, settings: { maxResident: 1 } });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    await manager.run({ agent: "reviewer", task: "y", background: true });
+    expect(runner.sessions.map((s) => s.disposed)).toEqual([false, false]);
+    runner.sessions[0]!.finish();
+    runner.sessions[1]!.finish();
+    await manager.whenIdle();
+    expect(runner.sessions.filter((s) => !s.disposed)).toHaveLength(1);
+    await manager.shutdown();
+  });
+
+  it("a child that exited while idle is replaced on resume", async () => {
+    // Arrange: the record and the idle child agree on the leaf, so only the exit can make resume restart it.
+    const { manager, runner } = setup({ hold: true, settings: { maxResident: 4 } });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    runner.sessions[0]!.leafId = "leaf-a";
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+    expect(manager.list()[0]!.childLeafId).toBe("leaf-a");
+    expect(runner.sessions[0]!.disposed).toBe(false);
+
+    // Act
+    runner.sessions[0]!.exit("killed");
+    await manager.resume("reviewer", "again", { background: true });
+    runner.sessions[1]!.finish();
+    await manager.whenIdle();
+
+    // Assert: a new child resumes the session file at the recorded leaf; the dead one gets no prompt.
+    expect(runner.opened).toHaveLength(2);
+    expect(runner.opened[1]!.resumeFile).toBe(runner.sessions[0]!.sessionFile);
+    expect(runner.opened[1]!.resumeLeafId).toBe("leaf-a");
+    expect(runner.sessions[0]!.prompts).toEqual(["x"]);
+    expect(runner.sessions[1]!.prompts).toEqual(["again"]);
+    expect(manager.list()[0]!.status).toBe("completed");
+    await manager.shutdown();
+  });
+
+  it("stop and shutdown close idle children", async () => {
+    const { manager, runner } = setup({ scripts: [[ok("a")], [ok("b")]], settings: { maxResident: 4 } });
+    await manager.run({ agent: "reviewer", task: "x" });
+    await manager.run({ agent: "reviewer", task: "y" });
+    await manager.stop("reviewer");
+    expect(runner.sessions[0]!.disposed).toBe(true);
+    expect(runner.sessions[1]!.disposed).toBe(false);
+    await manager.shutdown();
+    expect(runner.sessions[1]!.disposed).toBe(true);
+  });
+
+  it("a resume refreshes recency so the other idle child is evicted first", async () => {
+    // Arrange: two idle children A (older) and B (newer); resuming A makes B the least recently used.
+    const { manager, runner } = setup({ hold: true, settings: { maxResident: 2 } });
+    await manager.run({ agent: "reviewer", task: "a", background: true });
+    runner.sessions[0]!.leafId = "leaf-a";
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+    await manager.run({ agent: "reviewer", task: "b", background: true });
+    runner.sessions[1]!.leafId = "leaf-b";
+    runner.sessions[1]!.finish();
+    await manager.whenIdle();
+    await manager.resume("reviewer", "a again", { background: true });
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+    expect(runner.opened).toHaveLength(2);
+
+    // Act: a third child starts running, so live + idle exceeds the limit.
+    await manager.run({ agent: "reviewer", task: "c", background: true });
+
+    // Assert: B (least recently used) is evicted, A stays resident.
+    expect(runner.sessions[1]!.disposed).toBe(true);
+    expect(runner.sessions[0]!.disposed).toBe(false);
+    runner.sessions[2]!.finish();
+    await manager.whenIdle();
+    await manager.shutdown();
+  });
+
+  it("maxResident -1 keeps every idle child open", async () => {
+    const { manager, runner } = setup({ scripts: [[ok("a")], [ok("b")], [ok("c")]], settings: { maxResident: -1 } });
+    await manager.run({ agent: "reviewer", task: "x" });
+    await manager.run({ agent: "reviewer", task: "y" });
+    await manager.run({ agent: "reviewer", task: "z" });
+    expect(runner.sessions.map((s) => s.disposed)).toEqual([false, false, false]);
+    await manager.shutdown();
+    expect(runner.sessions.every((s) => s.disposed)).toBe(true);
+  });
+
+  it("stopping a running resident child closes it instead of parking it", async () => {
+    const { manager, runner } = setup({ hold: true, settings: { maxResident: 4 } });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    await manager.stop("reviewer");
+    await manager.whenIdle();
+    await vi.waitFor(() => expect(runner.sessions[0]!.disposed).toBe(true));
+    await manager.shutdown();
+  });
+
+  it("with maxResident 0 the child has finished closing when run() returns", async () => {
+    const { manager, runner } = setup({ scripts: [[ok("a")]], disposeDelayMs: 50, settings: { maxResident: 0 } });
+    await manager.run({ agent: "reviewer", task: "x" });
+    expect(runner.sessions[0]!.disposeDone).toBe(true);
+  });
+
+  it("an evicted child has finished closing before resume reopens its session file", async () => {
+    const { manager, runner } = setup({ scripts: [[ok("a")], [ok("b")], [ok("a2")]], disposeDelayMs: 50, settings: { maxResident: 1 } });
+    await manager.run({ agent: "reviewer", task: "x" });
+    // Starting a second child evicts the first (idle) one.
+    await manager.run({ agent: "reviewer", task: "y" });
+    expect(runner.sessions[0]!.disposed).toBe(true);
+    const open = runner.open.bind(runner);
+    const closedAtOpen: boolean[] = [];
+    runner.open = async (spec) => {
+      closedAtOpen.push(runner.sessions[0]!.disposeDone);
+      return open(spec);
+    };
+    await manager.resume("reviewer", "again");
+    expect(runner.opened[2]!.resumeFile).toBe(runner.sessions[0]!.sessionFile);
+    expect(closedAtOpen).toEqual([true]);
+    await manager.shutdown();
+  });
+
+  it("stop on an idle child returns once the child has finished closing", async () => {
+    const { manager, runner } = setup({ scripts: [[ok("a")]], disposeDelayMs: 50, settings: { maxResident: 4 } });
+    await manager.run({ agent: "reviewer", task: "x" });
+    await manager.stop("reviewer");
+    expect(runner.sessions[0]!.disposeDone).toBe(true);
+    await manager.shutdown();
+  });
+
+  it("whenIdle waits for an evicted child to finish closing", async () => {
+    const { manager, runner } = setup({ scripts: [[ok("a")], [ok("b")]], disposeDelayMs: 50, settings: { maxResident: 1 } });
+    await manager.run({ agent: "reviewer", task: "x" });
+    await manager.run({ agent: "reviewer", task: "y" });
+    await manager.whenIdle();
+    expect(runner.sessions[0]!.disposeDone).toBe(true);
+    await manager.shutdown();
+  });
+
+  it("shutdown waits for idle children and children still closing", async () => {
+    const { manager, runner } = setup({ scripts: [[ok("a")], [ok("b")]], disposeDelayMs: 50, settings: { maxResident: 1 } });
+    await manager.run({ agent: "reviewer", task: "x" });
+    // The evicted child takes longer to close than the idle one shutdown closes itself.
+    runner.sessions[0]!.disposeDelayMs = 150;
+    await manager.run({ agent: "reviewer", task: "y" });
+    await manager.shutdown();
+    expect(runner.sessions.map((s) => s.disposeDone)).toEqual([true, true]);
+  });
+
+  it("a resident child whose leaf cannot be read is closed and reopened on resume", async () => {
+    const { manager, runner } = setup({ hold: true, settings: { maxResident: 4 } });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    runner.sessions[0]!.leafId = "leaf-a";
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+    Object.defineProperty(runner.sessions[0]!, "leafId", {
+      get() {
+        throw new Error("leaf unreadable");
+      },
+    });
+    await manager.resume("reviewer", "again", { background: true });
+    expect(runner.sessions[0]!.disposed).toBe(true);
+    expect(runner.opened).toHaveLength(2);
+    expect(runner.opened[1]!.resumeLeafId).toBe("leaf-a");
+    runner.sessions[1]!.finish();
+    await manager.whenIdle();
+    await manager.shutdown();
+  });
+
+  it("a child that exits while idle is still disposed", async () => {
+    const { manager, runner } = setup({ scripts: [[ok("a")]], settings: { maxResident: 4 } });
+    await manager.run({ agent: "reviewer", task: "x" });
+    runner.sessions[0]!.exit("killed");
+    await manager.whenIdle();
+    expect(runner.sessions[0]!.disposed).toBe(true);
+    await manager.shutdown();
+  });
+
+  it("with maxResident 1 a child that exited while idle no longer holds the slot", async () => {
+    // Arrange: A is the only resident child, then it exits while idle.
+    const { manager, runner } = setup({ hold: true, settings: { maxResident: 1 } });
+    await manager.run({ agent: "reviewer", task: "a", background: true });
+    runner.sessions[0]!.leafId = "leaf-a";
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+    runner.sessions[0]!.exit("killed");
+    await manager.whenIdle();
+    expect(runner.sessions[0]!.disposed).toBe(true);
+
+    // Act: a new child B runs and becomes idle.
+    await manager.run({ agent: "reviewer", task: "b", background: true });
+    runner.sessions[1]!.leafId = "leaf-b";
+    runner.sessions[1]!.finish();
+    await manager.whenIdle();
+
+    // Assert: B keeps the single slot and a resume of B reuses it.
+    expect(runner.sessions[1]!.disposed).toBe(false);
+    const b = manager.list().find((r) => r.sessionFile === runner.sessions[1]!.sessionFile)!;
+    await manager.resume(b.handle, "b again", { background: true });
+    expect(runner.opened).toHaveLength(2);
+    expect(runner.sessions[1]!.prompts).toEqual(["b", "b again"]);
+    runner.sessions[1]!.finish();
+    await manager.whenIdle();
+    await manager.shutdown();
+  });
+
+  it("a child that exited while idle does not make a live idle child get evicted", async () => {
+    // Arrange: A (older) and B (newer) are idle with maxResident 2; then B exits.
+    const { manager, runner } = setup({ hold: true, settings: { maxResident: 2 } });
+    await manager.run({ agent: "reviewer", task: "a", background: true });
+    runner.sessions[0]!.leafId = "leaf-a";
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+    await manager.run({ agent: "reviewer", task: "b", background: true });
+    runner.sessions[1]!.leafId = "leaf-b";
+    runner.sessions[1]!.finish();
+    await manager.whenIdle();
+    runner.sessions[1]!.exit("killed");
+
+    // Act: C starts running; live C + idle A fit in the limit only if the dead B is gone.
+    await manager.run({ agent: "reviewer", task: "c", background: true });
+
+    // Assert
+    expect(runner.sessions[0]!.disposed).toBe(false);
+    expect(runner.sessions[1]!.disposed).toBe(true);
+    runner.sessions[2]!.finish();
+    await manager.whenIdle();
+    await manager.shutdown();
+  });
+
+  it("a dead idle child is not reused even before its exit is reported", async () => {
+    // Arrange: the idle child is at the recorded leaf but no longer alive (exit not reported yet).
+    const { manager, runner } = setup({ hold: true, settings: { maxResident: 4 } });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    runner.sessions[0]!.leafId = "leaf-a";
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+    runner.sessions[0]!.exited = true;
+
+    // Act
+    await manager.resume("reviewer", "again", { background: true });
+
+    // Assert
+    expect(runner.opened).toHaveLength(2);
+    expect(runner.opened[1]!.resumeLeafId).toBe("leaf-a");
+    expect(runner.sessions[0]!.prompts).toEqual(["x"]);
+    expect(runner.sessions[0]!.disposed).toBe(true);
+    runner.sessions[1]!.finish();
+    await manager.whenIdle();
+    await manager.shutdown();
+  });
+
+  it("a child that dies during a run is closed instead of parked", async () => {
+    const { manager, runner } = setup({ hold: true, settings: { maxResident: 4 } });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    runner.sessions[0]!.leafId = "leaf-a";
+    runner.sessions[0]!.exit("killed");
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+    expect(runner.sessions[0]!.disposed).toBe(true);
+    await manager.resume("reviewer", "again", { background: true });
+    expect(runner.opened).toHaveLength(2);
+    runner.sessions[1]!.finish();
+    await manager.whenIdle();
+    await manager.shutdown();
+  });
+
+  it("shutdown closes a running resident child instead of parking it", async () => {
+    // Arrange: the child's prompt settles only after shutdown has closed the idle children it knew about.
+    const { manager, runner } = setup({ hold: true, settings: { maxResident: 4 } });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    const session = runner.sessions[0]!;
+    session.leafId = "leaf-a";
+    const abort = session.abort.bind(session);
+    session.abort = async () => {
+      setTimeout(() => void abort(), 10);
+    };
+
+    // Act
+    await manager.shutdown();
+    await vi.waitFor(() => expect(session.aborted).toBe(1));
+    await manager.whenIdle();
+
+    // Assert
+    expect(session.disposed).toBe(true);
+    expect(manager.list()[0]!.status).toBe("paused");
+  });
+
+  it("stop while resume waits for a mismatched child to close leaves nothing open", async () => {
+    // Arrange: the idle child is at leaf-b while the record says leaf-a, and its dispose takes 50 ms.
+    const { manager, runner } = setup({ hold: true, disposeDelayMs: 50, settings: { maxResident: 4 } });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    runner.sessions[0]!.leafId = "leaf-a";
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+    runner.sessions[0]!.leafId = "leaf-b";
+    const resumed = manager.resume("reviewer", "again", { background: true });
+    const settled = resumed.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    await vi.waitFor(() => expect(runner.sessions[0]!.disposed).toBe(true));
+    expect(runner.sessions[0]!.disposeDone).toBe(false);
+
+    // Act
+    await manager.stop("reviewer");
+
+    // Assert
+    expect(runner.sessions[0]!.disposeDone).toBe(true);
+    const error = await settled;
+    expect(error).toBeInstanceOf(SubagentError);
+    expect((error as SubagentError).code).toBe("stopped");
+    await manager.whenIdle();
+    expect(manager.list()[0]!.status).toBe("stopped");
+    // Current behaviour: resume may still open a new child after the stop, but it closes it without prompting it.
+    expect(runner.sessions.every((s) => s.disposeDone)).toBe(true);
+    expect(runner.sessions.slice(1).every((s) => s.prompts.length === 0)).toBe(true);
+    expect(runner.sessions[0]!.prompts).toEqual(["x"]);
+    await manager.shutdown();
+  });
+
+  it("with maxResident 1 only one of three concurrent children stays open", async () => {
+    const { manager, runner } = setup({ hold: true, limit: 3, settings: { maxResident: 1 } });
+    await manager.run({ agent: "reviewer", task: "a", background: true });
+    await manager.run({ agent: "reviewer", task: "b", background: true });
+    await manager.run({ agent: "reviewer", task: "c", background: true });
+    expect(runner.sessions.map((s) => s.disposed)).toEqual([false, false, false]);
+    for (const s of runner.sessions) s.finish();
+    await manager.whenIdle();
+    expect(manager.list().map((r) => r.status)).toEqual(["completed", "completed", "completed"]);
+    expect(runner.sessions.filter((s) => !s.disposed)).toHaveLength(1);
+    expect(runner.sessions.filter((s) => s.disposed).every((s) => s.disposeDone)).toBe(true);
+    await manager.shutdown();
   });
 });

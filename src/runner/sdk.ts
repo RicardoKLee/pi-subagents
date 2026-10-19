@@ -28,7 +28,18 @@ function delta(after: Usage, before: Usage): Usage {
 }
 
 class SdkChildSession implements ChildSession {
+  private disposed = false;
+
   constructor(private readonly session: AgentSession) {}
+
+  get alive(): boolean {
+    return !this.disposed;
+  }
+
+  /** An in-process session never ends on its own. */
+  onExit(): () => void {
+    return () => {};
+  }
 
   get sessionFile(): string {
     const file = this.session.sessionFile;
@@ -66,6 +77,7 @@ class SdkChildSession implements ChildSession {
   }
 
   async dispose(): Promise<void> {
+    this.disposed = true;
     this.session.dispose();
   }
 }

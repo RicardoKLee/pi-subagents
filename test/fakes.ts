@@ -10,11 +10,35 @@ export class FakeSession implements ChildSession {
   disposed = false;
   /** Tests set this to simulate the child session's current leaf entry. */
   leafId: string | undefined;
+  exited = false;
+  /** Optional: how long dispose() takes to finish (simulates a child process that needs time to exit). */
+  disposeDelayMs = 0;
+  /** True once a dispose() call has finished; `disposed` turns true as soon as dispose() is called. */
+  disposeDone = false;
+  private readonly exitListeners: ((reason: string) => void)[] = [];
   private pending?: (r: ChildResult) => void;
   private held?: ChildResult;
 
   /** `hold`: prompt() stays pending until finish() or abort(). */
   constructor(readonly sessionFile: string, private readonly script: ChildResult[], private readonly hold = false) {}
+
+  get alive(): boolean {
+    return !this.disposed && !this.exited;
+  }
+
+  onExit(listener: (reason: string) => void): () => void {
+    this.exitListeners.push(listener);
+    return () => {
+      const i = this.exitListeners.indexOf(listener);
+      if (i >= 0) this.exitListeners.splice(i, 1);
+    };
+  }
+
+  /** Simulates the child dying on its own (crash, killed process). */
+  exit(reason = "child process exited"): void {
+    this.exited = true;
+    for (const l of [...this.exitListeners]) l(reason);
+  }
 
   prompt(text: string): Promise<ChildResult> {
     if (this.pending) return Promise.reject(new Error("FakeSession: prompt while busy"));
@@ -46,6 +70,8 @@ export class FakeSession implements ChildSession {
 
   async dispose(): Promise<void> {
     this.disposed = true;
+    if (this.disposeDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, this.disposeDelayMs));
+    this.disposeDone = true;
   }
 }
 
