@@ -1,10 +1,10 @@
 import { existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import type { AgentDef } from "./agents.ts";
-import { type ChainRecord, ChainStore } from "./chain.ts";
+import { type ChainRecord, type ChainStatus, ChainStore } from "./chain.ts";
 import { type Ask, deliver, type DeliveryPort, deliverBatch, quoteAsk, renderAsks } from "./delivery.ts";
 import { estimateTokens, type Payload, preparePayload, SUMMARY_INSTRUCTION, writeOutput } from "./output.ts";
-import type { Registry, RunStatus, SubagentRecord } from "./registry.ts";
+import { type Registry, type RunStatus, type SubagentRecord, type Usage, ZERO_USAGE } from "./registry.ts";
 import type { ChildResult, ChildSession, Runner } from "./runner/types.ts";
 import { type Scheduler, SubagentsDisabledError } from "./scheduler.ts";
 import type { DeliveryMode, RunnerKind, SubagentSettings } from "./settings.ts";
@@ -81,8 +81,9 @@ export interface BatchItem {
 export interface BatchOutcome {
   /**
    * Records for the batch, in item order. A foreground batch resolves with each record's final state; a background
-   * batch returns the queued snapshots taken when the records were created (only `id` and `handle` are guaranteed
-   * to match the finished run). Callers must read the current status from the registry, never from these snapshots.
+   * parallel batch returns the queued snapshots taken when the records were created, and a background chain returns an
+   * empty list (the tool only needs the chain id). Callers must read the current status from the registry, never from
+   * these snapshots.
    */
   records: SubagentRecord[];
   /** Foreground batches: the summary the tool returns. */
@@ -269,6 +270,178 @@ export class SubagentManager {
       (error) => this.reportBatchError(prepared[0]?.record, error),
     );
     return { records: prepared.map((p) => p.record) };
+  }
+
+  /** Runs the steps one after another; a failing, interrupted or stopped step stops the chain and can be continued later. */
+  async runChain(req: { steps: readonly BatchItem[]; background?: boolean; signal?: AbortSignal }): Promise<BatchOutcome> {
+    if (this.closed) throw shutDownError();
+    if (req.steps.length === 0) throw new Error("a chain needs at least one step");
+    const max = this.deps.settings().maxChainSteps;
+    if (max === 0) throw new SubagentsDisabledError("chains are disabled (maxChainSteps is 0)");
+    if (!limitAllows(max, req.steps.length - 1)) throw new Error(`too many chain steps (${req.steps.length}); max is ${max}`);
+    // Refuse before the chain exists when the scheduler is disabled (maxConcurrent 0): prepare() would throw
+    // afterwards and leave a chain stuck in "running" with no step records and no way to continue it.
+    if (this.deps.scheduler.disabled) throw new SubagentsDisabledError();
+    // Validate every step's agent, runner and cwd before the chain exists, so a typo cannot leave a half-run chain behind.
+    const targets = req.steps.map((step) => this.resolveTarget({ agent: step.agent, cwd: step.cwd }));
+    const chain = this.deps.chainStore.create({
+      steps: req.steps.map((s) => ({ agent: s.agent, task: s.task, ...(s.cwd ? { cwd: s.cwd } : {}) })),
+    });
+    if (!req.background) return this.runChainLoop(chain, 0, "", req.signal, targets);
+    this.track(
+      this.runChainLoop(chain, 0, "", req.signal, targets).then((outcome) => {
+        this.sendBatch("chain", outcome.payload!, outcome.records, outcome.chain);
+      }),
+      (error) => this.reportBatchError(this.firstChainRecord(chain.id), error),
+    );
+    return { records: [], chain };
+  }
+
+  /** Continues the chain that stopped at the step behind `handle`: resumes that step, then runs the remaining ones. */
+  async continueChain(handle: string, message?: string, opts: { background?: boolean; signal?: AbortSignal } = {}): Promise<BatchOutcome> {
+    if (this.closed) throw shutDownError();
+    const record = this.requireRecord(handle);
+    const chain = record.chainId ? this.deps.chainStore.get(record.chainId) : undefined;
+    if (!chain) throw new SubagentError("unknown_handle", `@${record.handle} is not part of a chain`);
+    if (chain.status === "stopped") throw new SubagentError("stopped", `chain ${chain.id} was stopped and cannot be continued`);
+    if (chain.status === "running") throw new SubagentError("busy", `chain ${chain.id} is still running`);
+    if (chain.status === "completed") throw new SubagentError("not_running", `chain ${chain.id} already finished`);
+    const index = record.stepIndex ?? chain.currentStep;
+    if (index !== chain.currentStep) {
+      throw new SubagentError(
+        "not_running",
+        `@${record.handle} is step ${index + 1} of chain ${chain.id}, which stopped at step ${chain.currentStep + 1}`,
+      );
+    }
+    // Validate the remaining steps before resuming, so a bad step cannot leave the chain half-advanced.
+    const targets = chain.steps.map((step, i) => (i > index ? this.resolveTarget({ agent: step.agent, cwd: step.cwd }) : undefined));
+    if (!opts.background) return this.continueChainLoop(chain, record, index, message, opts.signal, targets);
+    this.track(
+      this.continueChainLoop(chain, record, index, message, opts.signal, targets).then((outcome) => {
+        this.sendBatch("chain", outcome.payload!, outcome.records, outcome.chain);
+      }),
+      (error) => this.reportBatchError(this.firstChainRecord(chain.id), error),
+    );
+    return { records: [], chain };
+  }
+
+  /** Chains that still have a live or queued run (those must survive a branch switch). */
+  activeChains(): ChainRecord[] {
+    const ids = new Set<string>();
+    for (const r of this.activeRecords()) if (r.chainId) ids.add(r.chainId);
+    return [...ids].map((id) => this.deps.chainStore.get(id)).filter((c): c is ChainRecord => !!c);
+  }
+
+  private async continueChainLoop(
+    chain: ChainRecord,
+    record: SubagentRecord,
+    index: number,
+    message: string | undefined,
+    signal: AbortSignal | undefined,
+    targets: readonly (Resolved | undefined)[],
+  ): Promise<BatchOutcome> {
+    // Resume the step that stopped the chain so it keeps its own session, then run the remaining steps.
+    const receiver = this.chainReceiverWindow(chain, index);
+    const resumed = await this.resume(record.handle, message ?? record.task, {
+      background: true,
+      ...(signal ? { signal } : {}),
+      mode: "batch",
+      ...(receiver ? { receiverContextWindow: receiver } : {}),
+    });
+    if (resumed.record.status !== "completed") {
+      const stopped = this.deps.chainStore.update(chain.id, { status: chainStatusOf(resumed.record.status), usage: this.chainUsage(chain) });
+      return { records: [resumed.record], payload: this.chainPayload(stopped, [resumed]), chain: stopped };
+    }
+    // The resumed step keeps its record id, so the chain usage stays the sum of every started step's record.
+    const current = this.deps.chainStore.update(chain.id, { status: "running", usage: this.chainUsage(chain) });
+    const rest = await this.runChainLoop(current, index + 1, resumed.payload?.text ?? "", signal, targets, [resumed]);
+    // `runChainLoop` already carries the resumed outcome, so its records and payload span the whole chain.
+    return { records: rest.records, payload: rest.payload, chain: rest.chain };
+  }
+
+  private async runChainLoop(
+    chain: ChainRecord,
+    from: number,
+    previous: string,
+    signal: AbortSignal | undefined,
+    targets: readonly (Resolved | undefined)[],
+    outcomes: RunOutcome[] = [],
+  ): Promise<BatchOutcome> {
+    let current = chain;
+    for (let i = from; i < chain.steps.length; i++) {
+      const step = chain.steps[i]!;
+      const task = substitutePrevious(step.task, previous);
+      let prepared: Prepared;
+      try {
+        prepared = this.prepare({ agent: step.agent, task, cwd: step.cwd, chainId: chain.id, stepIndex: i }, targets[i]);
+      } catch (error) {
+        // prepare() can only fail before the step's record exists (shutdown or disabled between steps). Never leave
+        // the chain stuck in "running": settle it to stopped/failed and let the caller or the background error path
+        // surface the failure (firstChainRecord is then defined whenever any earlier step had started).
+        this.deps.chainStore.update(chain.id, { status: this.closed ? "stopped" : "failed", usage: this.chainUsage(current) });
+        throw error;
+      }
+      current = this.deps.chainStore.update(chain.id, { currentStep: i, status: "running", stepRecordIds: [...current.stepRecordIds, prepared.record.id] });
+      const receiver = this.chainReceiverWindow(chain, i);
+      let outcome: RunOutcome;
+      try {
+        outcome = await this.launch(prepared, task, true, signal, { mode: "batch", ...(receiver ? { receiverContextWindow: receiver } : {}) });
+      } catch (error) {
+        // The run was cancelled or its session could not open; the record already says why.
+        const failed = this.deps.registry.get(prepared.record.id) ?? prepared.record;
+        outcomes.push({ record: failed });
+        const stopped = this.deps.chainStore.update(chain.id, { status: chainStatusOf(failed.status), usage: this.chainUsage(current) });
+        return { records: outcomes.map((o) => o.record), payload: this.chainPayload(stopped, outcomes), chain: stopped };
+      }
+      outcomes.push(outcome);
+      current = this.deps.chainStore.update(chain.id, { usage: this.chainUsage(current) });
+      if (outcome.record.status !== "completed") {
+        const stopped = this.deps.chainStore.update(chain.id, { status: chainStatusOf(outcome.record.status) });
+        return { records: outcomes.map((o) => o.record), payload: this.chainPayload(stopped, outcomes), chain: stopped };
+      }
+      previous = outcome.payload?.text ?? "";
+    }
+    const done = this.deps.chainStore.update(chain.id, { status: "completed", usage: this.chainUsage(current) });
+    return { records: outcomes.map((o) => o.record), payload: this.chainPayload(done, outcomes), chain: done };
+  }
+
+  /** The window of whoever receives a step's output: the next step's agent, or the main session for the last step. */
+  private chainReceiverWindow(chain: ChainRecord, index: number): number | undefined {
+    const next = chain.steps[index + 1] ? this.deps.agents().get(chain.steps[index + 1]!.agent) : undefined;
+    return next ? this.deps.receiverContextWindowFor?.(next) : undefined;
+  }
+
+  /** The first step record of a chain, for reporting a detached failure; undefined before the first step starts. */
+  private firstChainRecord(chainId: string): SubagentRecord | undefined {
+    const first = this.deps.chainStore.get(chainId)?.stepRecordIds[0];
+    return first ? this.deps.registry.get(first) : undefined;
+  }
+
+  /**
+   * The chain's total usage, recomputed from its started step records. A resumed step keeps its record id and its
+   * usage is cumulative, so summing `chain.usage` again would double-count it; deriving the total from the registry
+   * keeps `chain.usage` equal to the sum of every started step's record usage.
+   */
+  private chainUsage(chain: ChainRecord): Usage {
+    let total: Usage = { ...ZERO_USAGE };
+    for (const id of chain.stepRecordIds) {
+      const record = this.deps.registry.get(id);
+      if (record) total = addUsage(total, record.usage);
+    }
+    return total;
+  }
+
+  /** One summary for a chain: a head line, a section per step, then the last step's output. */
+  private chainPayload(chain: ChainRecord, outcomes: readonly RunOutcome[]): Payload {
+    // Count every step the chain has started (not just this call's outcomes), so a continued chain still reports 3/3.
+    const head = `Chain ${chain.status} (${chain.stepRecordIds.length}/${chain.steps.length} steps)`;
+    const sections = outcomes.map((o) => {
+      const r = o.record;
+      const step = `step ${(r.stepIndex ?? 0) + 1}`;
+      return `### [@${r.handle}] (${r.agent}) ${step} ${r.status}${r.error ? `: ${r.error}` : ""}\n${r.lastSummary ?? ""}\nSession: ${r.sessionFile}`;
+    });
+    const last = outcomes.at(-1)?.payload?.text ?? "";
+    return { text: `${head}\n\n${sections.join("\n\n")}${last ? `\n\n${last}` : ""}`, summary: head };
   }
 
   /** A rejected batch item is reported like finish() reports a failed run, using the status settleQueued already stored. */
@@ -853,6 +1026,36 @@ export class SubagentManager {
 
 function runInterruptedError(): SubagentError {
   return new SubagentError("interrupted", "subagent run was interrupted before it started");
+}
+
+/** The only placeholder a chain task may use: the previous step's final output. */
+function substitutePrevious(task: string, previous: string): string {
+  // Use a function replacement: `$&`, `` $` ``, `$'`, `$1` and `$$` in the previous output must stay literal.
+  return task.replace(/\{previous\}/g, () => previous);
+}
+
+/** Maps a finished step's run status to the chain status it leaves behind. */
+function chainStatusOf(status: RunStatus): ChainStatus {
+  switch (status) {
+    case "completed":
+      return "completed";
+    case "paused":
+      return "paused";
+    case "stopped":
+      return "stopped";
+    default:
+      return "failed";
+  }
+}
+
+function addUsage(a: Usage, b: Usage): Usage {
+  return {
+    input: a.input + b.input,
+    output: a.output + b.output,
+    cacheRead: a.cacheRead + b.cacheRead,
+    cacheWrite: a.cacheWrite + b.cacheWrite,
+    cost: Math.round((a.cost + b.cost) * 1e6) / 1e6,
+  };
 }
 
 function shutDownError(): Error {
