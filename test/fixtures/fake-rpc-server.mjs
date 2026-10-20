@@ -14,6 +14,7 @@ if (mode === "exit-soon") setTimeout(() => process.exit(5), 200);
 
 let leaf = "leaf-0";
 let n = 0;
+let entriesCalls = 0;
 function handle(cmd) {
   switch (cmd.type) {
     case "get_state":
@@ -22,6 +23,9 @@ function handle(cmd) {
       n++;
       return respond(cmd, { tokens: { input: 10 * n, output: 5 * n, cacheRead: 0, cacheWrite: 0, total: 15 * n }, cost: 0.01 * n });
     case "get_entries":
+      entriesCalls++;
+      // "entries-fail-after-first": the first read works, later ones fail (the client must keep its last known leaf).
+      if (mode === "entries-fail-after-first" && entriesCalls > 1) return respond(cmd, undefined, false, "entries unavailable");
       return respond(cmd, { entries: [], leafId: leaf });
     case "fail":
       return respond(cmd, undefined, false, "nope");

@@ -135,16 +135,19 @@ class RpcChildSession implements ChildSession {
     return { input: s.tokens.input, output: s.tokens.output, cacheRead: s.tokens.cacheRead, cacheWrite: s.tokens.cacheWrite, cost: s.cost };
   }
 
-  /** The child's leaf after a turn; unknown (forces a restart on the next resume) if it cannot be read. */
+  /**
+   * The child's leaf after a turn. If it cannot be read the last known value is kept: a slightly stale pin is far
+   * better than an unknown one, which would silently drop this turn on the next restart.
+   */
   private async refreshLeaf(): Promise<void> {
     try {
       const since = this.leaf ? { since: this.leaf } : {};
-      this.leaf = (await this.proc.request<{ leafId: string | null }>({ type: "get_entries", ...since })).leafId ?? undefined;
+      this.leaf = (await this.proc.request<{ leafId: string | null }>({ type: "get_entries", ...since })).leafId ?? this.leaf;
     } catch {
       try {
-        this.leaf = (await this.proc.request<{ leafId: string | null }>({ type: "get_entries" })).leafId ?? undefined;
+        this.leaf = (await this.proc.request<{ leafId: string | null }>({ type: "get_entries" })).leafId ?? this.leaf;
       } catch {
-        this.leaf = undefined;
+        // Keep the previous leaf.
       }
     }
   }

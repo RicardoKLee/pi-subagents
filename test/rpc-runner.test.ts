@@ -129,6 +129,15 @@ describe("RpcRunner with a fake child", () => {
     expect(s.alive).toBe(false);
   });
 
+  it("keeps the last known leaf when get_entries keeps failing", async () => {
+    const s = await open("entries-fail-after-first");
+    await s.prompt("one");
+    const first = s.leafId;
+    expect(first).toBeTruthy();
+    await s.prompt("two");
+    expect(s.leafId).toBe(first);
+  });
+
   it("cannot resolve a model", async () => {
     const r = new RpcRunner({ resolveModel: () => undefined, cliPath: SERVER });
     await expect(r.open(base)).rejects.toThrow(/cannot resolve model/);
