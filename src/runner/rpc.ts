@@ -190,7 +190,7 @@ export class RpcRunner implements Runner {
     const model = this.opts.resolveModel(spec.agent.model);
     if (!model) throw new Error(`cannot resolve model "${spec.agent.model ?? "(inherit)"}" for agent ${spec.agent.name}`);
     if (spec.resumeFile && spec.resumeLeafId) pinLeaf(spec.resumeFile, spec.resumeLeafId);
-    const trusted = this.opts.projectTrusted?.();
+    const trusted = spec.projectTrusted ?? this.opts.projectTrusted?.();
     const proc = new RpcProcess({
       cliPath: this.opts.cliPath ?? piCliPath(),
       args: buildRpcArgs(spec, `${model.provider}/${model.id}`, { ...(trusted !== undefined ? { trusted } : {}), ...(this.opts.extraArgs ? { extraArgs: this.opts.extraArgs } : {}) }),

@@ -204,6 +204,26 @@ describe("RpcRunner against a configurable fake child", () => {
     expect((JSON.parse(readFileSync(recordFile, "utf8")) as { argv: string[] }).argv).toContain("-na");
   });
 
+  it("should_prefer_the_spec_trust_over_the_runner_option", async () => {
+    // The manager decides trust per child cwd and passes it on the spec; it must win over the runner-wide option.
+    const recordFile = join(tempDir("rec-"), "argv.json");
+    const { runner: r } = runner({ recordFile }, { projectTrusted: () => false });
+    await open(r, { projectTrusted: true });
+    const argv = (JSON.parse(readFileSync(recordFile, "utf8")) as { argv: string[] }).argv;
+    expect(argv).toContain("-a");
+    expect(argv).not.toContain("-na");
+  });
+
+  it("should_prefer_an_untrusted_spec_over_a_trusted_runner_option", async () => {
+    // Symmetric to the case above: the manager can mark one child cwd untrusted while the runner default is trusted.
+    const recordFile = join(tempDir("rec-"), "argv.json");
+    const { runner: r } = runner({ recordFile }, { projectTrusted: () => true });
+    await open(r, { projectTrusted: false });
+    const argv = (JSON.parse(readFileSync(recordFile, "utf8")) as { argv: string[] }).argv;
+    expect(argv).toContain("-na");
+    expect(argv).not.toContain("-a");
+  });
+
   it("should_report_each_turn_usage_as_the_difference_of_cumulative_session_stats", async () => {
     const stats = [
       { input: 100, output: 40, cacheRead: 7, cacheWrite: 3, cost: 0.5 },

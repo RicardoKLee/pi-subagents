@@ -32,6 +32,11 @@ export interface SubagentRecord {
   status: RunStatus;
   delivery: DeliveryMode;
   task: string;
+  /** Working directory of the child process; absent means the main session's cwd (records written before M4). */
+  cwd?: string;
+  /** Set for chain steps: the chain this run belongs to and its 0-based position. */
+  chainId?: string;
+  stepIndex?: number;
   createdAt: number;
   updatedAt: number;
   usage: Usage;
@@ -48,12 +53,17 @@ export interface NewRecord {
   sessionFile: string;
   delivery: DeliveryMode;
   task: string;
+  /** Working directory for the child process (already resolved); absent means the main session's cwd. */
+  cwd?: string;
+  /** Set for chain steps: the chain this run belongs to and its 0-based position. */
+  chainId?: string;
+  stepIndex?: number;
   /** "queued" while the run waits for a slot and a child session; defaults to "running". */
   status?: "queued" | "running";
 }
 
 export type RecordPatch = Partial<
-  Pick<SubagentRecord, "status" | "runId" | "lastSummary" | "error" | "delivery" | "task" | "sessionFile" | "childLeafId">
+  Pick<SubagentRecord, "status" | "runId" | "lastSummary" | "error" | "delivery" | "task" | "sessionFile" | "childLeafId" | "cwd" | "chainId" | "stepIndex">
 >;
 
 function isRecord(value: unknown): value is SubagentRecord {
@@ -106,6 +116,8 @@ export class Registry {
       status: input.status ?? "running",
       delivery: input.delivery,
       task: input.task,
+      ...(input.cwd ? { cwd: input.cwd } : {}),
+      ...(input.chainId ? { chainId: input.chainId, stepIndex: input.stepIndex ?? 0 } : {}),
       createdAt: t,
       updatedAt: t,
       usage: { ...ZERO_USAGE },

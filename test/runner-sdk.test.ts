@@ -322,6 +322,16 @@ describe("SdkRunner", () => {
       expect(await runBash(project(() => undefined, { defaultProjectTrust: "always" }))).toBe(true);
     });
 
+    it("should_prefer_the_spec_trust_over_the_runner_option", async () => {
+      // The manager decides trust per child cwd and passes it on the spec; it must win over the runner-wide option.
+      const runnerUntrusted = project(() => false);
+      const trustedSpec = { ...runnerUntrusted.spec, projectTrusted: true };
+      expect(await runBash({ ...runnerUntrusted, spec: trustedSpec })).toBe(true);
+      const runnerTrusted = project(() => true);
+      const untrustedSpec = { ...runnerTrusted.spec, projectTrusted: false };
+      expect(await runBash({ ...runnerTrusted, spec: untrustedSpec })).toBe(false);
+    });
+
     it("should_not_run_the_project_npmCommand_on_open_when_projectTrusted_returns_false", async () => {
       // A missing project package makes resource loading install it with the project's npmCommand.
       const root = tempDir("sdk-npm-");

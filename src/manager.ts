@@ -1,4 +1,5 @@
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
+import { resolve } from "node:path";
 import type { AgentDef } from "./agents.ts";
 import { type Ask, deliver, type DeliveryPort, quoteAsk, renderAsks } from "./delivery.ts";
 import { type Payload, preparePayload, SUMMARY_INSTRUCTION } from "./output.ts";
@@ -8,7 +9,15 @@ import { type Scheduler, SubagentsDisabledError } from "./scheduler.ts";
 import type { DeliveryMode, RunnerKind, SubagentSettings } from "./settings.ts";
 import { limitAllows } from "./settings.ts";
 
-export type SubagentErrorCode = "unknown_agent" | "unknown_handle" | "stopped" | "busy" | "not_running" | "missing_session" | "interrupted";
+export type SubagentErrorCode =
+  | "unknown_agent"
+  | "unknown_handle"
+  | "stopped"
+  | "busy"
+  | "not_running"
+  | "missing_session"
+  | "missing_cwd"
+  | "interrupted";
 
 export class SubagentError extends Error {
   constructor(readonly code: SubagentErrorCode, message: string) {
@@ -29,6 +38,8 @@ export interface ManagerDeps {
   cwd: string;
   sessionDir: string;
   outputDir: string;
+  /** Project trust for a child cwd decided by the caller; the manager never guesses it. */
+  trustForCwd?: (cwd: string) => boolean | undefined;
   /** Called when a background result could not be delivered (the error is also recorded on the record). */
   onDeliveryError?: (record: SubagentRecord, message: string) => void;
   /** Called once a new record exists (queued); used to warn about handles that clash with files. */
@@ -42,6 +53,13 @@ export interface RunRequest {
   background?: boolean;
   /** The calling tool's signal: aborting it cancels this run while queued, opening, or (foreground) running. */
   signal?: AbortSignal;
+  /** Working directory for the child; relative paths resolve against deps.cwd. Defaults to deps.cwd. */
+  cwd?: string;
+  /** Receiver window for the 30% rule (chain steps size their output for the next step). Defaults to deps.receiverContextWindow(). */
+  receiverContextWindow?: number;
+  /** Set for chain steps: the chain this run belongs to and its 0-based position. */
+  chainId?: string;
+  stepIndex?: number;
 }
 
 export interface RunOutcome {
@@ -82,6 +100,22 @@ export class SubagentManager {
     return this.deps.registry.list();
   }
 
+  /** Resolves a run's working directory; the main cwd when omitted. Absolute inputs are normalized too, so equivalent paths compare equal. */
+  resolveCwd(cwd: string | undefined): string {
+    if (!cwd) return this.deps.cwd;
+    const resolved = resolve(this.deps.cwd, cwd);
+    try {
+      if (statSync(resolved).isDirectory()) return resolved;
+    } catch (error) {
+      // Only a missing path is "does not exist"; surface other causes (permissions and so on) with their reason.
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
+        throw new SubagentError("missing_cwd", `cannot access working directory ${resolved}: ${code ?? String(error)}`);
+      }
+    }
+    throw new SubagentError("missing_cwd", `working directory does not exist: ${resolved}`);
+  }
+
   /** Records with a live child or a pending resume claim; these must survive a branch switch. */
   activeRecords(): SubagentRecord[] {
     const ids = new Set([...this.live.keys(), ...this.claims.keys(), ...this.queued.keys()]);
@@ -96,6 +130,8 @@ export class SubagentManager {
     // Runs started by the main agent's tool are always auto; `delivery` is only passed by internal callers.
     const delivery = req.delivery ?? "auto";
     const signal = req.signal;
+    const cwd = this.resolveCwd(req.cwd);
+    const trusted = this.deps.trustForCwd?.(cwd);
     // The record exists from the start so a run waiting for a slot is listed and can be cancelled by handle.
     const queuedRecord = this.deps.registry.create({
       agent: agent.name,
@@ -105,7 +141,9 @@ export class SubagentManager {
       sessionFile: "",
       delivery,
       task: req.task,
+      cwd,
       status: "queued",
+      ...(req.chainId ? { chainId: req.chainId, stepIndex: req.stepIndex ?? 0 } : {}),
     });
     try {
       this.deps.onRecordCreated?.(queuedRecord);
@@ -127,8 +165,9 @@ export class SubagentManager {
     try {
       session = await runner.open({
         agent,
-        cwd: this.deps.cwd,
+        cwd,
         sessionDir: this.deps.sessionDir,
+        ...(trusted !== undefined ? { projectTrusted: trusted } : {}),
         appendSystemPrompt: [agent.systemPrompt, SUMMARY_INSTRUCTION].filter(Boolean),
       });
     } catch (error) {
@@ -144,15 +183,16 @@ export class SubagentManager {
       throw this.settleQueued(id, this.closed ? shutDownError() : runInterruptedError(), signal);
     }
     const running = this.deps.registry.update(id, { status: "running", sessionFile: session.sessionFile });
-    return this.execute(running, session, req.task, release, req.background ?? false, signal);
+    return this.execute(running, session, req.task, release, req.background ?? false, signal, [], req.receiverContextWindow);
   }
 
   async resume(
     handle: string,
     message: string,
-    opts: { delivery?: DeliveryMode; background?: boolean; signal?: AbortSignal; mention?: boolean } = {},
+    opts: { delivery?: DeliveryMode; background?: boolean; signal?: AbortSignal; mention?: boolean; receiverContextWindow?: number } = {},
   ): Promise<RunOutcome> {
-    const { record, agent, runner } = this.preflight(handle);
+    const { record, agent, runner, cwd } = this.preflight(handle);
+    const trusted = this.deps.trustForCwd?.(cwd);
     // Snapshot taken before the claim so a failed resume can be rolled back fully.
     const previous: { status: RunStatus; runId: number; delivery: DeliveryMode; error: string | undefined } = {
       status: record.status,
@@ -195,10 +235,11 @@ export class SubagentManager {
           // takeIdle has waited for any close of this record still in flight, so the file has no other writer.
           (await runner.open({
             agent,
-            cwd: this.deps.cwd,
+            cwd,
             sessionDir: this.deps.sessionDir,
             resumeFile: record.sessionFile,
             ...(record.childLeafId ? { resumeLeafId: record.childLeafId } : {}),
+            ...(trusted !== undefined ? { projectTrusted: trusted } : {}),
             appendSystemPrompt: [agent.systemPrompt, SUMMARY_INSTRUCTION].filter(Boolean),
           }));
         if (this.closed) {
@@ -230,7 +271,7 @@ export class SubagentManager {
       await this.close(record.id, session);
       throw stoppedWhileWaiting();
     }
-    return this.execute(claimed, session, message, release, opts.background ?? false, signal, opts.mention ? [this.ask("ask", message)] : []);
+    return this.execute(claimed, session, message, release, opts.background ?? false, signal, opts.mention ? [this.ask("ask", message)] : [], opts.receiverContextWindow);
   }
 
   /** The error resume() would reject with right away, if any; lets fire-and-forget callers report it immediately. */
@@ -356,6 +397,7 @@ export class SubagentManager {
     background: boolean,
     signal?: AbortSignal,
     asks: Ask[] = [],
+    receiverContextWindow?: number,
   ): Promise<RunOutcome> {
     const live: Live = { session, asks };
     this.live.set(record.id, live);
@@ -388,7 +430,7 @@ export class SubagentManager {
         await this.park(record.id, session, live);
       }
       try {
-        return this.finish(record.id, result, live, background, leafId);
+        return this.finish(record.id, result, live, background, leafId, receiverContextWindow);
       } catch (error) {
         // Never leave the record stuck in "running" or let a background job reject.
         const message = `result handling failed: ${(error as Error).message}`;
@@ -408,7 +450,7 @@ export class SubagentManager {
     return job;
   }
 
-  private finish(id: string, result: ChildResult, live: Live, background: boolean, leafId?: string): RunOutcome {
+  private finish(id: string, result: ChildResult, live: Live, background: boolean, leafId?: string, receiverContextWindow?: number): RunOutcome {
     const registry = this.deps.registry;
     registry.addUsage(id, result.usage);
     let status: RunStatus;
@@ -425,9 +467,10 @@ export class SubagentManager {
       // share/auto background results are delivered into the main LLM context: always move the full text to a file
       // and send only the summary + paths (ratio 0). Private results never enter the LLM context, so they keep the
       // contextRatio rule like foreground returns. One file per run at most.
+      const receiverWindow = receiverContextWindow ?? this.deps.receiverContextWindow();
       payload = preparePayload({
         text: result.text,
-        receiverContextWindow: this.deps.receiverContextWindow(),
+        receiverContextWindow: receiverWindow,
         ratio: background && current.delivery !== "private" ? 0 : this.deps.settings().contextRatio,
         outputDir: this.deps.outputDir,
         label: `${current.handle}-run${current.runId}`,
@@ -558,8 +601,8 @@ export class SubagentManager {
     return done;
   }
 
-  /** Synchronous checks shared by resume and checkResumable; throws the error resume would reject with. */
-  private preflight(handle: string): { record: SubagentRecord; agent: AgentDef; runner: Runner } {
+  /** Synchronous checks shared by resume and checkResumable, including resolving the recorded cwd; throws the error resume would reject with. */
+  private preflight(handle: string): { record: SubagentRecord; agent: AgentDef; runner: Runner; cwd: string } {
     if (this.closed) throw shutDownError();
     const record = this.requireRecord(handle);
     if (record.status === "stopped") throw new SubagentError("stopped", `@${record.handle} was stopped and cannot be resumed; start a new subagent instead`);
@@ -571,7 +614,10 @@ export class SubagentManager {
     if (!existsSync(record.sessionFile)) {
       throw new SubagentError("missing_session", `session file for @${record.handle} is missing: ${record.sessionFile}`);
     }
-    return { record, agent: this.requireAgent(record.agent), runner: this.requireRunner(record.runner) };
+    const agent = this.requireAgent(record.agent);
+    const runner = this.requireRunner(record.runner);
+    // Resolve last so a missing cwd is reported exactly like resume() does, after the other preflight errors.
+    return { record, agent, runner, cwd: this.resolveCwd(record.cwd) };
   }
 
   private ask(kind: Ask["kind"], text: string): Ask {

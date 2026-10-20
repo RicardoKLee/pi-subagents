@@ -120,7 +120,7 @@ export class SdkRunner implements Runner {
     if (!model) throw new Error(`cannot resolve model "${spec.agent.model ?? "(inherit)"}" for agent ${spec.agent.name}`);
     // Project settings (shellCommandPrefix, npmCommand, packages, ...) and project resources only load for a trusted
     // project, as in the main session; SettingsManager.create would otherwise trust every project.
-    const projectTrusted = this.opts.projectTrusted?.() ?? defaultProjectTrust(spec.cwd, this.opts.agentDir);
+    const projectTrusted = spec.projectTrusted ?? this.opts.projectTrusted?.() ?? defaultProjectTrust(spec.cwd, this.opts.agentDir);
     // Same user settings as a normal pi run (and as the RPC runner's child process).
     const settingsManager = SettingsManager.create(spec.cwd, this.opts.agentDir, { projectTrusted });
     const resourceLoader = new DefaultResourceLoader({

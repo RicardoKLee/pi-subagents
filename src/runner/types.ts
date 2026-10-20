@@ -21,6 +21,8 @@ export interface ChildSpec {
   /** Entry in `resumeFile` to continue from; without it the session continues from its last entry. */
   resumeLeafId?: string;
   appendSystemPrompt: string[];
+  /** Project trust decided by the caller for this cwd; runners fall back to their own resolution when absent. */
+  projectTrusted?: boolean;
 }
 
 export interface ChildResult {
