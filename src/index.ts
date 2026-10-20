@@ -263,7 +263,7 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
           ctx.ui.notify(`pi-subagents: unknown view "${raw}"; ${hint}`, "error");
           return;
         }
-        pi.appendEntry<TreeEntryData>(TREE_ENTRY_TYPE, { view, text: renderTree(state?.registry.list() ?? [], view) });
+        pi.appendEntry<TreeEntryData>(TREE_ENTRY_TYPE, { view, text: renderTree(state?.registry.list() ?? [], view, state?.manager.listChains() ?? []) });
       },
     });
 

@@ -1,3 +1,4 @@
+import type { ChainRecord } from "./chain.ts";
 import type { SubagentRecord, Usage } from "./registry.ts";
 
 export type TreeView = "list" | "cost";
@@ -60,24 +61,59 @@ function cells(node: Node, view: TreeView): string[] {
   return [`@${r.handle}`, r.agent, `run ${r.runId}`, cost, error, `[${r.status}]`];
 }
 
-/** pstree-style tree of subagents under the main session; columns are padded so statuses line up. */
-export function renderTree(records: readonly SubagentRecord[], view: TreeView): string {
-  if (!records.length) return "No subagents yet.";
+function chainCells(group: { chain: ChainRecord; index: number; steps: readonly SubagentRecord[] }, view: TreeView): string[] {
+  const { chain, index, steps } = group;
+  const total = steps.reduce((acc, r) => sum(acc, r.usage), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
+  const label = `chain ${index + 1}`;
+  if (view === "cost") return [label, ...usageCells(total)];
+  const error = steps.find((r) => r.error)?.error?.split("\n")[0]!.slice(0, 60) ?? "";
+  const progress = `step ${Math.min(chain.currentStep + 1, chain.steps.length)}/${chain.steps.length}`;
+  return [label, `${chain.steps.length} steps`, progress, money(total.cost), error, `[${chain.status}]`];
+}
+
+/** pstree-style tree of subagents under the main session; chain steps are grouped under their chain header. */
+export function renderTree(records: readonly SubagentRecord[], view: TreeView, chains: readonly ChainRecord[] = []): string {
+  if (!records.length && !chains.length) return "No subagents yet.";
   const rows: { prefix: string; cells: string[] }[] = [];
-  const walk = (nodes: Node[], indent: string) => {
-    nodes.forEach((node, i) => {
-      const last = i === nodes.length - 1;
-      rows.push({ prefix: `${indent}${last ? "└─ " : "├─ "}`, cells: cells(node, view) });
-      walk(node.children, `${indent}${last ? "   " : "│  "}`);
-    });
-  };
-  const roots = forest(records);
-  walk(roots, "");
+
+  function pushNode(node: Node, indent: string, last: boolean): void {
+    rows.push({ prefix: `${indent}${last ? "└─ " : "├─ "}`, cells: cells(node, view) });
+    walkForest(node.children, `${indent}${last ? "   " : "│  "}`);
+  }
+
+  function walkForest(nodes: readonly Node[], indent: string): void {
+    nodes.forEach((node, i) => pushNode(node, indent, i === nodes.length - 1));
+  }
+
+  // Steps of chains on this branch sit under their chain header; everything else keeps the parent/child forest.
+  const groups = chains.map((chain, index) => ({
+    chain,
+    index,
+    steps: records.filter((r) => r.chainId === chain.id).sort((a, b) => (a.stepIndex ?? 0) - (b.stepIndex ?? 0)),
+  }));
+  const grouped = new Set(groups.flatMap((g) => g.steps.map((r) => r.id)));
+  // A step whose chain is not on this branch (e.g. after /tree) stays visible as an ordinary root.
+  const loose = records.filter((r) => !grouped.has(r.id) && !(r.chainId && chains.some((c) => c.id === r.chainId)));
+
+  const entries = [
+    ...forest(loose).map((node) => ({ at: node.record.createdAt, push: (last: boolean) => pushNode(node, "", last) })),
+    ...groups.map((group) => ({
+      at: group.chain.createdAt,
+      push: (last: boolean) => {
+        rows.push({ prefix: `${last ? "└─ " : "├─ "}`, cells: chainCells(group, view) });
+        const inner = last ? "   " : "│  ";
+        group.steps.forEach((step, i) => pushNode({ record: step, children: [] }, inner, i === group.steps.length - 1));
+      },
+    })),
+  ].sort((a, b) => a.at - b.at);
+  entries.forEach((entry, i) => entry.push(i === entries.length - 1));
+
   if (view === "cost") {
-    const total = roots.reduce((acc, n) => sum(acc, subtree(n)), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
+    const total = records.reduce((acc, r) => sum(acc, r.usage), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
     rows.push({ prefix: "", cells: ["total", ...usageCells(total)] });
   }
-  const columns = rows[0]!.cells.length;
+  // Chain headers carry more columns (progress) than plain rows; pad to the widest row.
+  const columns = Math.max(...rows.map((row) => row.cells.length));
   // Drop columns that are empty on every row (e.g. no record has an error).
   const used = [...Array(columns).keys()].filter((c) => rows.some((row) => row.cells[c]));
   // widths[k] belongs to column used[k]; the first column's width includes the tree prefix.

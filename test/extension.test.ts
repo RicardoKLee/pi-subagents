@@ -223,6 +223,15 @@ describe("batch wiring", () => {
     expect(out.content[0].text).toContain("Parallel: 2/2 succeeded");
     expect(JSON.stringify(out.details)).toContain("reviewer-2");
   });
+
+  it("shows a chain in the tool's list output", async () => {
+    const { callTool } = await boot({ scripts: [[ok("alpha")], [ok("beta")]] });
+    await callTool({ action: "chain", chain: [{ agent: "reviewer", task: "first" }, { agent: "reviewer", task: "second got {previous}" }] });
+    const list = await callTool({ action: "list" });
+    expect(list.content[0].text).toContain("chain 1");
+    expect(list.content[0].text).toContain("2 steps");
+    expect(list.content[0].text).toContain("step 2/2");
+  });
 });
 
 // Chain/registry entries exactly as they are persisted on a session branch; used to simulate /tree and reload.
@@ -528,6 +537,20 @@ describe("/subagents command", () => {
     await command.handler("/debug-agent", ctx);
     expect(notes.at(-1)).toMatchObject({ type: "error", message: expect.stringContaining("was not run") });
     expect(pi.branch.some((e: any) => e.customType === "pi-subagents/tree")).toBe(false);
+  });
+
+  it("shows a chain in the tree entry appended by the command", async () => {
+    // Arrange
+    const { pi, ctx, callTool } = await boot({ scripts: [[ok("alpha")], [ok("beta")]] });
+    await callTool({ action: "chain", chain: [{ agent: "reviewer", task: "first" }, { agent: "reviewer", task: "second got {previous}" }] });
+
+    // Act
+    await pi.commands.get("subagents").handler("", ctx);
+
+    // Assert
+    const trees = pi.branch.filter((e: any) => e.customType === "pi-subagents/tree") as any[];
+    expect(trees.at(-1)!.data.text).toContain("chain 1");
+    expect(trees.at(-1)!.data.text).toContain("step 2/2");
   });
 });
 

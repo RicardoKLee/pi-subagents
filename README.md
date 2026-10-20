@@ -3,7 +3,7 @@
 pi extension: delegate work to named subagents that keep their own session, can be steered
 while running, and can be resumed by handle after they finish.
 
-Status: milestone 3 (M3). Children run in-process through the pi SDK or as resident
+Status: milestone 4 (M4). Children run in-process through the pi SDK or as resident
 `pi --mode rpc` child processes. See `/sandbox/temp/plans/pi-subagent-extension-plan.md` for the full plan.
 
 ## Loading
@@ -25,6 +25,8 @@ Optional file `~/.pi/agent/subagents.json`. Missing file means defaults; invalid
 | `maxChildrenPerParent` | `4` | Same value rules. Read and validated, enforced from M6 (nesting). |
 | `maxDepth` | `2` | Same value rules. Read and validated, enforced from M6 (nesting). |
 | `maxResident` | `8` | Child sessions kept open between turns, running ones included. Positive = limit, `0` = close after every turn, `-1` = unlimited. The least recently used idle child is closed first; resuming it later reopens its session file. |
+| `maxParallelTasks` | `8` | Most tasks in one `parallel` call. Positive = limit, `0` = parallel disabled, `-1` = unlimited. |
+| `maxChainSteps` | `8` | Same value rules; `0` disables chains. |
 | `defaultDelivery` | `"auto"` | `private`, `share` or `auto`. Used for `@handle` messages without a symbol (M2). Background runs started by the main agent always use `auto`. |
 | `defaultRunner` | `"sdk"` | `sdk` (in-process) or `rpc` (a resident `pi --mode rpc` child process per subagent). An agent's `runner:` frontmatter overrides it. Existing records keep the runner they were created with. |
 | `contextRatio` | `0.3` | In `(0, 1]`. A foreground result larger than this share of the main model's context window is written to a file; the tool returns the summary and the file path. |
@@ -46,11 +48,23 @@ dies while a turn is running, that turn fails with the exit code and the tail of
 
 When pi's `cli.js` cannot be located, set `PI_SUBAGENTS_PI_CLI` to its path.
 
+## Working directories
+
+`run`, every item of `parallel` and every step of `chain` can carry a `cwd`; a relative path is resolved against the
+main session's cwd. The record stores the resolved cwd, so later `resume`/`continue` turns run in the same directory;
+if it no longer exists they fail with a clear error instead of falling back to the main cwd.
+
+When `cwd` differs from the main session's cwd, project trust is decided for that directory on its own (a saved
+decision, or the user's `defaultProjectTrust`); the main session's trust is never applied to another directory.
+
 ## Tool `subagents`
 
 | `action` | Parameters | Effect |
 | --- | --- | --- |
-| `run` | `agent`, `task`, optional `background` | Starts a new subagent and returns its handle. Foreground waits for the result; background returns at once and delivers the result later (background results always use auto). |
+| `run` | `agent`, `task`, optional `cwd`, `background` | Starts a new subagent and returns its handle. Foreground waits for the result; background returns at once and delivers the result later (background results always use auto). |
+| `parallel` | `tasks` (`[{ agent, task, cwd? }]`), optional `background` | Runs tasks at the same time (the global `maxConcurrent` still caps concurrency). Every task gets its own handle. The result is one summary: `Parallel: X/N succeeded` plus a section per task. A failure does not stop the others. |
+| `chain` | `chain` (`[{ agent, task, cwd? }]`), optional `background` | Runs steps in order; `{previous}` in a task is replaced with the previous step's output. Each step gets its own handle. A failing step stops the chain; its status and the chain progress are kept. |
+| `continue` | `handle` (the step that stopped the chain), optional `message` | Resumes that step (its own session) and then runs the remaining steps. Works for `failed` and `paused` chains; a `stopped` chain cannot be continued. |
 | `resume` | `handle`, `message`, optional `background` | Continues a finished or paused subagent in its own session (background results always use auto). Unknown, stopped, still-running or session-file-missing handles are rejected. |
 | `steer` | `handle`, `message`, optional `mode` (`steer` or `followUp`) | Sends guidance to a running subagent. |
 | `interrupt` | `handle` | Pauses a running subagent; it can be resumed. |
@@ -88,6 +102,21 @@ Mentions are only recognised at the start of a message, typed in the TUI (not RP
 
 Both are shown in the TUI only; they are custom entries and never enter the model context.
 
+## Chain progress
+
+Chain definitions and progress are stored as `pi-subagents/chain` custom entries on the session branch (rebuilt
+after `/reload`, `/tree` and fork like the record registry). `/subagents` shows a chain as
+`chain 1  2 steps  step 2/2  $0.0180  [failed]` with its steps indented below; `/subagents cost` shows the chain's
+summed tokens and cost and a total line. A chain that is paused or stopped does not create records for the steps it
+never reached.
+
+## Background batches
+
+`background: true` on a `parallel` group or a `chain` delivers exactly one summary when the whole group or chain
+finishes (always auto), never one message per task. Background batches that end paused or stopped deliver nothing.
+Each item and step still has its own handle, so a single one can be inspected, `steer`ed, `interrupt`ed or `stop`ped
+while the rest continue.
+
 ## Files
 
 With a session directory: child sessions in `<sessionDir>/subagents/`, large outputs in `<sessionDir>/subagents/outputs/`,
@@ -106,6 +135,9 @@ and a read-only snapshot `<sessionDir>/<sessionId>.subagents.json` (never used f
 - `@` completion uses pi's autocomplete hook; how it behaves after `/reload` or `/new` has not been verified.
 - An instruction sent with @ just as the subagent finishes may be quoted with the result even though the subagent did not act on it.
 - Records created before M2 have no pinned child leaf; the first resume on each branch after /fork or /tree can still see the other branch once.
-- Not yet available: chains, nested subagents. These are planned for later milestones.
+- Not yet available: nested subagents. It is planned for a later milestone.
+- `pi` rewrites its process title to `pi`; to see the resident RPC children, list the main pi's children whose comm is `pi` (`ps --ppid <main pi> -o pid,comm`), instead of `grep`ping the command line.
+- Chain steps run one after another; a parallel group inside a chain is not supported yet.
+- A step's prompt is the substituted task text (with `{previous}` already replaced), and `continue` replays that same text when no message is given.
 - An RPC child starts in about a second; resuming a resident child has no start-up cost.
 - RPC children load no extensions until nesting (M6).

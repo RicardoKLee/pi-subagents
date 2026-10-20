@@ -147,6 +147,11 @@ export class SubagentManager {
     return this.deps.registry.list();
   }
 
+  /** Chains on the current branch, in creation order (for the list tree). */
+  listChains(): ChainRecord[] {
+    return this.deps.chainStore.list();
+  }
+
   /** Resolves a run's working directory; the main cwd when omitted. Absolute inputs are normalized too, so equivalent paths compare equal. */
   resolveCwd(cwd: string | undefined): string {
     if (!cwd) return this.deps.cwd;

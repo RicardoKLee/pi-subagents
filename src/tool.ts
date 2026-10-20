@@ -151,7 +151,7 @@ async function dispatch(
       return { text: `${input.handle} stopped; it cannot be resumed.`, details: {} };
     case "list": {
       const records = manager.list();
-      return { text: renderTree(records, "list"), details: { count: records.length } };
+      return { text: renderTree(records, "list", manager.listChains()), details: { count: records.length } };
     }
   }
 }
