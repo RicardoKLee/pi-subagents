@@ -23,6 +23,9 @@ export async function boot(
     branch?: unknown[];
     settings?: Record<string, unknown>;
     rpcRunner?: Runner;
+    /** Main-session model and what `modelRegistry.find` returns; used by the model resolver assertion. */
+    model?: { provider: string; id: string };
+    find?: (provider: string, id: string) => unknown;
   } = {},
 ) {
   const root = tempDir("ext-");
@@ -41,17 +44,31 @@ export async function boot(
     return new FakeSession(file, opts.scripts?.[n] ?? [], opts.hold ?? false);
   });
   const pi = new FakePi();
+  const rpcResolvers: ((spec: string | undefined) => unknown)[] = [];
   createExtension({
     agentDir,
     createRunner: () => runner,
-    ...(opts.rpcRunner ? { createRpcRunner: () => opts.rpcRunner! } : {}),
+    ...(opts.rpcRunner
+      ? {
+          createRpcRunner: (resolveModel: (spec: string | undefined) => unknown) => {
+            rpcResolvers.push(resolveModel);
+            return opts.rpcRunner!;
+          },
+        }
+      : {}),
   })(pi.asApi());
   pi.branch.push(...(opts.branch ?? []));
-  const { ctx, notes, providers } = fakeCtx(pi, { cwd, sessionDir, hasUI: opts.hasUI ?? true });
+  const { ctx, notes, providers } = fakeCtx(pi, {
+    cwd,
+    sessionDir,
+    hasUI: opts.hasUI ?? true,
+    ...(opts.model ? { model: opts.model } : {}),
+    ...(opts.find ? { find: opts.find } : {}),
+  });
   await pi.emit("session_start", { type: "session_start" }, ctx);
   const tool = pi.tools.get("subagents");
   const callTool = (params: Record<string, unknown>) => tool.execute("call-1", params, undefined, undefined, ctx);
-  return { pi, ctx, notes, providers, runner, callTool, root, cwd, agentDir, rpcRunner: opts.rpcRunner };
+  return { pi, ctx, notes, providers, runner, callTool, root, cwd, agentDir, rpcRunner: opts.rpcRunner, rpcResolvers };
 }
 
 const ok = (text: string): ChildResult => ({ text, stopReason: "stop", usage: usage() });
@@ -138,6 +155,33 @@ describe("extension wiring", () => {
     const list = (await callTool({ action: "list" })).content[0].text;
     expect(list).toMatch(/@runner .*\[paused\]/);
     expect(list).toMatch(/@waiter .*\[stopped\]/);
+  });
+
+  it("gives the injected rpc runner the model resolver and the run spec", async () => {
+    const rpcOpened: ChildSpec[] = [];
+    const fakeModel = { provider: "p", id: "m", contextWindow: 1000 };
+    const inner = new FakeRunner((_spec, n) => new FakeSession(join(tempDir("rpc-"), `child-${n}.jsonl`), [{ text: "rpc answer", stopReason: "stop", usage: usage() }], false));
+    const rpcRunner: Runner = {
+      kind: "rpc",
+      open: (spec) => {
+        rpcOpened.push(spec);
+        return inner.open(spec);
+      },
+    };
+    const { callTool, rpcResolvers, cwd } = await boot({
+      rpcRunner,
+      model: { provider: "p", id: "main" },
+      find: () => fakeModel,
+      extraAgents: { "rpcer.md": "---\nname: rpcer\ndescription: Runs over rpc\nrunner: rpc\nmodel: m\n---\nYou are rpcer." },
+    });
+    await callTool({ action: "run", agent: "rpcer", task: "x" });
+    expect(rpcResolvers).toHaveLength(1);
+    // The resolver the extension handed to the runner resolves the agent's model spec.
+    expect(rpcResolvers[0]!("m")).toBe(fakeModel);
+    expect(rpcOpened).toHaveLength(1);
+    expect(rpcOpened[0]!.agent.name).toBe("rpcer");
+    expect(rpcOpened[0]!.cwd).toBe(cwd);
+    expect(rpcOpened[0]!.appendSystemPrompt[0]).toContain("You are rpcer.");
   });
 
   it("uses the injected rpc runner for agents with runner: rpc", async () => {

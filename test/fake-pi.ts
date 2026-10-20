@@ -46,6 +46,9 @@ export interface FakeCtxOptions {
   sessionDir: string;
   sessionId?: string;
   hasUI?: boolean;
+  /** Model of the main session; `find` is what `modelRegistry.find` returns. */
+  model?: { provider: string; id: string };
+  find?: (provider: string, id: string) => unknown;
 }
 
 /** ExtensionContext stand-in whose session branch is `pi.branch`; notify calls and autocomplete factories are recorded. */
@@ -60,8 +63,8 @@ export function fakeCtx(pi: FakePi, opts: FakeCtxOptions) {
     ui,
     hasUI: opts.hasUI ?? true,
     cwd: opts.cwd,
-    model: undefined,
-    modelRegistry: { find: () => undefined },
+    model: opts.model,
+    modelRegistry: { find: (provider: string, id: string) => opts.find?.(provider, id) },
     sessionManager: {
       getBranch: () => pi.branch,
       getSessionDir: () => opts.sessionDir,
