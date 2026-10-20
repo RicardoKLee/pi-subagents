@@ -1,6 +1,6 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { type ExtensionContext, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { type ExtensionContext, ProjectTrustStore, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { PRIVATE_ENTRY_TYPE } from "../src/delivery.ts";
 import { createExtension } from "../src/index.ts";
@@ -206,6 +206,152 @@ describe("extension wiring", () => {
     expect(out.content[0].text).toContain("rpc answer");
     expect(rpcOpened).toHaveLength(1);
     expect(runner.opened).toHaveLength(0);
+  });
+});
+
+describe("batch wiring", () => {
+  it("runs a chain through the tool and persists the chain entry", async () => {
+    const { pi, callTool } = await boot({ scripts: [[ok("alpha")], [ok("beta")]] });
+    const out = await callTool({ action: "chain", chain: [{ agent: "reviewer", task: "first" }, { agent: "reviewer", task: "second got {previous}" }] });
+    expect(out.content[0].text).toContain("Chain completed (2/2 steps)");
+    expect(pi.branch.some((e: any) => e.customType === "pi-subagents/chain")).toBe(true);
+  });
+
+  it("runs parallel tasks through the tool and reports their handles", async () => {
+    const { callTool } = await boot({ scripts: [[ok("a")], [ok("b")]] });
+    const out = await callTool({ action: "parallel", tasks: [{ agent: "reviewer", task: "one" }, { agent: "reviewer", task: "two" }] });
+    expect(out.content[0].text).toContain("Parallel: 2/2 succeeded");
+    expect(JSON.stringify(out.details)).toContain("reviewer-2");
+  });
+});
+
+// Chain/registry entries exactly as they are persisted on a session branch; used to simulate /tree and reload.
+const ZERO = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+const step = (agent: string, task: string) => ({ agent, task });
+const chainEntry = (over: Record<string, unknown> = {}) => ({
+  type: "custom",
+  customType: "pi-subagents/chain",
+  data: {
+    id: "chain-1",
+    steps: [step("reviewer", "first"), step("reviewer", "second"), step("reviewer", "third")],
+    stepRecordIds: ["rec-0", "rec-1"],
+    currentStep: 1,
+    status: "running",
+    usage: ZERO,
+    createdAt: 1,
+    updatedAt: 1,
+    ...over,
+  },
+});
+const recordEntry = (over: Record<string, unknown> = {}) => ({
+  type: "custom",
+  customType: "pi-subagents/registry",
+  data: {
+    id: "rec-0",
+    handle: "reviewer",
+    agent: "reviewer",
+    runner: "sdk",
+    depth: 1,
+    sessionFile: "",
+    runId: 1,
+    status: "completed",
+    delivery: "auto",
+    task: "first",
+    chainId: "chain-1",
+    stepIndex: 0,
+    createdAt: 1,
+    updatedAt: 1,
+    usage: ZERO,
+    ...over,
+  },
+});
+/** The latest persisted chain entry on the branch, as the extension's ChainStore would have written it. */
+const latestChain = (pi: FakePi, id = "chain-1") =>
+  pi.branch.filter((e: any) => e.customType === "pi-subagents/chain" && e.data.id === id).at(-1) as any;
+
+describe("chain state after a branch reload (REVIEW-001/REVIEW-002)", () => {
+  it("reconciles a running chain after session_tree and continues from the stopped step without replaying finished steps", async () => {
+    // Arrange: /tree switches to a branch taken mid-chain, while no child is live in this manager. recoverInterrupted
+    // settles the branch's "running" step; the chain entry left "running" must not make continue reject it as busy forever.
+    const { pi, ctx, runner, callTool, root } = await boot();
+    const firstFile = join(root, "step-0.jsonl");
+    const stoppedFile = join(root, "step-1.jsonl");
+    writeFileSync(firstFile, "");
+    writeFileSync(stoppedFile, "");
+    pi.branch.push(
+      recordEntry({ sessionFile: firstFile }),
+      recordEntry({ id: "rec-1", handle: "reviewer-2", task: "second", status: "running", stepIndex: 1, sessionFile: stoppedFile }),
+      chainEntry(),
+    );
+
+    // Act
+    await pi.emit("session_tree", { type: "session_tree" }, ctx);
+
+    // Assert: the chain entry is no longer "running" and agrees with the settled step record.
+    expect(latestChain(pi).data.status).toBe("paused");
+    expect((await callTool({ action: "list" })).content[0].text).toMatch(/@reviewer-2 .*\[paused\]/);
+
+    // Act: continue from the step that stopped.
+    const out = await callTool({ action: "continue", handle: "reviewer-2" });
+
+    // Assert: the stopped step was reused (same session file), the remaining step ran, and step 0 was never replayed.
+    expect(out.content[0].text).toContain("Chain completed (3/3 steps)");
+    expect(runner.opened.map((s) => s.resumeFile)).toEqual([stoppedFile, undefined]);
+    expect(runner.sessions.map((s) => s.prompts)).toEqual([["second"], ["third"]]);
+    expect(latestChain(pi).data.status).toBe("completed");
+  });
+
+  it("keeps a chain stopped after session_tree when its stopping step was stopped", async () => {
+    // Arrange
+    const { pi, ctx, callTool, root } = await boot();
+    const stoppedFile = join(root, "stopped.jsonl");
+    writeFileSync(stoppedFile, "");
+    pi.branch.push(
+      recordEntry(),
+      recordEntry({ id: "rec-1", handle: "reviewer-2", task: "second", status: "stopped", stepIndex: 1, sessionFile: stoppedFile }),
+      chainEntry({ steps: [step("reviewer", "first"), step("reviewer", "second")] }),
+    );
+
+    // Act
+    await pi.emit("session_tree", { type: "session_tree" }, ctx);
+
+    // Assert: the chain never becomes continuable just because its entry said "running" before the reload.
+    expect(latestChain(pi).data.status).toBe("stopped");
+    await expect(callTool({ action: "continue", handle: "reviewer-2" })).rejects.toMatchObject({ code: "stopped" });
+  });
+
+  it("normalizes a fully completed chain to completed after session_tree", async () => {
+    // Arrange: every step finished, but the chain entry still says "running" (the process died before marking it completed).
+    const { pi, ctx, callTool } = await boot();
+    pi.branch.push(
+      recordEntry(),
+      recordEntry({ id: "rec-1", handle: "reviewer-2", task: "second", status: "completed", stepIndex: 1 }),
+      chainEntry({ steps: [step("reviewer", "first"), step("reviewer", "second")] }),
+    );
+
+    // Act
+    await pi.emit("session_tree", { type: "session_tree" }, ctx);
+
+    // Assert
+    expect(latestChain(pi).data.status).toBe("completed");
+    await expect(callTool({ action: "continue", handle: "reviewer-2" })).rejects.toMatchObject({ code: "not_running" });
+  });
+
+  it("reconciles a running chain restored on session_start (reload/restart)", async () => {
+    // Arrange: the reloaded branch carries a chain whose step was still running when the process died.
+    const stoppedFile = join(tempDir("chain-reload-"), "step-1.jsonl");
+    writeFileSync(stoppedFile, "");
+    const { pi, callTool } = await boot({
+      branch: [
+        recordEntry(),
+        recordEntry({ id: "rec-1", handle: "reviewer-2", task: "second", status: "running", stepIndex: 1, sessionFile: stoppedFile }),
+        chainEntry({ steps: [step("reviewer", "first"), step("reviewer", "second")] }),
+      ],
+    });
+
+    // Assert: session_start settled the step and reconciled the chain, so continue can finish it.
+    expect(latestChain(pi).data.status).toBe("paused");
+    expect((await callTool({ action: "continue", handle: "reviewer-2" })).content[0].text).toContain("Chain completed (2/2 steps)");
   });
 });
 
@@ -416,4 +562,37 @@ describe("default SDK runner", () => {
       await pi.emit("session_shutdown", { type: "session_shutdown" }, ctx);
     });
   }
+
+  it("does not inherit the main session's trust for a run in another cwd", async () => {
+    // Arrange: an untrusted main session, and a different cwd with its own saved "trusted" decision.
+    const root = tempDir("ext-cwd-trust-");
+    const agentDir = join(root, "agent");
+    const cwd = join(root, "project");
+    const other = join(root, "other");
+    mkdirSync(join(agentDir, "agents"), { recursive: true });
+    mkdirSync(cwd, { recursive: true });
+    mkdirSync(join(other, ".pi"), { recursive: true });
+    writeFileSync(join(agentDir, "agents", "reviewer.md"), REVIEWER);
+    writeFileSync(join(other, ".pi", "settings.json"), "{}");
+    new ProjectTrustStore(agentDir).set(other, true);
+    const seen: unknown[] = [];
+    vi.spyOn(SettingsManager, "create").mockImplementation((_cwd, _agentDir, options) => {
+      seen.push(options?.projectTrusted);
+      throw new Error("stop after settings");
+    });
+    const pi = new FakePi();
+    createExtension({ agentDir })(pi.asApi());
+    const { ctx } = fakeCtx(pi, { cwd, sessionDir: join(root, "sessions") });
+    Object.assign(ctx, { model: { provider: "p", id: "m", contextWindow: 1000 }, isProjectTrusted: () => false });
+    await pi.emit("session_start", { type: "session_start" }, ctx);
+
+    // Act
+    await expect(
+      pi.tools.get("subagents").execute("call-1", { action: "run", agent: "reviewer", task: "x", cwd: other }, undefined, undefined, ctx),
+    ).rejects.toThrow("stop after settings");
+
+    // Assert: the child gets the other cwd's own decision, never the main session's `false`.
+    expect(seen).toEqual([true]);
+    await pi.emit("session_shutdown", { type: "session_shutdown" }, ctx);
+  });
 });

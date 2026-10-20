@@ -40,6 +40,7 @@ function setup(settings: Partial<SubagentSettings> = {}) {
   const root = tempDir("idx-");
   const persisted: { type: "custom"; customType: string; data: SubagentRecord }[] = [];
   const registry = new Registry((record) => persisted.push({ type: "custom", customType: REGISTRY_ENTRY_TYPE, data: record }));
+  const chainStore = new ChainStore(() => {});
   const runner = new FakeRunner((_spec, n) => {
     const file = join(root, `child-${n}.jsonl`);
     writeFileSync(file, "", { flag: "a" });
@@ -47,7 +48,7 @@ function setup(settings: Partial<SubagentSettings> = {}) {
   });
   const manager = new SubagentManager({
     registry,
-    chainStore: new ChainStore(() => {}),
+    chainStore,
     scheduler: new Scheduler(() => 4),
     runners: { sdk: runner, rpc: undefined },
     agents: () => new Map([["reviewer", reviewer]]),
@@ -58,7 +59,7 @@ function setup(settings: Partial<SubagentSettings> = {}) {
     sessionDir: join(root, "sessions"),
     outputDir: join(root, "out"),
   });
-  return { manager, registry, runner, persisted };
+  return { manager, registry, runner, persisted, chainStore };
 }
 
 describe("rebuildForBranch", () => {
@@ -106,5 +107,47 @@ describe("rebuildForBranch", () => {
     expect(runner.sessions[0]!.disposed).toBe(false);
     rebuildForBranch(manager, registry, []);
     await vi.waitFor(() => expect(runner.sessions[0]!.disposed).toBe(true));
+  });
+
+  it("rebuildForBranch keeps the chains of still-running steps and drops the others", async () => {
+    const { manager, registry, chainStore, runner } = setup();
+    // A chain whose step is live must survive the reload; a chain with no live step must not.
+    const abandoned = chainStore.create({ steps: [{ agent: "reviewer", task: "abandoned" }] });
+    const started = await manager.runChain({
+      steps: [{ agent: "reviewer", task: "one" }, { agent: "reviewer", task: "two" }],
+      background: true,
+    });
+    await vi.waitFor(() => expect(runner.sessions).toHaveLength(1));
+
+    rebuildForBranch(manager, registry, [], chainStore);
+
+    expect(chainStore.list().map((c) => c.id)).toEqual([started.chain!.id]);
+    expect(chainStore.get(abandoned.id)).toBeUndefined();
+    // Let the restored chain finish so the test leaves no pending child behind.
+    runner.sessions[0]!.finish();
+    await vi.waitFor(() => expect(runner.sessions).toHaveLength(2));
+    runner.sessions[1]!.finish();
+    await manager.whenIdle();
+    expect(chainStore.get(started.chain!.id)!.status).toBe("completed");
+  });
+
+  it("rebuildForBranch refuses to continue a chain the new branch cut away", async () => {
+    // Arrange: a chain paused on the current branch (its records are not live, so nothing restores it).
+    const { manager, registry, chainStore, runner } = setup();
+    const pending = manager.runChain({ steps: [{ agent: "reviewer", task: "one" }, { agent: "reviewer", task: "two" }] });
+    await vi.waitFor(() => expect(runner.sessions).toHaveLength(1));
+    await manager.interrupt("reviewer");
+    const paused = await pending;
+    expect(paused.chain!.status).toBe("paused");
+    const handle = paused.records.at(-1)!.handle;
+    const opened = runner.opened.length;
+
+    // Act: switch to a branch that never saw the chain.
+    rebuildForBranch(manager, registry, [], chainStore);
+
+    // Assert: the chain is gone and continue does not replay the step that was cut away.
+    expect(chainStore.list()).toEqual([]);
+    await expect(manager.continueChain(handle)).rejects.toMatchObject({ code: "unknown_handle" });
+    expect(runner.opened).toHaveLength(opened);
   });
 });

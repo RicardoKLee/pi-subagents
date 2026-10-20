@@ -4,7 +4,7 @@ import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { loadAgents } from "./agents.ts";
-import { ChainStore } from "./chain.ts";
+import { CHAIN_ENTRY_TYPE, ChainStore } from "./chain.ts";
 import { mentionProvider } from "./complete.ts";
 import { PRIVATE_ENTRY_TYPE, type PrivateEntryData } from "./delivery.ts";
 import { handleRoute } from "./input.ts";
@@ -12,7 +12,7 @@ import { SubagentManager } from "./manager.ts";
 import { routeMention } from "./mention.ts";
 import { REGISTRY_ENTRY_TYPE, Registry, writeSnapshot } from "./registry.ts";
 import { RpcRunner } from "./runner/rpc.ts";
-import { type ModelResolver, SdkRunner } from "./runner/sdk.ts";
+import { type ModelResolver, SdkRunner, defaultProjectTrust } from "./runner/sdk.ts";
 import type { Runner } from "./runner/types.ts";
 import { Scheduler } from "./scheduler.ts";
 import { loadSettings, type SubagentSettings } from "./settings.ts";
@@ -24,6 +24,7 @@ const PRIVATE_PREVIEW_LINES = 20;
 interface State {
   manager: SubagentManager;
   registry: Registry;
+  chains: ChainStore;
   ctx: ExtensionContext;
   settings: SubagentSettings;
   snapshotFile?: string;
@@ -52,15 +53,26 @@ export function subagentPaths(sessionDir: string, sessionId: string): { childDir
 }
 
 /**
- * Reload the registry from a new branch after /tree: keep children that are still running, then pause records the
- * branch left as "running" but that have no live child (e.g. /tree back to a point mid-run). Returns how many were paused.
+ * Reload the registry (and, when given, the chain store) from a new branch after /tree: keep children that are still
+ * running, then pause records the branch left as "running" but that have no live child (e.g. /tree back to a point
+ * mid-run). Chains whose steps are still live are restored onto the new branch; the others are dropped. Returns how
+ * many records were paused.
  */
-export function rebuildForBranch(manager: SubagentManager, registry: Registry, branch: readonly unknown[]): number {
+export function rebuildForBranch(manager: SubagentManager, registry: Registry, branch: readonly unknown[], chains?: ChainStore): number {
   const active = manager.activeRecords();
+  const activeChains = chains ? manager.activeChains() : [];
   registry.reload(branch);
   for (const r of active) registry.restore(r);
+  if (chains) {
+    chains.reload(branch);
+    for (const c of activeChains) chains.restore(c);
+  }
   manager.pruneIdle();
-  return manager.recoverInterrupted("left running on another branch");
+  const paused = manager.recoverInterrupted("left running on another branch");
+  // The chain entries the branch restored may still say "running" while their steps were just settled; align them so
+  // continueChain can resume the stopping step instead of rejecting the chain as busy forever.
+  manager.reconcileChains();
+  return paused;
 }
 
 function writeSnapshotSafely(file: string | undefined, registry: Registry): void {
@@ -115,6 +127,10 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
         pi.appendEntry(REGISTRY_ENTRY_TYPE, record);
         writeSnapshotSafely(snapshotFile, registry);
       });
+      const chains = ChainStore.rebuild(ctx.sessionManager.getBranch(), (chain) => pi.appendEntry(CHAIN_ENTRY_TYPE, chain));
+      // Normalized once so a non-canonical ctx.cwd still matches the resolved cwd the manager compares against.
+      const mainCwd = resolvePath(ctx.cwd);
+      const modelWindow = (spec: string | undefined) => resolveModel(state?.ctx ?? ctx, spec)?.contextWindow;
       const modelResolver: ModelResolver = (spec) => resolveModel(state?.ctx ?? ctx, spec);
       const sdk = opts.createRunner
         ? opts.createRunner(modelResolver)
@@ -130,7 +146,7 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
           });
       const manager = new SubagentManager({
         registry,
-        chainStore: new ChainStore(() => {}),
+        chainStore: chains,
         scheduler: new Scheduler(() => settings.maxConcurrent),
         runners: { sdk, rpc },
         agents: () => {
@@ -144,9 +160,14 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
           appendEntry: (type, data) => pi.appendEntry(type, data),
         },
         receiverContextWindow: () => state?.ctx.model?.contextWindow ?? 200000,
+        receiverContextWindowFor: (agent) => modelWindow(agent.model),
         cwd: ctx.cwd,
         sessionDir: childDir,
         outputDir,
+        // Trust follows the resolved cwd: the main session's decision only applies to the main cwd. Any other
+        // directory gets its own non-interactive decision (never the main session's trust). Both sides are
+        // normalized so equivalent spellings of the same directory match without letting a different one through.
+        trustForCwd: (cwd) => (resolvePath(cwd) === mainCwd ? (state?.ctx ?? ctx).isProjectTrusted?.() : defaultProjectTrust(cwd, agentDir)),
         onDeliveryError: (record, message) => notify(`result of @${record.handle} was not delivered: ${message}`, "warning"),
         onRecordCreated: (record) => {
           if (existsSync(join(ctx.cwd, record.handle))) {
@@ -154,9 +175,11 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
           }
         },
       });
-      state = { manager, registry, ctx, settings, ...(snapshotFile ? { snapshotFile } : {}) };
+      state = { manager, registry, chains, ctx, settings, ...(snapshotFile ? { snapshotFile } : {}) };
       for (const w of warnings) warnOnce(w);
       const recovered = manager.recoverInterrupted();
+      // Reload/restart settled the running steps; bring any chain entry left "running" back in line so it can be continued.
+      manager.reconcileChains();
       if (recovered) {
         notify(`${recovered} subagent(s) were cut off by reload/restart: running ones are paused, queued ones were cancelled`, "warning");
       }
@@ -173,7 +196,7 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
     // /tree only fires session_tree: rebuild the registry for the new branch (see rebuildForBranch).
     pi.on("session_tree", (_event, ctx) => {
       if (!state) return;
-      const paused = rebuildForBranch(state.manager, state.registry, ctx.sessionManager.getBranch());
+      const paused = rebuildForBranch(state.manager, state.registry, ctx.sessionManager.getBranch(), state.chains);
       if (paused > 0 && ctx.hasUI) {
         ctx.ui.notify(
           `pi-subagents: ${paused} subagent(s) from another branch were not running: running ones are paused, queued ones were cancelled`,
@@ -254,6 +277,7 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
       label: "Subagents",
       description:
         "Delegate work to named, persistent subagents. action=run starts a new one (agent + task) and returns its @handle. " +
+        "action=parallel runs many at once; chain runs steps in order, where {previous} is the previous step's output; continue resumes the step that stopped a chain and finishes it. " +
         "action=resume continues an existing one in its own context (handle + message); prefer it when the user wants the same subagent to revise its work. " +
         "action=steer guides a running one; interrupt pauses; stop ends it permanently; list shows all.",
       parameters: SubagentsParams,

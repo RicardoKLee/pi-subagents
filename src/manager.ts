@@ -717,6 +717,33 @@ export class SubagentManager {
     return count;
   }
 
+  /**
+   * Align chain status with its step records after a reload, restart or branch switch. A chain left "running"
+   * with no live, queued or claimed step (recoverInterrupted settled those) would otherwise reject `continueChain`
+   * with "busy" forever, losing "continue from the stopped step". Such a chain is normalized to what its stopping
+   * step left behind; chains that still have an active step are untouched. Returns how many chains were changed.
+   */
+  reconcileChains(): number {
+    const active = new Set(this.activeRecords().map((r) => r.id));
+    let count = 0;
+    for (const chain of this.deps.chainStore.list()) {
+      if (chain.status !== "running") continue;
+      if (chain.stepRecordIds.some((id) => active.has(id))) continue;
+      const records = chain.stepRecordIds.map((id) => this.deps.registry.get(id)).filter((r): r is SubagentRecord => !!r);
+      // Only a chain whose every step finished is "completed". A stopping step that is itself completed (the process
+      // died between steps) must not mark the whole chain finished, so it falls through to the continuable "paused".
+      const stop = records.find((r) => r.stepIndex === chain.currentStep) ?? records.at(-1);
+      let status: ChainStatus;
+      if (records.length === chain.steps.length && records.every((r) => r.status === "completed")) status = "completed";
+      else if (stop?.status === "stopped") status = "stopped";
+      else if (stop?.status === "failed") status = "failed";
+      else status = "paused";
+      this.deps.chainStore.update(chain.id, { status, usage: this.chainUsage(chain) });
+      count++;
+    }
+    return count;
+  }
+
   async whenIdle(): Promise<void> {
     while (this.work.size) await Promise.allSettled([...this.work]);
   }
