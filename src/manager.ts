@@ -1,8 +1,9 @@
 import { existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import type { AgentDef } from "./agents.ts";
-import { type Ask, deliver, type DeliveryPort, quoteAsk, renderAsks } from "./delivery.ts";
-import { type Payload, preparePayload, SUMMARY_INSTRUCTION } from "./output.ts";
+import { type ChainRecord, ChainStore } from "./chain.ts";
+import { type Ask, deliver, type DeliveryPort, deliverBatch, quoteAsk, renderAsks } from "./delivery.ts";
+import { estimateTokens, type Payload, preparePayload, SUMMARY_INSTRUCTION, writeOutput } from "./output.ts";
 import type { Registry, RunStatus, SubagentRecord } from "./registry.ts";
 import type { ChildResult, ChildSession, Runner } from "./runner/types.ts";
 import { type Scheduler, SubagentsDisabledError } from "./scheduler.ts";
@@ -28,6 +29,7 @@ export class SubagentError extends Error {
 
 export interface ManagerDeps {
   registry: Registry;
+  chainStore: ChainStore;
   scheduler: Scheduler;
   runners: Record<RunnerKind, Runner | undefined>;
   agents: () => Map<string, AgentDef>;
@@ -35,6 +37,8 @@ export interface ManagerDeps {
   port: DeliveryPort;
   /** Context window of whoever receives the result (main model in M1). */
   receiverContextWindow: () => number;
+  /** Context window of a given agent's model, for the 30% rule between chain steps. */
+  receiverContextWindowFor?: (agent: AgentDef) => number | undefined;
   cwd: string;
   sessionDir: string;
   outputDir: string;
@@ -66,6 +70,48 @@ export interface RunOutcome {
   record: SubagentRecord;
   /** Set for foreground calls. */
   payload?: Payload;
+}
+
+export interface BatchItem {
+  agent: string;
+  task: string;
+  cwd?: string;
+}
+
+export interface BatchOutcome {
+  /**
+   * Records for the batch, in item order. A foreground batch resolves with each record's final state; a background
+   * batch returns the queued snapshots taken when the records were created (only `id` and `handle` are guaranteed
+   * to match the finished run). Callers must read the current status from the registry, never from these snapshots.
+   */
+  records: SubagentRecord[];
+  /** Foreground batches: the summary the tool returns. */
+  payload?: Payload;
+  /** Chains only: the chain this batch belongs to. */
+  chain?: ChainRecord;
+}
+
+interface Prepared {
+  record: SubagentRecord;
+  agent: AgentDef;
+  runner: Runner;
+  cwd: string;
+  trusted?: boolean;
+  controller: AbortController;
+}
+
+/** An item's agent, runner and cwd after validation; computed once so a whole batch can be checked before any record exists. */
+interface Resolved {
+  agent: AgentDef;
+  runner: Runner;
+  cwd: string;
+  trusted?: boolean;
+}
+
+interface LaunchOptions {
+  /** "batch" items never return early, never deliver on their own, and size their output by `receiverContextWindow`. */
+  mode?: "single" | "batch";
+  receiverContextWindow?: number;
 }
 
 interface Live {
@@ -123,17 +169,24 @@ export class SubagentManager {
   }
 
   async run(req: RunRequest): Promise<RunOutcome> {
+    const prepared = this.prepare(req);
+    return this.launch(prepared, req.task, req.background ?? false, req.signal, {
+      ...(req.receiverContextWindow ? { receiverContextWindow: req.receiverContextWindow } : {}),
+    });
+  }
+
+  /** Validates the request and creates the queued record (so it is listed and cancellable from the start). */
+  private prepare(
+    req: { agent: string; task: string; delivery?: DeliveryMode; cwd?: string; chainId?: string; stepIndex?: number },
+    resolved?: Resolved,
+  ): Prepared {
     if (this.closed) throw shutDownError();
     if (this.deps.scheduler.disabled) throw new SubagentsDisabledError();
-    const agent = this.requireAgent(req.agent);
-    const runner = this.requireRunner(agent.runner ?? this.deps.settings().defaultRunner);
+    const { agent, runner, cwd, trusted } = resolved ?? this.resolveTarget(req);
     // Runs started by the main agent's tool are always auto; `delivery` is only passed by internal callers.
     const delivery = req.delivery ?? "auto";
-    const signal = req.signal;
-    const cwd = this.resolveCwd(req.cwd);
-    const trusted = this.deps.trustForCwd?.(cwd);
     // The record exists from the start so a run waiting for a slot is listed and can be cancelled by handle.
-    const queuedRecord = this.deps.registry.create({
+    const record = this.deps.registry.create({
       agent: agent.name,
       preferredHandle: agent.handle ?? agent.name,
       runner: runner.kind,
@@ -146,20 +199,25 @@ export class SubagentManager {
       ...(req.chainId ? { chainId: req.chainId, stepIndex: req.stepIndex ?? 0 } : {}),
     });
     try {
-      this.deps.onRecordCreated?.(queuedRecord);
+      this.deps.onRecordCreated?.(record);
     } catch {
       // Informational only.
     }
-    const id = queuedRecord.id;
     const controller = new AbortController();
-    this.queued.set(id, controller);
+    this.queued.set(record.id, controller);
+    return { record, agent, runner, cwd, trusted, controller };
+  }
+
+  /** Waits for a slot, opens the child, then runs one turn. */
+  private async launch(prepared: Prepared, text: string, background: boolean, signal: AbortSignal | undefined, options: LaunchOptions = {}): Promise<RunOutcome> {
+    const { record, agent, runner, cwd, trusted, controller } = prepared;
     const cancel = AbortSignal.any([this.lifetime.signal, controller.signal, ...(signal ? [signal] : [])]);
     let release: () => void;
     try {
       release = await this.deps.scheduler.acquire(cancel);
     } catch (error) {
-      this.queued.delete(id);
-      throw this.settleQueued(id, error, signal);
+      this.queued.delete(record.id);
+      throw this.settleQueued(record.id, error, signal);
     }
     let session: ChildSession;
     try {
@@ -171,25 +229,123 @@ export class SubagentManager {
         appendSystemPrompt: [agent.systemPrompt, SUMMARY_INSTRUCTION].filter(Boolean),
       });
     } catch (error) {
-      this.queued.delete(id);
+      this.queued.delete(record.id);
       release();
-      throw this.settleQueued(id, error, signal);
+      throw this.settleQueued(record.id, error, signal);
     }
-    this.queued.delete(id);
+    this.queued.delete(record.id);
     if (this.closed || controller.signal.aborted || signal?.aborted) {
       // Shutdown, a cancel by handle, or the calling tool's abort happened while the session was opening.
       release();
-      await this.close(id, session);
-      throw this.settleQueued(id, this.closed ? shutDownError() : runInterruptedError(), signal);
+      await this.close(record.id, session);
+      throw this.settleQueued(record.id, this.closed ? shutDownError() : runInterruptedError(), signal);
     }
-    const running = this.deps.registry.update(id, { status: "running", sessionFile: session.sessionFile });
-    return this.execute(running, session, req.task, release, req.background ?? false, signal, [], req.receiverContextWindow);
+    const running = this.deps.registry.update(record.id, { status: "running", sessionFile: session.sessionFile });
+    return this.execute(running, session, text, release, background, signal, [], options);
+  }
+
+  /** Starts every task at once (the scheduler still caps concurrency) and summarizes the group afterwards. */
+  async runParallel(req: { items: readonly BatchItem[]; background?: boolean; signal?: AbortSignal }): Promise<BatchOutcome> {
+    if (this.closed) throw shutDownError();
+    if (req.items.length === 0) throw new Error("a parallel batch needs at least one item");
+    const max = this.deps.settings().maxParallelTasks;
+    if (max === 0) throw new SubagentsDisabledError("parallel is disabled (maxParallelTasks is 0)");
+    // The n-th task is allowed exactly when the previous n - 1 are within the limit (max -1 = unlimited).
+    if (!limitAllows(max, req.items.length - 1)) throw new Error(`too many parallel tasks (${req.items.length}); max is ${max}`);
+    // Validate every agent, runner and cwd up front, before any record exists: a bad item must not leave a half-created
+    // batch behind (a queued record whose launch() is never reached would stay queued forever).
+    const resolved = req.items.map((item) => this.resolveTarget({ agent: item.agent, cwd: item.cwd }));
+    const prepared = req.items.map((item, i) => this.prepare({ agent: item.agent, task: item.task, cwd: item.cwd }, resolved[i]!));
+    // One item failing to start (runner.open, a cancel while queued/opening, shutdown) must not drop the others' results.
+    const settled = Promise.allSettled(prepared.map((p, i) => this.launch(p, req.items[i]!.task, true, req.signal, { mode: "batch" })));
+    const outcomes = settled.then((results) => results.map((result, i) => (result.status === "fulfilled" ? result.value : this.failureOutcome(prepared[i]!.record))));
+    if (!req.background) {
+      const done = await outcomes;
+      return { records: done.map((o) => o.record), payload: this.parallelPayload(done) };
+    }
+    // The records already exist, so the tool can report the handles now; one summary is delivered when all finish.
+    this.track(
+      outcomes.then((done) => this.sendBatch("parallel", this.parallelPayload(done), done.map((o) => o.record))),
+      (error) => this.reportBatchError(prepared[0]?.record, error),
+    );
+    return { records: prepared.map((p) => p.record) };
+  }
+
+  /** A rejected batch item is reported like finish() reports a failed run, using the status settleQueued already stored. */
+  private failureOutcome(record: SubagentRecord): RunOutcome {
+    const current = this.deps.registry.get(record.id) ?? record;
+    const note = `@${current.handle} ${current.status}${current.error ? `: ${current.error}` : ""}`;
+    return { record: current, payload: { text: note, summary: note } };
+  }
+
+  /** One summary for a whole group: `Parallel: X/N succeeded` plus a section per item. */
+  private parallelPayload(outcomes: readonly RunOutcome[]): Payload {
+    const window = this.deps.receiverContextWindow();
+    const ratio = this.deps.settings().contextRatio;
+    const texts = outcomes.map((o) => o.payload?.text ?? "");
+    const inline = texts.reduce((n, t) => n + estimateTokens(t), 0) <= window * ratio;
+    const sections = outcomes.map((o, i) => {
+      const r = o.record;
+      const head = `### [@${r.handle}] (${r.agent}) ${r.status}${r.error ? `: ${r.error}` : ""}`;
+      let body = texts[i] ?? "";
+      if (!inline && body && !o.payload?.filePath) {
+        const file = writeOutput(body, { outputDir: this.deps.outputDir, label: `${r.handle}-run${r.runId}` });
+        body = `Summary:\n${r.lastSummary ?? ""}\n\nFull output: ${file}`;
+      }
+      return `${head}\n${body}${body ? "\n" : ""}Session: ${r.sessionFile}`;
+    });
+    const succeeded = outcomes.filter((o) => o.record.status === "completed").length;
+    const head = `Parallel: ${succeeded}/${outcomes.length} succeeded`;
+    return { text: `${head}\n\n${sections.join("\n\n---\n\n")}`, summary: head };
+  }
+
+  /** One auto message per batch, only when it carries something the main agent can use. */
+  private sendBatch(kind: "parallel" | "chain", payload: Payload, records: readonly SubagentRecord[], chain?: ChainRecord): void {
+    if (this.closed) return;
+    if (!records.some((r) => r.status === "completed" || r.status === "failed")) return;
+    deliverBatch(this.deps.port, {
+      text: payload.text,
+      details: { kind, ...(chain ? { chainId: chain.id, status: chain.status } : {}), handles: records.map((r) => r.handle) },
+    });
+  }
+
+  /** Resolves a run's agent, runner and cwd without creating a record, so a caller can validate it first. */
+  private resolveTarget(req: { agent: string; cwd?: string }): Resolved {
+    const agent = this.requireAgent(req.agent);
+    const runner = this.requireRunner(agent.runner ?? this.deps.settings().defaultRunner);
+    const cwd = this.resolveCwd(req.cwd);
+    return { agent, runner, cwd, trusted: this.deps.trustForCwd?.(cwd) };
+  }
+
+  /** Runs a promise in the background and keeps whenIdle()/shutdown() waiting for it. `onError` makes a detached failure visible. */
+  private track(job: Promise<unknown>, onError?: (error: unknown) => void): void {
+    this.work.add(job);
+    void job
+      .catch((error) => {
+        try {
+          onError?.(error);
+        } catch {
+          // Reporting must never surface as an unhandled rejection.
+        }
+      })
+      .finally(() => this.work.delete(job));
+  }
+
+  /** A background batch failing after its handles were returned must not disappear: surface it like a delivery failure. */
+  private reportBatchError(record: SubagentRecord | undefined, error: unknown): void {
+    if (!record) return;
+    const message = error instanceof Error ? error.message : String(error);
+    try {
+      this.deps.onDeliveryError?.(this.deps.registry.get(record.id) ?? record, message);
+    } catch {
+      // The notifier must never turn a finished batch into a rejected background job.
+    }
   }
 
   async resume(
     handle: string,
     message: string,
-    opts: { delivery?: DeliveryMode; background?: boolean; signal?: AbortSignal; mention?: boolean; receiverContextWindow?: number } = {},
+    opts: { delivery?: DeliveryMode; background?: boolean; signal?: AbortSignal; mention?: boolean; receiverContextWindow?: number; mode?: "single" | "batch" } = {},
   ): Promise<RunOutcome> {
     const { record, agent, runner, cwd } = this.preflight(handle);
     const trusted = this.deps.trustForCwd?.(cwd);
@@ -271,7 +427,10 @@ export class SubagentManager {
       await this.close(record.id, session);
       throw stoppedWhileWaiting();
     }
-    return this.execute(claimed, session, message, release, opts.background ?? false, signal, opts.mention ? [this.ask("ask", message)] : [], opts.receiverContextWindow);
+    return this.execute(claimed, session, message, release, opts.background ?? false, signal, opts.mention ? [this.ask("ask", message)] : [], {
+      ...(opts.mode ? { mode: opts.mode } : {}),
+      ...(opts.receiverContextWindow ? { receiverContextWindow: opts.receiverContextWindow } : {}),
+    });
   }
 
   /** The error resume() would reject with right away, if any; lets fire-and-forget callers report it immediately. */
@@ -397,13 +556,14 @@ export class SubagentManager {
     background: boolean,
     signal?: AbortSignal,
     asks: Ask[] = [],
-    receiverContextWindow?: number,
+    options: LaunchOptions = {},
   ): Promise<RunOutcome> {
     const live: Live = { session, asks };
     this.live.set(record.id, live);
     this.evictIdle();
-    // Only a foreground call is still waiting on its tool signal; a background call has already returned.
-    const callSignal = background ? undefined : signal;
+    const batch = options.mode === "batch";
+    // Only a foreground single call is still waiting on its tool signal; a background or batch call runs detached.
+    const callSignal = background || batch ? undefined : signal;
     const onCallAbort = () => {
       live.intent = "interrupt";
       void session.abort().catch(() => {});
@@ -430,7 +590,7 @@ export class SubagentManager {
         await this.park(record.id, session, live);
       }
       try {
-        return this.finish(record.id, result, live, background, leafId, receiverContextWindow);
+        return this.finish(record.id, result, live, background, leafId, options);
       } catch (error) {
         // Never leave the record stuck in "running" or let a background job reject.
         const message = `result handling failed: ${(error as Error).message}`;
@@ -446,11 +606,11 @@ export class SubagentManager {
     })();
     this.work.add(job);
     void job.catch(() => {}).finally(() => this.work.delete(job));
-    if (background) return { record };
+    if (background && !batch) return { record };
     return job;
   }
 
-  private finish(id: string, result: ChildResult, live: Live, background: boolean, leafId?: string, receiverContextWindow?: number): RunOutcome {
+  private finish(id: string, result: ChildResult, live: Live, background: boolean, leafId?: string, options: LaunchOptions = {}): RunOutcome {
     const registry = this.deps.registry;
     registry.addUsage(id, result.usage);
     let status: RunStatus;
@@ -462,18 +622,23 @@ export class SubagentManager {
     else status = "completed";
 
     const current = registry.get(id)!;
+    const batch = options.mode === "batch";
     let payload: Payload;
     if (status === "completed") {
       // share/auto background results are delivered into the main LLM context: always move the full text to a file
       // and send only the summary + paths (ratio 0). Private results never enter the LLM context, so they keep the
-      // contextRatio rule like foreground returns. One file per run at most.
-      const receiverWindow = receiverContextWindow ?? this.deps.receiverContextWindow();
+      // contextRatio rule like foreground returns. One file per run at most. A batch run is never delivered on its
+      // own: it is sized for its consumer (the next chain step, or the group summary) in the summary + path form.
+      const receiverWindow = options.receiverContextWindow ?? this.deps.receiverContextWindow();
+      const label =
+        batch && current.stepIndex !== undefined ? `${current.handle}-step${current.stepIndex + 1}-run${current.runId}` : `${current.handle}-run${current.runId}`;
       payload = preparePayload({
         text: result.text,
         receiverContextWindow: receiverWindow,
-        ratio: background && current.delivery !== "private" ? 0 : this.deps.settings().contextRatio,
+        ratio: background && !batch && current.delivery !== "private" ? 0 : this.deps.settings().contextRatio,
         outputDir: this.deps.outputDir,
-        label: `${current.handle}-run${current.runId}`,
+        label,
+        ...(batch ? { style: "path" as const } : {}),
       });
     } else {
       const note = `@${current.handle} ${status}${error ? `: ${error}` : ""}`;
@@ -484,7 +649,7 @@ export class SubagentManager {
     // Private instructions are never shown to it.
     const shown = live.asks.filter((a) => !a.private);
     if (!background && shown.length) payload = { ...payload, text: `${renderAsks(current.handle, shown)}\n\n${payload.text}` };
-    if (background && status !== "stopped" && status !== "paused") {
+    if (background && !batch && status !== "stopped" && status !== "paused") {
       // Only a private run's own private entry may quote private instructions.
       const quoted = record.delivery === "private" ? live.asks : shown;
       try {

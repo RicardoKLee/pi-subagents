@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import type { AgentDef } from "../src/agents.ts";
+import { ChainStore } from "../src/chain.ts";
 import { rebuildForBranch, subagentPaths } from "../src/index.ts";
 import { SubagentManager } from "../src/manager.ts";
 import { REGISTRY_ENTRY_TYPE, Registry, type SubagentRecord } from "../src/registry.ts";
@@ -46,6 +47,7 @@ function setup(settings: Partial<SubagentSettings> = {}) {
   });
   const manager = new SubagentManager({
     registry,
+    chainStore: new ChainStore(() => {}),
     scheduler: new Scheduler(() => 4),
     runners: { sdk: runner, rpc: undefined },
     agents: () => new Map([["reviewer", reviewer]]),

@@ -4,6 +4,7 @@ import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { loadAgents } from "./agents.ts";
+import { ChainStore } from "./chain.ts";
 import { mentionProvider } from "./complete.ts";
 import { PRIVATE_ENTRY_TYPE, type PrivateEntryData } from "./delivery.ts";
 import { handleRoute } from "./input.ts";
@@ -129,6 +130,7 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
           });
       const manager = new SubagentManager({
         registry,
+        chainStore: new ChainStore(() => {}),
         scheduler: new Scheduler(() => settings.maxConcurrent),
         runners: { sdk, rpc },
         agents: () => {

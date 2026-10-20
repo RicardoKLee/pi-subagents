@@ -2,6 +2,8 @@ import type { RunStatus } from "./registry.ts";
 import type { DeliveryMode } from "./settings.ts";
 
 export const RESULT_MESSAGE_TYPE = "pi-subagents/result";
+/** Results of a whole batch (parallel group, chain) are delivered as one message per call. */
+export const BATCH_MESSAGE_TYPE = "pi-subagents/batch";
 /** Private results are stored as custom entries, which never enter the LLM context (incl. compaction and branch summaries). */
 export const PRIVATE_ENTRY_TYPE = "pi-subagents/private";
 
@@ -71,4 +73,12 @@ export function deliver(port: DeliveryPort, mode: DeliveryMode, env: ResultEnvel
   }
   const options = mode === "auto" ? { triggerTurn: true, deliverAs: "followUp" as const } : { triggerTurn: false };
   port.sendMessage({ customType: RESULT_MESSAGE_TYPE, content: render(env), display: true, details }, options);
+}
+
+/** One auto message for a batch: the main agent starts a turn when the group or chain finishes. */
+export function deliverBatch(port: DeliveryPort, env: { text: string; details?: unknown }): void {
+  port.sendMessage(
+    { customType: BATCH_MESSAGE_TYPE, content: env.text, display: true, ...(env.details ? { details: env.details } : {}) },
+    { triggerTurn: true, deliverAs: "followUp" },
+  );
 }

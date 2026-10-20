@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import type { AgentDef } from "../src/agents.ts";
 import type { DeliveryPort } from "../src/delivery.ts";
+import { ChainStore } from "../src/chain.ts";
 import { SubagentError, SubagentManager } from "../src/manager.ts";
 import { REGISTRY_ENTRY_TYPE, Registry, type SubagentRecord } from "../src/registry.ts";
 import type { ChildResult } from "../src/runner/types.ts";
@@ -31,6 +32,8 @@ function setup(
     disposeDelayMs?: number;
     /** Project trust for a child cwd; the manager never guesses it. */
     trustForCwd?: (cwd: string) => boolean | undefined;
+    /** Context window of a given agent's model; used by chain steps to size `{previous}`. */
+    agentWindow?: (agent: AgentDef) => number | undefined;
   } = {},
 ) {
   const root = tempDir("mgr-");
@@ -47,6 +50,7 @@ function setup(
   const entries: Parameters<DeliveryPort["appendEntry"]>[] = [];
   const manager = new SubagentManager({
     registry: opts.registry ?? new Registry(() => {}),
+    chainStore: new ChainStore(() => {}),
     scheduler: new Scheduler(() => opts.limit ?? 4),
     runners: { sdk: runner, rpc: undefined },
     agents: () => new Map([["reviewer", reviewer]]),
@@ -57,6 +61,7 @@ function setup(
     sessionDir: join(root, "sessions"),
     outputDir: opts.outputDir ?? join(root, "out"),
     ...(opts.trustForCwd ? { trustForCwd: opts.trustForCwd } : {}),
+    ...(opts.agentWindow ? { receiverContextWindowFor: opts.agentWindow } : {}),
   });
   return { manager, runner, sent, entries, root };
 }
