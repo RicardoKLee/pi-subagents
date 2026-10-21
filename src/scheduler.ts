@@ -1,8 +1,8 @@
 import { limitAllows } from "./settings.ts";
 
 export class SubagentsDisabledError extends Error {
-  constructor() {
-    super("subagents are disabled (maxConcurrent is 0)");
+  constructor(message = "subagents are disabled (maxConcurrent is 0)") {
+    super(message);
     this.name = "SubagentsDisabledError";
   }
 }

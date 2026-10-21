@@ -12,6 +12,7 @@ function fakeManager(overrides: Partial<Record<keyof SubagentManager, unknown>> 
     interrupt: vi.fn(async () => {}),
     stop: vi.fn(async () => {}),
     list: vi.fn(() => [record]),
+    listChains: vi.fn(() => []),
     ...overrides,
   } as unknown as SubagentManager;
 }

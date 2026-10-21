@@ -1,8 +1,9 @@
-import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import type { AgentDef } from "../src/agents.ts";
 import type { DeliveryPort } from "../src/delivery.ts";
+import { ChainStore } from "../src/chain.ts";
 import { SubagentError, SubagentManager } from "../src/manager.ts";
 import { REGISTRY_ENTRY_TYPE, Registry, type SubagentRecord } from "../src/registry.ts";
 import type { ChildResult } from "../src/runner/types.ts";
@@ -29,6 +30,10 @@ function setup(
     settings?: Partial<SubagentSettings>;
     /** How long each FakeSession.dispose() takes. */
     disposeDelayMs?: number;
+    /** Project trust for a child cwd; the manager never guesses it. */
+    trustForCwd?: (cwd: string) => boolean | undefined;
+    /** Context window of a given agent's model; used by chain steps to size `{previous}`. */
+    agentWindow?: (agent: AgentDef) => number | undefined;
   } = {},
 ) {
   const root = tempDir("mgr-");
@@ -45,6 +50,7 @@ function setup(
   const entries: Parameters<DeliveryPort["appendEntry"]>[] = [];
   const manager = new SubagentManager({
     registry: opts.registry ?? new Registry(() => {}),
+    chainStore: new ChainStore(() => {}),
     scheduler: new Scheduler(() => opts.limit ?? 4),
     runners: { sdk: runner, rpc: undefined },
     agents: () => new Map([["reviewer", reviewer]]),
@@ -54,6 +60,8 @@ function setup(
     cwd: root,
     sessionDir: join(root, "sessions"),
     outputDir: opts.outputDir ?? join(root, "out"),
+    ...(opts.trustForCwd ? { trustForCwd: opts.trustForCwd } : {}),
+    ...(opts.agentWindow ? { receiverContextWindowFor: opts.agentWindow } : {}),
   });
   return { manager, runner, sent, entries, root };
 }
@@ -670,6 +678,142 @@ describe("checkResumable", () => {
     await manager.stop("reviewer");
     expect(manager.checkResumable("reviewer")).toMatchObject({ code: "stopped" });
     expect(runner.opened).toHaveLength(1);
+  });
+});
+
+describe("cwd and trust", () => {
+  it("runs in the given cwd and records it", async () => {
+    const dir = tempDir("cwd-");
+    const { manager, runner } = setup({ scripts: [[ok("hi")]] });
+    const { record } = await manager.run({ agent: "reviewer", task: "x", cwd: dir });
+    expect(record.cwd).toBe(dir);
+    expect(runner.opened[0]!.cwd).toBe(dir);
+  });
+
+  it("resolves a relative cwd against the main cwd and rejects a missing one", async () => {
+    const { manager, runner, root } = setup({ scripts: [[ok("hi")]] });
+    mkdirSync(join(root, "sub"), { recursive: true });
+    await manager.run({ agent: "reviewer", task: "x", cwd: "sub" });
+    expect(runner.opened[0]!.cwd).toBe(join(root, "sub"));
+    await expect(manager.run({ agent: "reviewer", task: "y", cwd: "nope" })).rejects.toMatchObject({ code: "missing_cwd" });
+  });
+
+  it("uses the main session's trust only for the main cwd", async () => {
+    const other = tempDir("other-");
+    const { manager, runner, root } = setup({ scripts: [[ok("a")], [ok("b")]], trustForCwd: (cwd) => (cwd === root ? true : false) });
+    await manager.run({ agent: "reviewer", task: "x" });
+    await manager.run({ agent: "reviewer", task: "y", cwd: other });
+    expect(runner.opened[0]!.projectTrusted).toBe(true);
+    expect(runner.opened[1]!.projectTrusted).toBe(false);
+  });
+
+  it("resume runs in the recorded cwd", async () => {
+    const dir = tempDir("cwd-resume-");
+    const { manager, runner } = setup({ scripts: [[ok("a")], [ok("b")]] });
+    await manager.run({ agent: "reviewer", task: "x", cwd: dir });
+    await manager.resume("reviewer", "again");
+    expect(runner.opened[1]!.cwd).toBe(dir);
+  });
+
+  it("resume reports a missing cwd", async () => {
+    const dir = tempDir("cwd-gone-");
+    const { manager } = setup({ scripts: [[ok("a")]] });
+    await manager.run({ agent: "reviewer", task: "x", cwd: dir });
+    rmSync(dir, { recursive: true, force: true });
+    await expect(manager.resume("reviewer", "again")).rejects.toMatchObject({ code: "missing_cwd" });
+  });
+
+  it("checkResumable reports a missing cwd like resume does", async () => {
+    // Arrange: a completed run whose recorded cwd still exists.
+    const dir = tempDir("cwd-check-");
+    const { manager, runner } = setup({ scripts: [[ok("a")]] });
+    await manager.run({ agent: "reviewer", task: "x", cwd: dir });
+    expect(manager.checkResumable("reviewer")).toBeUndefined();
+
+    // Act: the recorded cwd disappears.
+    rmSync(dir, { recursive: true, force: true });
+
+    // Assert: checkResumable reports the same error resume would reject with, without opening anything.
+    expect(manager.checkResumable("reviewer")).toMatchObject({ code: "missing_cwd" });
+    expect(runner.opened).toHaveLength(1);
+  });
+
+  it("rejects a cwd that points at a file instead of a directory", async () => {
+    // Arrange: a regular file where the child would run.
+    const { manager, root } = setup();
+    const file = join(root, "not-a-dir");
+    writeFileSync(file, "");
+
+    // Act / Assert: resolveCwd only accepts directories, and no record is created.
+    await expect(manager.run({ agent: "reviewer", task: "x", cwd: file })).rejects.toMatchObject({ code: "missing_cwd" });
+    expect(manager.list()).toHaveLength(0);
+  });
+
+  it("resume of a legacy record without a cwd falls back to the manager cwd", async () => {
+    // Arrange: a record persisted before M4 (no cwd field) is rebuilt from its session entry.
+    const dir = tempDir("legacy-");
+    const sessionFile = join(dir, "legacy.jsonl");
+    writeFileSync(sessionFile, "");
+    const legacy = {
+      id: "legacy-1",
+      handle: "reviewer",
+      agent: "reviewer",
+      runner: "sdk",
+      depth: 1,
+      sessionFile,
+      runId: 1,
+      status: "completed",
+      delivery: "auto",
+      task: "x",
+      createdAt: 1,
+      updatedAt: 1,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    };
+    const registry = Registry.rebuild([{ type: "custom", customType: REGISTRY_ENTRY_TYPE, data: legacy }], () => {});
+    const { manager, runner, root } = setup({ registry, scripts: [[ok("resumed")]] });
+    expect(registry.resolve("reviewer")!.cwd).toBeUndefined();
+
+    // Act
+    const { payload } = await manager.resume("reviewer", "again");
+
+    // Assert: the child opens in the manager's cwd, exactly as a pre-M4 record was expected to.
+    expect(payload!.text).toBe("resumed");
+    expect(runner.opened[0]!.cwd).toBe(root);
+  });
+});
+
+describe("receiver context window override", () => {
+  it("uses the run's receiverContextWindow instead of the manager default", async () => {
+    // Arrange: the receiver window is tiny, so a long answer would normally be written to a file.
+    const long = "z".repeat(4000);
+    const { manager } = setup({ scripts: [[ok(long)], [ok(long)]], contextWindow: 1000 });
+
+    // Act: the caller sizes the output for a larger receiver (e.g. the next chain step).
+    const overridden = await manager.run({ agent: "reviewer", task: "x", receiverContextWindow: 100000 });
+    const defaulted = await manager.run({ agent: "reviewer", task: "y" });
+
+    // Assert: only the defaulted run spills to a file.
+    expect(overridden.payload!.filePath).toBeUndefined();
+    expect(overridden.payload!.text).toContain(long);
+    expect(defaulted.payload!.filePath).toBeDefined();
+    expect(defaulted.payload!.text).toContain("Full output (");
+  });
+
+  it("uses the resume's receiverContextWindow override", async () => {
+    // Arrange: same tiny receiver window, and a long answer for the resumed turn.
+    const long = "y".repeat(4000);
+    const { manager } = setup({ scripts: [[ok("first")], [ok(long)], [ok(long)]], contextWindow: 1000 });
+    await manager.run({ agent: "reviewer", task: "x" });
+
+    // Act
+    const overridden = await manager.resume("reviewer", "again", { receiverContextWindow: 100000 });
+    const defaulted = await manager.resume("reviewer", "once more");
+
+    // Assert
+    expect(overridden.payload!.filePath).toBeUndefined();
+    expect(overridden.payload!.text).toContain(long);
+    expect(defaulted.payload!.filePath).toBeDefined();
+    expect(defaulted.payload!.text).toContain("Full output (");
   });
 });
 

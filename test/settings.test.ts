@@ -70,6 +70,20 @@ describe("parseSettings", () => {
     expect(settings.maxResident).toBe(8);
     expect(warnings[0]).toContain("maxResident");
   });
+
+  it("defaults the batch limits to 8 and accepts 0 and -1", () => {
+    expect(DEFAULT_SETTINGS.maxParallelTasks).toBe(8);
+    expect(DEFAULT_SETTINGS.maxChainSteps).toBe(8);
+    expect(parseSettings({ maxParallelTasks: 0, maxChainSteps: -1 }).settings).toMatchObject({ maxParallelTasks: 0, maxChainSteps: -1 });
+  });
+
+  it("rejects invalid batch limits", () => {
+    const { settings, warnings } = parseSettings({ maxParallelTasks: -2, maxChainSteps: 1.5 });
+    expect(settings.maxParallelTasks).toBe(8);
+    expect(settings.maxChainSteps).toBe(8);
+    expect(warnings.join(" ")).toContain("maxParallelTasks");
+    expect(warnings.join(" ")).toContain("maxChainSteps");
+  });
 });
 
 describe("loadSettings", () => {

@@ -1,14 +1,24 @@
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
+import { resolve } from "node:path";
 import type { AgentDef } from "./agents.ts";
-import { type Ask, deliver, type DeliveryPort, quoteAsk, renderAsks } from "./delivery.ts";
-import { type Payload, preparePayload, SUMMARY_INSTRUCTION } from "./output.ts";
-import type { Registry, RunStatus, SubagentRecord } from "./registry.ts";
+import { type ChainRecord, type ChainStatus, ChainStore } from "./chain.ts";
+import { type Ask, deliver, type DeliveryPort, deliverBatch, quoteAsk, renderAsks } from "./delivery.ts";
+import { estimateTokens, type Payload, preparePayload, SUMMARY_INSTRUCTION, writeOutput } from "./output.ts";
+import { type Registry, type RunStatus, type SubagentRecord, type Usage, ZERO_USAGE } from "./registry.ts";
 import type { ChildResult, ChildSession, Runner } from "./runner/types.ts";
 import { type Scheduler, SubagentsDisabledError } from "./scheduler.ts";
 import type { DeliveryMode, RunnerKind, SubagentSettings } from "./settings.ts";
 import { limitAllows } from "./settings.ts";
 
-export type SubagentErrorCode = "unknown_agent" | "unknown_handle" | "stopped" | "busy" | "not_running" | "missing_session" | "interrupted";
+export type SubagentErrorCode =
+  | "unknown_agent"
+  | "unknown_handle"
+  | "stopped"
+  | "busy"
+  | "not_running"
+  | "missing_session"
+  | "missing_cwd"
+  | "interrupted";
 
 export class SubagentError extends Error {
   constructor(readonly code: SubagentErrorCode, message: string) {
@@ -19,6 +29,7 @@ export class SubagentError extends Error {
 
 export interface ManagerDeps {
   registry: Registry;
+  chainStore: ChainStore;
   scheduler: Scheduler;
   runners: Record<RunnerKind, Runner | undefined>;
   agents: () => Map<string, AgentDef>;
@@ -26,9 +37,13 @@ export interface ManagerDeps {
   port: DeliveryPort;
   /** Context window of whoever receives the result (main model in M1). */
   receiverContextWindow: () => number;
+  /** Context window of a given agent's model, for the 30% rule between chain steps. */
+  receiverContextWindowFor?: (agent: AgentDef) => number | undefined;
   cwd: string;
   sessionDir: string;
   outputDir: string;
+  /** Project trust for a child cwd decided by the caller; the manager never guesses it. */
+  trustForCwd?: (cwd: string) => boolean | undefined;
   /** Called when a background result could not be delivered (the error is also recorded on the record). */
   onDeliveryError?: (record: SubagentRecord, message: string) => void;
   /** Called once a new record exists (queued); used to warn about handles that clash with files. */
@@ -42,12 +57,62 @@ export interface RunRequest {
   background?: boolean;
   /** The calling tool's signal: aborting it cancels this run while queued, opening, or (foreground) running. */
   signal?: AbortSignal;
+  /** Working directory for the child; relative paths resolve against deps.cwd. Defaults to deps.cwd. */
+  cwd?: string;
+  /** Receiver window for the 30% rule (chain steps size their output for the next step). Defaults to deps.receiverContextWindow(). */
+  receiverContextWindow?: number;
+  /** Set for chain steps: the chain this run belongs to and its 0-based position. */
+  chainId?: string;
+  stepIndex?: number;
 }
 
 export interface RunOutcome {
   record: SubagentRecord;
   /** Set for foreground calls. */
   payload?: Payload;
+}
+
+export interface BatchItem {
+  agent: string;
+  task: string;
+  cwd?: string;
+}
+
+export interface BatchOutcome {
+  /**
+   * Records for the batch, in item order. A foreground batch resolves with each record's final state; a background
+   * parallel batch returns the queued snapshots taken when the records were created, and a background chain returns an
+   * empty list (the tool only needs the chain id). Callers must read the current status from the registry, never from
+   * these snapshots.
+   */
+  records: SubagentRecord[];
+  /** Foreground batches: the summary the tool returns. */
+  payload?: Payload;
+  /** Chains only: the chain this batch belongs to. */
+  chain?: ChainRecord;
+}
+
+interface Prepared {
+  record: SubagentRecord;
+  agent: AgentDef;
+  runner: Runner;
+  cwd: string;
+  trusted?: boolean;
+  controller: AbortController;
+}
+
+/** An item's agent, runner and cwd after validation; computed once so a whole batch can be checked before any record exists. */
+interface Resolved {
+  agent: AgentDef;
+  runner: Runner;
+  cwd: string;
+  trusted?: boolean;
+}
+
+interface LaunchOptions {
+  /** "batch" items never return early, never deliver on their own, and size their output by `receiverContextWindow`. */
+  mode?: "single" | "batch";
+  receiverContextWindow?: number;
 }
 
 interface Live {
@@ -82,6 +147,27 @@ export class SubagentManager {
     return this.deps.registry.list();
   }
 
+  /** Chains on the current branch, in creation order (for the list tree). */
+  listChains(): ChainRecord[] {
+    return this.deps.chainStore.list();
+  }
+
+  /** Resolves a run's working directory; the main cwd when omitted. Absolute inputs are normalized too, so equivalent paths compare equal. */
+  resolveCwd(cwd: string | undefined): string {
+    if (!cwd) return this.deps.cwd;
+    const resolved = resolve(this.deps.cwd, cwd);
+    try {
+      if (statSync(resolved).isDirectory()) return resolved;
+    } catch (error) {
+      // Only a missing path is "does not exist"; surface other causes (permissions and so on) with their reason.
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
+        throw new SubagentError("missing_cwd", `cannot access working directory ${resolved}: ${code ?? String(error)}`);
+      }
+    }
+    throw new SubagentError("missing_cwd", `working directory does not exist: ${resolved}`);
+  }
+
   /** Records with a live child or a pending resume claim; these must survive a branch switch. */
   activeRecords(): SubagentRecord[] {
     const ids = new Set([...this.live.keys(), ...this.claims.keys(), ...this.queued.keys()]);
@@ -89,15 +175,24 @@ export class SubagentManager {
   }
 
   async run(req: RunRequest): Promise<RunOutcome> {
+    const prepared = this.prepare(req);
+    return this.launch(prepared, req.task, req.background ?? false, req.signal, {
+      ...(req.receiverContextWindow ? { receiverContextWindow: req.receiverContextWindow } : {}),
+    });
+  }
+
+  /** Validates the request and creates the queued record (so it is listed and cancellable from the start). */
+  private prepare(
+    req: { agent: string; task: string; delivery?: DeliveryMode; cwd?: string; chainId?: string; stepIndex?: number },
+    resolved?: Resolved,
+  ): Prepared {
     if (this.closed) throw shutDownError();
     if (this.deps.scheduler.disabled) throw new SubagentsDisabledError();
-    const agent = this.requireAgent(req.agent);
-    const runner = this.requireRunner(agent.runner ?? this.deps.settings().defaultRunner);
+    const { agent, runner, cwd, trusted } = resolved ?? this.resolveTarget(req);
     // Runs started by the main agent's tool are always auto; `delivery` is only passed by internal callers.
     const delivery = req.delivery ?? "auto";
-    const signal = req.signal;
     // The record exists from the start so a run waiting for a slot is listed and can be cancelled by handle.
-    const queuedRecord = this.deps.registry.create({
+    const record = this.deps.registry.create({
       agent: agent.name,
       preferredHandle: agent.handle ?? agent.name,
       runner: runner.kind,
@@ -105,54 +200,339 @@ export class SubagentManager {
       sessionFile: "",
       delivery,
       task: req.task,
+      cwd,
       status: "queued",
+      ...(req.chainId ? { chainId: req.chainId, stepIndex: req.stepIndex ?? 0 } : {}),
     });
     try {
-      this.deps.onRecordCreated?.(queuedRecord);
+      this.deps.onRecordCreated?.(record);
     } catch {
       // Informational only.
     }
-    const id = queuedRecord.id;
     const controller = new AbortController();
-    this.queued.set(id, controller);
+    this.queued.set(record.id, controller);
+    return { record, agent, runner, cwd, trusted, controller };
+  }
+
+  /** Waits for a slot, opens the child, then runs one turn. */
+  private async launch(prepared: Prepared, text: string, background: boolean, signal: AbortSignal | undefined, options: LaunchOptions = {}): Promise<RunOutcome> {
+    const { record, agent, runner, cwd, trusted, controller } = prepared;
     const cancel = AbortSignal.any([this.lifetime.signal, controller.signal, ...(signal ? [signal] : [])]);
     let release: () => void;
     try {
       release = await this.deps.scheduler.acquire(cancel);
     } catch (error) {
-      this.queued.delete(id);
-      throw this.settleQueued(id, error, signal);
+      this.queued.delete(record.id);
+      throw this.settleQueued(record.id, error, signal);
     }
     let session: ChildSession;
     try {
       session = await runner.open({
         agent,
-        cwd: this.deps.cwd,
+        cwd,
         sessionDir: this.deps.sessionDir,
+        ...(trusted !== undefined ? { projectTrusted: trusted } : {}),
         appendSystemPrompt: [agent.systemPrompt, SUMMARY_INSTRUCTION].filter(Boolean),
       });
     } catch (error) {
-      this.queued.delete(id);
+      this.queued.delete(record.id);
       release();
-      throw this.settleQueued(id, error, signal);
+      throw this.settleQueued(record.id, error, signal);
     }
-    this.queued.delete(id);
+    this.queued.delete(record.id);
     if (this.closed || controller.signal.aborted || signal?.aborted) {
       // Shutdown, a cancel by handle, or the calling tool's abort happened while the session was opening.
       release();
-      await this.close(id, session);
-      throw this.settleQueued(id, this.closed ? shutDownError() : runInterruptedError(), signal);
+      await this.close(record.id, session);
+      throw this.settleQueued(record.id, this.closed ? shutDownError() : runInterruptedError(), signal);
     }
-    const running = this.deps.registry.update(id, { status: "running", sessionFile: session.sessionFile });
-    return this.execute(running, session, req.task, release, req.background ?? false, signal);
+    const running = this.deps.registry.update(record.id, { status: "running", sessionFile: session.sessionFile });
+    return this.execute(running, session, text, release, background, signal, [], options);
+  }
+
+  /** Starts every task at once (the scheduler still caps concurrency) and summarizes the group afterwards. */
+  async runParallel(req: { items: readonly BatchItem[]; background?: boolean; signal?: AbortSignal }): Promise<BatchOutcome> {
+    if (this.closed) throw shutDownError();
+    if (req.items.length === 0) throw new Error("a parallel batch needs at least one item");
+    const max = this.deps.settings().maxParallelTasks;
+    if (max === 0) throw new SubagentsDisabledError("parallel is disabled (maxParallelTasks is 0)");
+    // The n-th task is allowed exactly when the previous n - 1 are within the limit (max -1 = unlimited).
+    if (!limitAllows(max, req.items.length - 1)) throw new Error(`too many parallel tasks (${req.items.length}); max is ${max}`);
+    // Validate every agent, runner and cwd up front, before any record exists: a bad item must not leave a half-created
+    // batch behind (a queued record whose launch() is never reached would stay queued forever).
+    const resolved = req.items.map((item) => this.resolveTarget({ agent: item.agent, cwd: item.cwd }));
+    const prepared = req.items.map((item, i) => this.prepare({ agent: item.agent, task: item.task, cwd: item.cwd }, resolved[i]!));
+    // One item failing to start (runner.open, a cancel while queued/opening, shutdown) must not drop the others' results.
+    const settled = Promise.allSettled(prepared.map((p, i) => this.launch(p, req.items[i]!.task, true, req.signal, { mode: "batch" })));
+    const outcomes = settled.then((results) => results.map((result, i) => (result.status === "fulfilled" ? result.value : this.failureOutcome(prepared[i]!.record))));
+    if (!req.background) {
+      const done = await outcomes;
+      return { records: done.map((o) => o.record), payload: this.parallelPayload(done) };
+    }
+    // The records already exist, so the tool can report the handles now; one summary is delivered when all finish.
+    this.track(
+      outcomes.then((done) => this.sendBatch("parallel", this.parallelPayload(done), done.map((o) => o.record))),
+      (error) => this.reportBatchError(prepared[0]?.record, error),
+    );
+    return { records: prepared.map((p) => p.record) };
+  }
+
+  /** Runs the steps one after another; a failing, interrupted or stopped step stops the chain and can be continued later. */
+  async runChain(req: { steps: readonly BatchItem[]; background?: boolean; signal?: AbortSignal }): Promise<BatchOutcome> {
+    if (this.closed) throw shutDownError();
+    if (req.steps.length === 0) throw new Error("a chain needs at least one step");
+    const max = this.deps.settings().maxChainSteps;
+    if (max === 0) throw new SubagentsDisabledError("chains are disabled (maxChainSteps is 0)");
+    if (!limitAllows(max, req.steps.length - 1)) throw new Error(`too many chain steps (${req.steps.length}); max is ${max}`);
+    // Refuse before the chain exists when the scheduler is disabled (maxConcurrent 0): prepare() would throw
+    // afterwards and leave a chain stuck in "running" with no step records and no way to continue it.
+    if (this.deps.scheduler.disabled) throw new SubagentsDisabledError();
+    // Validate every step's agent, runner and cwd before the chain exists, so a typo cannot leave a half-run chain behind.
+    const targets = req.steps.map((step) => this.resolveTarget({ agent: step.agent, cwd: step.cwd }));
+    const chain = this.deps.chainStore.create({
+      steps: req.steps.map((s) => ({ agent: s.agent, task: s.task, ...(s.cwd ? { cwd: s.cwd } : {}) })),
+    });
+    if (!req.background) return this.runChainLoop(chain, 0, "", req.signal, targets);
+    this.track(
+      this.runChainLoop(chain, 0, "", req.signal, targets).then((outcome) => {
+        this.sendBatch("chain", outcome.payload!, outcome.records, outcome.chain);
+      }),
+      (error) => this.reportBatchError(this.firstChainRecord(chain.id), error),
+    );
+    return { records: [], chain };
+  }
+
+  /** Continues the chain that stopped at the step behind `handle`: resumes that step, then runs the remaining ones. */
+  async continueChain(handle: string, message?: string, opts: { background?: boolean; signal?: AbortSignal } = {}): Promise<BatchOutcome> {
+    if (this.closed) throw shutDownError();
+    const record = this.requireRecord(handle);
+    const chain = record.chainId ? this.deps.chainStore.get(record.chainId) : undefined;
+    if (!chain) throw new SubagentError("unknown_handle", `@${record.handle} is not part of a chain`);
+    if (chain.status === "stopped") throw new SubagentError("stopped", `chain ${chain.id} was stopped and cannot be continued`);
+    if (chain.status === "running") throw new SubagentError("busy", `chain ${chain.id} is still running`);
+    if (chain.status === "completed") throw new SubagentError("not_running", `chain ${chain.id} already finished`);
+    const index = record.stepIndex ?? chain.currentStep;
+    if (index !== chain.currentStep) {
+      throw new SubagentError(
+        "not_running",
+        `@${record.handle} is step ${index + 1} of chain ${chain.id}, which stopped at step ${chain.currentStep + 1}`,
+      );
+    }
+    // Validate the remaining steps before resuming, so a bad step cannot leave the chain half-advanced.
+    const targets = chain.steps.map((step, i) => (i > index ? this.resolveTarget({ agent: step.agent, cwd: step.cwd }) : undefined));
+    if (!opts.background) return this.continueChainLoop(chain, record, index, message, opts.signal, targets);
+    this.track(
+      this.continueChainLoop(chain, record, index, message, opts.signal, targets).then((outcome) => {
+        this.sendBatch("chain", outcome.payload!, outcome.records, outcome.chain);
+      }),
+      (error) => this.reportBatchError(this.firstChainRecord(chain.id), error),
+    );
+    return { records: [], chain };
+  }
+
+  /** Chains that still have a live or queued run (those must survive a branch switch). */
+  activeChains(): ChainRecord[] {
+    const ids = new Set<string>();
+    for (const r of this.activeRecords()) if (r.chainId) ids.add(r.chainId);
+    return [...ids].map((id) => this.deps.chainStore.get(id)).filter((c): c is ChainRecord => !!c);
+  }
+
+  private async continueChainLoop(
+    chain: ChainRecord,
+    record: SubagentRecord,
+    index: number,
+    message: string | undefined,
+    signal: AbortSignal | undefined,
+    targets: readonly (Resolved | undefined)[],
+  ): Promise<BatchOutcome> {
+    // The process can die between a step finishing and the chain advancing: that step must not run a second time.
+    if (record.status === "completed") {
+      const current = this.deps.chainStore.update(chain.id, { status: "running", usage: this.chainUsage(chain) });
+      const rest = await this.runChainLoop(current, index + 1, record.lastSummary ?? "", signal, targets, [{ record }]);
+      return { records: rest.records, payload: rest.payload, chain: rest.chain };
+    }
+    // Resume the step that stopped the chain so it keeps its own session, then run the remaining steps.
+    const receiver = this.chainReceiverWindow(chain, index);
+    const resumed = await this.resume(record.handle, message ?? record.task, {
+      background: true,
+      ...(signal ? { signal } : {}),
+      mode: "batch",
+      ...(receiver ? { receiverContextWindow: receiver } : {}),
+    });
+    if (resumed.record.status !== "completed") {
+      const stopped = this.deps.chainStore.update(chain.id, { status: chainStatusOf(resumed.record.status), usage: this.chainUsage(chain) });
+      return { records: [resumed.record], payload: this.chainPayload(stopped, [resumed]), chain: stopped };
+    }
+    // The resumed step keeps its record id, so the chain usage stays the sum of every started step's record.
+    const current = this.deps.chainStore.update(chain.id, { status: "running", usage: this.chainUsage(chain) });
+    const rest = await this.runChainLoop(current, index + 1, resumed.payload?.text ?? "", signal, targets, [resumed]);
+    // `runChainLoop` already carries the resumed outcome, so its records and payload span the whole chain.
+    return { records: rest.records, payload: rest.payload, chain: rest.chain };
+  }
+
+  private async runChainLoop(
+    chain: ChainRecord,
+    from: number,
+    previous: string,
+    signal: AbortSignal | undefined,
+    targets: readonly (Resolved | undefined)[],
+    outcomes: RunOutcome[] = [],
+  ): Promise<BatchOutcome> {
+    let current = chain;
+    for (let i = from; i < chain.steps.length; i++) {
+      const step = chain.steps[i]!;
+      const task = substitutePrevious(step.task, previous);
+      let prepared: Prepared;
+      try {
+        prepared = this.prepare({ agent: step.agent, task, cwd: step.cwd, chainId: chain.id, stepIndex: i }, targets[i]);
+      } catch (error) {
+        // prepare() can only fail before the step's record exists (shutdown or disabled between steps). Never leave
+        // the chain stuck in "running": settle it to stopped/failed and let the caller or the background error path
+        // surface the failure (firstChainRecord is then defined whenever any earlier step had started).
+        this.deps.chainStore.update(chain.id, { status: this.closed ? "stopped" : "failed", usage: this.chainUsage(current) });
+        throw error;
+      }
+      current = this.deps.chainStore.update(chain.id, { currentStep: i, status: "running", stepRecordIds: [...current.stepRecordIds, prepared.record.id] });
+      const receiver = this.chainReceiverWindow(chain, i);
+      let outcome: RunOutcome;
+      try {
+        outcome = await this.launch(prepared, task, true, signal, { mode: "batch", ...(receiver ? { receiverContextWindow: receiver } : {}) });
+      } catch (error) {
+        // The run was cancelled or its session could not open; the record already says why.
+        const failed = this.deps.registry.get(prepared.record.id) ?? prepared.record;
+        outcomes.push({ record: failed });
+        const stopped = this.deps.chainStore.update(chain.id, { status: chainStatusOf(failed.status), usage: this.chainUsage(current) });
+        return { records: outcomes.map((o) => o.record), payload: this.chainPayload(stopped, outcomes), chain: stopped };
+      }
+      outcomes.push(outcome);
+      current = this.deps.chainStore.update(chain.id, { usage: this.chainUsage(current) });
+      if (outcome.record.status !== "completed") {
+        const stopped = this.deps.chainStore.update(chain.id, { status: chainStatusOf(outcome.record.status) });
+        return { records: outcomes.map((o) => o.record), payload: this.chainPayload(stopped, outcomes), chain: stopped };
+      }
+      previous = outcome.payload?.text ?? "";
+    }
+    const done = this.deps.chainStore.update(chain.id, { status: "completed", usage: this.chainUsage(current) });
+    return { records: outcomes.map((o) => o.record), payload: this.chainPayload(done, outcomes), chain: done };
+  }
+
+  /** The window of whoever receives a step's output: the next step's agent, or the main session for the last step. */
+  private chainReceiverWindow(chain: ChainRecord, index: number): number | undefined {
+    const next = chain.steps[index + 1] ? this.deps.agents().get(chain.steps[index + 1]!.agent) : undefined;
+    return next ? this.deps.receiverContextWindowFor?.(next) : undefined;
+  }
+
+  /** The first step record of a chain, for reporting a detached failure; undefined before the first step starts. */
+  private firstChainRecord(chainId: string): SubagentRecord | undefined {
+    const first = this.deps.chainStore.get(chainId)?.stepRecordIds[0];
+    return first ? this.deps.registry.get(first) : undefined;
+  }
+
+  /**
+   * The chain's total usage, recomputed from its started step records. A resumed step keeps its record id and its
+   * usage is cumulative, so summing `chain.usage` again would double-count it; deriving the total from the registry
+   * keeps `chain.usage` equal to the sum of every started step's record usage.
+   */
+  private chainUsage(chain: ChainRecord): Usage {
+    let total: Usage = { ...ZERO_USAGE };
+    for (const id of chain.stepRecordIds) {
+      const record = this.deps.registry.get(id);
+      if (record) total = addUsage(total, record.usage);
+    }
+    return total;
+  }
+
+  /** One summary for a chain: a head line, a section per step, then the last step's output. */
+  private chainPayload(chain: ChainRecord, outcomes: readonly RunOutcome[]): Payload {
+    // Count every step the chain has started (not just this call's outcomes), so a continued chain still reports 3/3.
+    const head = `Chain ${chain.status} (${chain.stepRecordIds.length}/${chain.steps.length} steps)`;
+    const sections = outcomes.map((o) => {
+      const r = o.record;
+      const step = `step ${(r.stepIndex ?? 0) + 1}`;
+      return `### [@${r.handle}] (${r.agent}) ${step} ${r.status}${r.error ? `: ${r.error}` : ""}\n${r.lastSummary ?? ""}\nSession: ${r.sessionFile}`;
+    });
+    const last = outcomes.at(-1)?.payload?.text ?? "";
+    return { text: `${head}\n\n${sections.join("\n\n")}${last ? `\n\n${last}` : ""}`, summary: head };
+  }
+
+  /** A rejected batch item is reported like finish() reports a failed run, using the status settleQueued already stored. */
+  private failureOutcome(record: SubagentRecord): RunOutcome {
+    const current = this.deps.registry.get(record.id) ?? record;
+    const note = `@${current.handle} ${current.status}${current.error ? `: ${current.error}` : ""}`;
+    return { record: current, payload: { text: note, summary: note } };
+  }
+
+  /** One summary for a whole group: `Parallel: X/N succeeded` plus a section per item. */
+  private parallelPayload(outcomes: readonly RunOutcome[]): Payload {
+    const window = this.deps.receiverContextWindow();
+    const ratio = this.deps.settings().contextRatio;
+    const texts = outcomes.map((o) => o.payload?.text ?? "");
+    const inline = texts.reduce((n, t) => n + estimateTokens(t), 0) <= window * ratio;
+    const sections = outcomes.map((o, i) => {
+      const r = o.record;
+      const head = `### [@${r.handle}] (${r.agent}) ${r.status}${r.error ? `: ${r.error}` : ""}`;
+      let body = texts[i] ?? "";
+      if (!inline && body && !o.payload?.filePath) {
+        const file = writeOutput(body, { outputDir: this.deps.outputDir, label: `${r.handle}-run${r.runId}` });
+        body = `Summary:\n${r.lastSummary ?? ""}\n\nFull output: ${file}`;
+      }
+      return `${head}\n${body}${body ? "\n" : ""}Session: ${r.sessionFile}`;
+    });
+    const succeeded = outcomes.filter((o) => o.record.status === "completed").length;
+    const head = `Parallel: ${succeeded}/${outcomes.length} succeeded`;
+    return { text: `${head}\n\n${sections.join("\n\n---\n\n")}`, summary: head };
+  }
+
+  /** One auto message per batch, only when it carries something the main agent can use. */
+  private sendBatch(kind: "parallel" | "chain", payload: Payload, records: readonly SubagentRecord[], chain?: ChainRecord): void {
+    if (this.closed) return;
+    if (!records.some((r) => r.status === "completed" || r.status === "failed")) return;
+    deliverBatch(this.deps.port, {
+      text: payload.text,
+      details: { kind, ...(chain ? { chainId: chain.id, status: chain.status } : {}), handles: records.map((r) => r.handle) },
+    });
+  }
+
+  /** Resolves a run's agent, runner and cwd without creating a record, so a caller can validate it first. */
+  private resolveTarget(req: { agent: string; cwd?: string }): Resolved {
+    const agent = this.requireAgent(req.agent);
+    const runner = this.requireRunner(agent.runner ?? this.deps.settings().defaultRunner);
+    const cwd = this.resolveCwd(req.cwd);
+    return { agent, runner, cwd, trusted: this.deps.trustForCwd?.(cwd) };
+  }
+
+  /** Runs a promise in the background and keeps whenIdle()/shutdown() waiting for it. `onError` makes a detached failure visible. */
+  private track(job: Promise<unknown>, onError?: (error: unknown) => void): void {
+    this.work.add(job);
+    void job
+      .catch((error) => {
+        try {
+          onError?.(error);
+        } catch {
+          // Reporting must never surface as an unhandled rejection.
+        }
+      })
+      .finally(() => this.work.delete(job));
+  }
+
+  /** A background batch failing after its handles were returned must not disappear: surface it like a delivery failure. */
+  private reportBatchError(record: SubagentRecord | undefined, error: unknown): void {
+    if (!record) return;
+    const message = error instanceof Error ? error.message : String(error);
+    try {
+      this.deps.onDeliveryError?.(this.deps.registry.get(record.id) ?? record, message);
+    } catch {
+      // The notifier must never turn a finished batch into a rejected background job.
+    }
   }
 
   async resume(
     handle: string,
     message: string,
-    opts: { delivery?: DeliveryMode; background?: boolean; signal?: AbortSignal; mention?: boolean } = {},
+    opts: { delivery?: DeliveryMode; background?: boolean; signal?: AbortSignal; mention?: boolean; receiverContextWindow?: number; mode?: "single" | "batch" } = {},
   ): Promise<RunOutcome> {
-    const { record, agent, runner } = this.preflight(handle);
+    const { record, agent, runner, cwd } = this.preflight(handle);
+    const trusted = this.deps.trustForCwd?.(cwd);
     // Snapshot taken before the claim so a failed resume can be rolled back fully.
     const previous: { status: RunStatus; runId: number; delivery: DeliveryMode; error: string | undefined } = {
       status: record.status,
@@ -195,10 +575,11 @@ export class SubagentManager {
           // takeIdle has waited for any close of this record still in flight, so the file has no other writer.
           (await runner.open({
             agent,
-            cwd: this.deps.cwd,
+            cwd,
             sessionDir: this.deps.sessionDir,
             resumeFile: record.sessionFile,
             ...(record.childLeafId ? { resumeLeafId: record.childLeafId } : {}),
+            ...(trusted !== undefined ? { projectTrusted: trusted } : {}),
             appendSystemPrompt: [agent.systemPrompt, SUMMARY_INSTRUCTION].filter(Boolean),
           }));
         if (this.closed) {
@@ -230,7 +611,10 @@ export class SubagentManager {
       await this.close(record.id, session);
       throw stoppedWhileWaiting();
     }
-    return this.execute(claimed, session, message, release, opts.background ?? false, signal, opts.mention ? [this.ask("ask", message)] : []);
+    return this.execute(claimed, session, message, release, opts.background ?? false, signal, opts.mention ? [this.ask("ask", message)] : [], {
+      ...(opts.mode ? { mode: opts.mode } : {}),
+      ...(opts.receiverContextWindow ? { receiverContextWindow: opts.receiverContextWindow } : {}),
+    });
   }
 
   /** The error resume() would reject with right away, if any; lets fire-and-forget callers report it immediately. */
@@ -344,6 +728,33 @@ export class SubagentManager {
     return count;
   }
 
+  /**
+   * Align chain status with its step records after a reload, restart or branch switch. A chain left "running"
+   * with no live, queued or claimed step (recoverInterrupted settled those) would otherwise reject `continueChain`
+   * with "busy" forever, losing "continue from the stopped step". Such a chain is normalized to what its stopping
+   * step left behind; chains that still have an active step are untouched. Returns how many chains were changed.
+   */
+  reconcileChains(): number {
+    const active = new Set(this.activeRecords().map((r) => r.id));
+    let count = 0;
+    for (const chain of this.deps.chainStore.list()) {
+      if (chain.status !== "running") continue;
+      if (chain.stepRecordIds.some((id) => active.has(id))) continue;
+      const records = chain.stepRecordIds.map((id) => this.deps.registry.get(id)).filter((r): r is SubagentRecord => !!r);
+      // Only a chain whose every step finished is "completed". A stopping step that is itself completed (the process
+      // died between steps) must not mark the whole chain finished, so it falls through to the continuable "paused".
+      const stop = records.find((r) => r.stepIndex === chain.currentStep) ?? records.at(-1);
+      let status: ChainStatus;
+      if (records.length === chain.steps.length && records.every((r) => r.status === "completed")) status = "completed";
+      else if (stop?.status === "stopped") status = "stopped";
+      else if (stop?.status === "failed") status = "failed";
+      else status = "paused";
+      this.deps.chainStore.update(chain.id, { status, usage: this.chainUsage(chain) });
+      count++;
+    }
+    return count;
+  }
+
   async whenIdle(): Promise<void> {
     while (this.work.size) await Promise.allSettled([...this.work]);
   }
@@ -356,12 +767,14 @@ export class SubagentManager {
     background: boolean,
     signal?: AbortSignal,
     asks: Ask[] = [],
+    options: LaunchOptions = {},
   ): Promise<RunOutcome> {
     const live: Live = { session, asks };
     this.live.set(record.id, live);
     this.evictIdle();
-    // Only a foreground call is still waiting on its tool signal; a background call has already returned.
-    const callSignal = background ? undefined : signal;
+    const batch = options.mode === "batch";
+    // Only a foreground single call is still waiting on its tool signal; a background or batch call runs detached.
+    const callSignal = background || batch ? undefined : signal;
     const onCallAbort = () => {
       live.intent = "interrupt";
       void session.abort().catch(() => {});
@@ -388,7 +801,7 @@ export class SubagentManager {
         await this.park(record.id, session, live);
       }
       try {
-        return this.finish(record.id, result, live, background, leafId);
+        return this.finish(record.id, result, live, background, leafId, options);
       } catch (error) {
         // Never leave the record stuck in "running" or let a background job reject.
         const message = `result handling failed: ${(error as Error).message}`;
@@ -404,11 +817,11 @@ export class SubagentManager {
     })();
     this.work.add(job);
     void job.catch(() => {}).finally(() => this.work.delete(job));
-    if (background) return { record };
+    if (background && !batch) return { record };
     return job;
   }
 
-  private finish(id: string, result: ChildResult, live: Live, background: boolean, leafId?: string): RunOutcome {
+  private finish(id: string, result: ChildResult, live: Live, background: boolean, leafId?: string, options: LaunchOptions = {}): RunOutcome {
     const registry = this.deps.registry;
     registry.addUsage(id, result.usage);
     let status: RunStatus;
@@ -420,17 +833,23 @@ export class SubagentManager {
     else status = "completed";
 
     const current = registry.get(id)!;
+    const batch = options.mode === "batch";
     let payload: Payload;
     if (status === "completed") {
       // share/auto background results are delivered into the main LLM context: always move the full text to a file
       // and send only the summary + paths (ratio 0). Private results never enter the LLM context, so they keep the
-      // contextRatio rule like foreground returns. One file per run at most.
+      // contextRatio rule like foreground returns. One file per run at most. A batch run is never delivered on its
+      // own: it is sized for its consumer (the next chain step, or the group summary) in the summary + path form.
+      const receiverWindow = options.receiverContextWindow ?? this.deps.receiverContextWindow();
+      const label =
+        batch && current.stepIndex !== undefined ? `${current.handle}-step${current.stepIndex + 1}-run${current.runId}` : `${current.handle}-run${current.runId}`;
       payload = preparePayload({
         text: result.text,
-        receiverContextWindow: this.deps.receiverContextWindow(),
-        ratio: background && current.delivery !== "private" ? 0 : this.deps.settings().contextRatio,
+        receiverContextWindow: receiverWindow,
+        ratio: background && !batch && current.delivery !== "private" ? 0 : this.deps.settings().contextRatio,
         outputDir: this.deps.outputDir,
-        label: `${current.handle}-run${current.runId}`,
+        label,
+        ...(batch ? { style: "path" as const, sessionFile: current.sessionFile } : {}),
       });
     } else {
       const note = `@${current.handle} ${status}${error ? `: ${error}` : ""}`;
@@ -441,7 +860,7 @@ export class SubagentManager {
     // Private instructions are never shown to it.
     const shown = live.asks.filter((a) => !a.private);
     if (!background && shown.length) payload = { ...payload, text: `${renderAsks(current.handle, shown)}\n\n${payload.text}` };
-    if (background && status !== "stopped" && status !== "paused") {
+    if (background && !batch && status !== "stopped" && status !== "paused") {
       // Only a private run's own private entry may quote private instructions.
       const quoted = record.delivery === "private" ? live.asks : shown;
       try {
@@ -558,8 +977,8 @@ export class SubagentManager {
     return done;
   }
 
-  /** Synchronous checks shared by resume and checkResumable; throws the error resume would reject with. */
-  private preflight(handle: string): { record: SubagentRecord; agent: AgentDef; runner: Runner } {
+  /** Synchronous checks shared by resume and checkResumable, including resolving the recorded cwd; throws the error resume would reject with. */
+  private preflight(handle: string): { record: SubagentRecord; agent: AgentDef; runner: Runner; cwd: string } {
     if (this.closed) throw shutDownError();
     const record = this.requireRecord(handle);
     if (record.status === "stopped") throw new SubagentError("stopped", `@${record.handle} was stopped and cannot be resumed; start a new subagent instead`);
@@ -571,7 +990,10 @@ export class SubagentManager {
     if (!existsSync(record.sessionFile)) {
       throw new SubagentError("missing_session", `session file for @${record.handle} is missing: ${record.sessionFile}`);
     }
-    return { record, agent: this.requireAgent(record.agent), runner: this.requireRunner(record.runner) };
+    const agent = this.requireAgent(record.agent);
+    const runner = this.requireRunner(record.runner);
+    // Resolve last so a missing cwd is reported exactly like resume() does, after the other preflight errors.
+    return { record, agent, runner, cwd: this.resolveCwd(record.cwd) };
   }
 
   private ask(kind: Ask["kind"], text: string): Ask {
@@ -642,6 +1064,36 @@ export class SubagentManager {
 
 function runInterruptedError(): SubagentError {
   return new SubagentError("interrupted", "subagent run was interrupted before it started");
+}
+
+/** The only placeholder a chain task may use: the previous step's final output. */
+function substitutePrevious(task: string, previous: string): string {
+  // Use a function replacement: `$&`, `` $` ``, `$'`, `$1` and `$$` in the previous output must stay literal.
+  return task.replace(/\{previous\}/g, () => previous);
+}
+
+/** Maps a finished step's run status to the chain status it leaves behind. */
+function chainStatusOf(status: RunStatus): ChainStatus {
+  switch (status) {
+    case "completed":
+      return "completed";
+    case "paused":
+      return "paused";
+    case "stopped":
+      return "stopped";
+    default:
+      return "failed";
+  }
+}
+
+function addUsage(a: Usage, b: Usage): Usage {
+  return {
+    input: a.input + b.input,
+    output: a.output + b.output,
+    cacheRead: a.cacheRead + b.cacheRead,
+    cacheWrite: a.cacheWrite + b.cacheWrite,
+    cost: Math.round((a.cost + b.cost) * 1e6) / 1e6,
+  };
 }
 
 function shutDownError(): Error {

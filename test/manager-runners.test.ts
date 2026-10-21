@@ -1,4 +1,5 @@
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { ChainStore } from "../src/chain.ts";
 import { SubagentManager } from "../src/manager.ts";
 import { REGISTRY_ENTRY_TYPE, Registry, type SubagentRecord } from "../src/registry.ts";
 import type { ChildSession, ChildSpec, Runner } from "../src/runner/types.ts";
@@ -44,6 +45,7 @@ async function setup(kind: "sdk" | "rpc", settings: Partial<SubagentSettings> = 
   const registry = new Registry((r) => persisted.push(r));
   const manager = new SubagentManager({
     registry,
+    chainStore: new ChainStore(() => {}),
     scheduler: new Scheduler(() => 4),
     runners: { sdk: kind === "sdk" ? runner : undefined, rpc: kind === "rpc" ? runner : undefined },
     agents: () => new Map([["echo", { ...echoAgent, runner: kind }]]),

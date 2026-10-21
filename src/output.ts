@@ -43,12 +43,32 @@ export interface Payload {
   summary: string;
 }
 
+/**
+ * Line that replaces an oversized body.
+ * - `detail` is for a model reading the tool result directly (keeps the token count).
+ * - `path` is for a batch consumer (chain `{previous}`, group summary): summary + paths only.
+ */
+export type OutputStyle = "detail" | "path";
+
+/** Writes the full output to a new file under `outputDir` and returns its path (never overwrites). */
+export function writeOutput(text: string, opts: { outputDir: string; label: string }): string {
+  mkdirSync(opts.outputDir, { recursive: true, mode: 0o700 });
+  const safe = opts.label.replace(/[^a-zA-Z0-9_-]+/g, "_");
+  const filePath = join(opts.outputDir, `${safe}-${Date.now()}-${randomUUID()}.md`);
+  // "wx" fails instead of silently overwriting an existing file.
+  writeFileSync(filePath, text, { mode: 0o600, flag: "wx" });
+  return filePath;
+}
+
 export function preparePayload(opts: {
   text: string;
   receiverContextWindow: number;
   ratio: number;
   outputDir: string;
   label: string;
+  style?: OutputStyle;
+  /** Child session file; added to the short path form so the receiver can find the full transcript. */
+  sessionFile?: string;
 }): Payload {
   const { body, summary } = extractSummary(opts.text);
   // An empty <summary></summary> is treated like a missing one.
@@ -56,14 +76,10 @@ export function preparePayload(opts: {
   if (estimateTokens(body) <= opts.receiverContextWindow * opts.ratio) {
     return { text: opts.text, summary: shortSummary };
   }
-  mkdirSync(opts.outputDir, { recursive: true, mode: 0o700 });
-  const safe = opts.label.replace(/[^a-zA-Z0-9_-]+/g, "_");
-  const filePath = join(opts.outputDir, `${safe}-${Date.now()}-${randomUUID()}.md`);
-  // "wx" fails instead of silently overwriting an existing file.
-  writeFileSync(filePath, body, { mode: 0o600, flag: "wx" });
-  return {
-    text: `Summary:\n${shortSummary}\n\nFull output (${estimateTokens(body)} tokens) saved to ${filePath}. Read it if you need details.`,
-    filePath,
-    summary: shortSummary,
-  };
+  const filePath = writeOutput(body, { outputDir: opts.outputDir, label: opts.label });
+  const text =
+    opts.style === "path"
+      ? `Summary:\n${shortSummary}\n\nFull output: ${filePath}${opts.sessionFile ? `\nSession: ${opts.sessionFile}` : ""}`
+      : `Summary:\n${shortSummary}\n\nFull output (${estimateTokens(body)} tokens) saved to ${filePath}. Read it if you need details.`;
+  return { text, filePath, summary: shortSummary };
 }

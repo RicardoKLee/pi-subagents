@@ -85,4 +85,42 @@ describe("preparePayload", () => {
     expect(readFileSync(a.filePath!, "utf8")).toBe(bodyA);
     expect(readFileSync(b.filePath!, "utf8")).toBe(bodyB);
   });
+
+  it("keeps the detailed wording when style is omitted", () => {
+    const body = "b".repeat(2000);
+    const p = preparePayload({ text: `${body}\n<summary>Short.</summary>`, receiverContextWindow: 1000, ratio: 0.3, outputDir: outputDir(), label: "r" });
+    expect(p.filePath).toBeDefined();
+    expect(p.text).toContain(`Full output (500 tokens) saved to ${p.filePath!}. Read it if you need details.`);
+  });
+
+  it("keeps the detailed wording when style is explicitly detail", () => {
+    const body = "b".repeat(2000);
+    const p = preparePayload({ text: `${body}\n<summary>Short.</summary>`, receiverContextWindow: 1000, ratio: 0.3, outputDir: outputDir(), label: "r", style: "detail" });
+    expect(p.text).toContain(`Full output (500 tokens) saved to ${p.filePath!}. Read it if you need details.`);
+  });
+
+  it("uses the short path form when style is path", () => {
+    const body = "b".repeat(2000);
+    const p = preparePayload({ text: `${body}\n<summary>Short.</summary>`, receiverContextWindow: 1000, ratio: 0.3, outputDir: outputDir(), label: "r", style: "path" });
+    expect(p.filePath).toBeDefined();
+    expect(readFileSync(p.filePath!, "utf8")).toBe(body);
+    expect(p.summary).toBe("Short.");
+    expect(p.text).toContain(`Full output: ${p.filePath!}`);
+    expect(p.text).not.toContain("tokens) saved to");
+  });
+
+  it("adds the child session path in the path form", () => {
+    const body = "b".repeat(2000);
+    const p = preparePayload({
+      text: `${body}\n<summary>Short.</summary>`,
+      receiverContextWindow: 1000,
+      ratio: 0.3,
+      outputDir: outputDir(),
+      label: "r",
+      style: "path",
+      sessionFile: "/sessions/subagents/child.jsonl",
+    });
+    expect(p.text).toContain(`Full output: ${p.filePath!}`);
+    expect(p.text).toContain("Session: /sessions/subagents/child.jsonl");
+  });
 });
