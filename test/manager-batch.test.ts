@@ -1,7 +1,6 @@
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import type { AgentDef } from "../src/agents.ts";
 import { ChainStore } from "../src/chain.ts";
 import type { DeliveryPort } from "../src/delivery.ts";
@@ -11,6 +10,9 @@ import type { ChildResult } from "../src/runner/types.ts";
 import { Scheduler } from "../src/scheduler.ts";
 import { DEFAULT_SETTINGS, type SubagentSettings } from "../src/settings.ts";
 import { FakeRunner, FakeSession, usage } from "./fakes.ts";
+import { cleanupTempDirs, tempDir } from "./tmp.ts";
+
+afterAll(cleanupTempDirs);
 
 const reviewer: AgentDef = { name: "reviewer", description: "r", systemPrompt: "Review.", source: "user", filePath: "/a/reviewer.md" };
 const ok = (text: string): ChildResult => ({ text, stopReason: "stop", usage: usage() });
@@ -38,7 +40,7 @@ function setup(
     agentWindow?: (agent: AgentDef) => number | undefined;
   } = {},
 ) {
-  const root = mkdtempSync(join(tmpdir(), "batch-"));
+  const root = tempDir("batch-");
   const scripts = opts.scripts ?? [];
   const runner = new FakeRunner((spec, n) => {
     if (opts.openFailsForCwd && spec.cwd === opts.openFailsForCwd) throw new Error(`runner.open failed for cwd ${spec.cwd}`);
@@ -219,7 +221,7 @@ describe("parallel regressions", () => {
   });
 
   it("aggregates a failed open as one failed item instead of rejecting the batch", async () => {
-    const failCwd = mkdtempSync(join(tmpdir(), "batch-fail-"));
+    const failCwd = tempDir("batch-fail-");
     const { manager, runner } = setup({ scripts: [[ok("first done")]], openFailsForCwd: failCwd });
     const out = await manager.runParallel({
       items: [{ agent: "reviewer", task: "one" }, { agent: "reviewer", task: "two", cwd: failCwd }],
@@ -235,7 +237,7 @@ describe("parallel regressions", () => {
   });
 
   it("background parallel still delivers one summary when one item fails to open", async () => {
-    const failCwd = mkdtempSync(join(tmpdir(), "batch-fail-"));
+    const failCwd = tempDir("batch-fail-");
     const { manager, sent } = setup({ scripts: [[ok("first done")]], openFailsForCwd: failCwd });
     await manager.runParallel({
       items: [{ agent: "reviewer", task: "one" }, { agent: "reviewer", task: "two", cwd: failCwd }],
@@ -480,7 +482,7 @@ describe("chain", () => {
   });
 
   it("fails the chain and keeps the earlier steps when a step cannot open", async () => {
-    const failCwd = mkdtempSync(join(tmpdir(), "chain-fail-"));
+    const failCwd = tempDir("chain-fail-");
     const { manager } = setup({ scripts: [[ok("a")]], openFailsForCwd: failCwd });
     const out = await manager.runChain({ steps: [step1, { agent: "reviewer", task: "second got {previous}", cwd: failCwd }, step3] });
     expect(out.chain!.status).toBe("failed");
