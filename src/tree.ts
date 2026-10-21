@@ -86,14 +86,17 @@ export function renderTree(records: readonly SubagentRecord[], view: TreeView, c
   }
 
   // Steps of chains on this branch sit under their chain header; everything else keeps the parent/child forest.
-  const groups = chains.map((chain, index) => ({
-    chain,
-    index,
-    steps: records.filter((r) => r.chainId === chain.id).sort((a, b) => (a.stepIndex ?? 0) - (b.stepIndex ?? 0)),
-  }));
+  // The number in `chain N` follows creation time, whatever order the caller lists the chains in.
+  const groups = [...chains]
+    .sort((a, b) => a.createdAt - b.createdAt)
+    .map((chain, index) => ({
+      chain,
+      index,
+      steps: records.filter((r) => r.chainId === chain.id).sort((a, b) => (a.stepIndex ?? 0) - (b.stepIndex ?? 0)),
+    }));
   const grouped = new Set(groups.flatMap((g) => g.steps.map((r) => r.id)));
   // A step whose chain is not on this branch (e.g. after /tree) stays visible as an ordinary root.
-  const loose = records.filter((r) => !grouped.has(r.id) && !(r.chainId && chains.some((c) => c.id === r.chainId)));
+  const loose = records.filter((r) => !grouped.has(r.id));
 
   const entries = [
     ...forest(loose).map((node) => ({ at: node.record.createdAt, push: (last: boolean) => pushNode(node, "", last) })),

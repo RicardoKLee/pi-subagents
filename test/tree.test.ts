@@ -143,6 +143,19 @@ describe("renderTree with chains", () => {
     expect(text.split("\n")[1]).toMatch(/^└─ chain 1\s+in 100\s+out 20\s+cache r0 w0\s+\$0\.0100$/);
   });
 
+  it("numbers chains by creation time, not by the order the caller passes them", () => {
+    const later = chain({ id: "c2", createdAt: 20, steps: [{ agent: "b", task: "x" }] });
+    const earlier = chain({ id: "c1", createdAt: 5, steps: [{ agent: "a", task: "y" }] });
+    const text = renderTree(
+      [rec({ handle: "a", id: "s1", chainId: "c1", stepIndex: 0, createdAt: 6 }), rec({ handle: "b", id: "s2", chainId: "c2", stepIndex: 0, createdAt: 21 })],
+      "list",
+      [later, earlier],
+    );
+    const lines = text.split("\n");
+    expect(lines[1]).toMatch(/^├─ chain 1 /);
+    expect(lines[3]).toMatch(/^└─ chain 2 /);
+  });
+
   it("still shows a step whose chain is missing as a root", () => {
     const text = renderTree([rec({ handle: "orphan", chainId: "gone", stepIndex: 0, createdAt: 1 })], "list", []);
     expect(text).toMatch(/└─ @orphan /);

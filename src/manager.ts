@@ -345,6 +345,12 @@ export class SubagentManager {
     signal: AbortSignal | undefined,
     targets: readonly (Resolved | undefined)[],
   ): Promise<BatchOutcome> {
+    // The process can die between a step finishing and the chain advancing: that step must not run a second time.
+    if (record.status === "completed") {
+      const current = this.deps.chainStore.update(chain.id, { status: "running", usage: this.chainUsage(chain) });
+      const rest = await this.runChainLoop(current, index + 1, record.lastSummary ?? "", signal, targets, [{ record }]);
+      return { records: rest.records, payload: rest.payload, chain: rest.chain };
+    }
     // Resume the step that stopped the chain so it keeps its own session, then run the remaining steps.
     const receiver = this.chainReceiverWindow(chain, index);
     const resumed = await this.resume(record.handle, message ?? record.task, {
@@ -843,7 +849,7 @@ export class SubagentManager {
         ratio: background && !batch && current.delivery !== "private" ? 0 : this.deps.settings().contextRatio,
         outputDir: this.deps.outputDir,
         label,
-        ...(batch ? { style: "path" as const } : {}),
+        ...(batch ? { style: "path" as const, sessionFile: current.sessionFile } : {}),
       });
     } else {
       const note = `@${current.handle} ${status}${error ? `: ${error}` : ""}`;

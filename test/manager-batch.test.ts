@@ -49,8 +49,9 @@ function setup(
   });
   const sent: Parameters<DeliveryPort["sendMessage"]>[] = [];
   const chainStore = new ChainStore(() => {});
+  const registry = new Registry(() => {});
   const manager = new SubagentManager({
-    registry: new Registry(() => {}),
+    registry,
     chainStore,
     scheduler: new Scheduler(() => opts.limit ?? 4),
     runners: { sdk: runner, rpc: undefined },
@@ -64,7 +65,7 @@ function setup(
     ...(opts.onDeliveryError ? { onDeliveryError: opts.onDeliveryError } : {}),
     ...(opts.agentWindow ? { receiverContextWindowFor: opts.agentWindow } : {}),
   });
-  return { manager, runner, sent, chainStore, root };
+  return { manager, runner, sent, chainStore, registry, root };
 }
 
 describe("parallel", () => {
@@ -317,6 +318,7 @@ describe("chain", () => {
     const { manager, runner } = setup({ scripts: [[ok(big)], [ok("done")]], agentWindow: () => 100 });
     await manager.runChain({ steps: [step1, step2] });
     expect(runner.sessions[1]!.prompts[0]).toContain("Full output: ");
+    expect(runner.sessions[1]!.prompts[0]).toContain("Session: ");
     expect(runner.sessions[1]!.prompts[0]).not.toContain(big);
   });
 
@@ -340,6 +342,39 @@ describe("chain", () => {
     expect(runner.sessions[1]!.prompts).toEqual(["second got a"]);
     expect(runner.sessions[2]!.prompts).toEqual(["try again"]);
     expect(runner.sessions[3]!.prompts).toEqual(["third got b2"]);
+  });
+
+  it("continue without a message replays the substituted step text", async () => {
+    const { manager, runner } = setup({ scripts: [[ok("a")], [err("boom")], [ok("b2")], [ok("c")]] });
+    const out = await manager.runChain({ steps: [step1, step2, step3] });
+    await manager.continueChain(out.records.at(-1)!.handle);
+    expect(runner.sessions[2]!.prompts).toEqual(["second got a"]);
+    expect(runner.sessions[3]!.prompts).toEqual(["third got b2"]);
+  });
+
+  it("continue skips a step that already finished when the chain stalled between steps", async () => {
+    const { manager, chainStore, registry, runner, root } = setup({ scripts: [[ok("second")]] });
+    const chain = chainStore.create({ steps: [step1, step2] });
+    const step = registry.create({
+      agent: "reviewer",
+      preferredHandle: "reviewer",
+      runner: "sdk",
+      depth: 1,
+      sessionFile: join(root, "s1.jsonl"),
+      delivery: "auto",
+      task: "first",
+      cwd: root,
+      status: "running",
+      chainId: chain.id,
+      stepIndex: 0,
+    });
+    registry.update(step.id, { status: "completed", lastSummary: "alpha" });
+    chainStore.update(chain.id, { stepRecordIds: [step.id], currentStep: 0, status: "paused" });
+
+    const out = await manager.continueChain(step.handle);
+    expect(out.chain!.status).toBe("completed");
+    // The finished step is not run again; the next step still receives its summary as {previous}.
+    expect(runner.sessions.map((s) => s.prompts)).toEqual([["second got alpha"]]);
   });
 
   it("interrupt pauses the chain and continue resumes the same step", async () => {

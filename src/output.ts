@@ -67,6 +67,8 @@ export function preparePayload(opts: {
   outputDir: string;
   label: string;
   style?: OutputStyle;
+  /** Child session file; added to the short path form so the receiver can find the full transcript. */
+  sessionFile?: string;
 }): Payload {
   const { body, summary } = extractSummary(opts.text);
   // An empty <summary></summary> is treated like a missing one.
@@ -77,7 +79,7 @@ export function preparePayload(opts: {
   const filePath = writeOutput(body, { outputDir: opts.outputDir, label: opts.label });
   const text =
     opts.style === "path"
-      ? `Summary:\n${shortSummary}\n\nFull output: ${filePath}`
+      ? `Summary:\n${shortSummary}\n\nFull output: ${filePath}${opts.sessionFile ? `\nSession: ${opts.sessionFile}` : ""}`
       : `Summary:\n${shortSummary}\n\nFull output (${estimateTokens(body)} tokens) saved to ${filePath}. Read it if you need details.`;
   return { text, filePath, summary: shortSummary };
 }

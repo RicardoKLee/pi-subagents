@@ -108,4 +108,19 @@ describe("preparePayload", () => {
     expect(p.text).toContain(`Full output: ${p.filePath!}`);
     expect(p.text).not.toContain("tokens) saved to");
   });
+
+  it("adds the child session path in the path form", () => {
+    const body = "b".repeat(2000);
+    const p = preparePayload({
+      text: `${body}\n<summary>Short.</summary>`,
+      receiverContextWindow: 1000,
+      ratio: 0.3,
+      outputDir: outputDir(),
+      label: "r",
+      style: "path",
+      sessionFile: "/sessions/subagents/child.jsonl",
+    });
+    expect(p.text).toContain(`Full output: ${p.filePath!}`);
+    expect(p.text).toContain("Session: /sessions/subagents/child.jsonl");
+  });
 });
