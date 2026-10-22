@@ -165,7 +165,7 @@ and a read-only snapshot `<sessionDir>/<sessionId>.subagents.json` (never used f
 - A step's prompt is the substituted task text (with `{previous}` already replaced), and `continue` replays that same text when no message is given.
 - An RPC child starts in about a second; resuming a resident child has no start-up cost.
 - RPC children load no extensions until nesting (M6).
-- A project-local skill or template is only expanded when the child's project is trusted; otherwise pi passes `/skill:x …` through as plain text. The name was validated against the discoverable directories, so this can only be noticed from the result.
+- Project skills and prompt templates are loaded regardless of project trust (pi only gates `SYSTEM.md` / `APPEND_SYSTEM.md` by trust), so `/sub /skill:x` works in an untrusted project too. pi expands the slash command inside the child and passes an unknown name through unchanged, so if a skill cannot be loaded there (a malformed or unreadable file, or a discovery difference) the model receives the literal `/skill:x …` text instead of an error.
 - Records store the prompt that was sent to the child (for skill and command entries that is the slash form, e.g. `/skill:sil-iterate …`); `continue` replays that text when no message is given.
 - `/sub` always creates a new subagent (a name clash becomes `name-2`); use `@handle` to continue an existing one.
 - `/sub` completion only applies to a bare target token: after `--cwd <dir>`, or once arguments have been entered, it does not complete (first-version limit).
