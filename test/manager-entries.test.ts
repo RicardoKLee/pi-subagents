@@ -10,6 +10,7 @@ import type { ChildResult } from "../src/runner/types.ts";
 import { Scheduler } from "../src/scheduler.ts";
 import { DEFAULT_SETTINGS, type SubagentSettings } from "../src/settings.ts";
 import { FakeRunner, FakeSession, usage } from "./fakes.ts";
+import { writeSkill } from "./fixtures/skill-fixtures.ts";
 import { cleanupTempDirs, tempDir } from "./tmp.ts";
 
 // The manager validates skill names against `<homeDir>/.agents/skills` and takes no homeDir dependency, so point
@@ -27,11 +28,6 @@ afterAll(() => {
 const codeAgent: AgentDef = { name: "code-agent", description: "codes", systemPrompt: "Code.", source: "user", filePath: "/a/code-agent.md" };
 const ok = (text: string): ChildResult => ({ text, stopReason: "stop", usage: usage() });
 const err = (message: string): ChildResult => ({ text: "", stopReason: "error", errorMessage: message, usage: usage(0) });
-
-function writeSkill(agentDir: string, name: string): void {
-  mkdirSync(join(agentDir, "skills", name), { recursive: true });
-  writeFileSync(join(agentDir, "skills", name, "SKILL.md"), `---\nname: ${name}\ndescription: ${name}\n---\nBody of ${name}.\n`);
-}
 
 function setup(opts: { scripts?: ChildResult[][]; settings?: Partial<SubagentSettings>; withSkill?: boolean } = {}) {
   const root = tempDir("entry-");
