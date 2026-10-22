@@ -32,6 +32,8 @@ export interface SubagentRecord {
   status: RunStatus;
   delivery: DeliveryMode;
   task: string;
+  /** Set for skill and command entries; absent means an agent entry (records written before M5 keep working). */
+  entry?: { kind: "skill" | "command"; name: string };
   /** Working directory of the child process; absent means the main session's cwd (records written before M4). */
   cwd?: string;
   /** Set for chain steps: the chain this run belongs to and its 0-based position. */
@@ -44,6 +46,11 @@ export interface SubagentRecord {
   error?: string;
 }
 
+/** The entry an existing record was started from: `skill:<name>` / `command:<name>` for skill and command entries, the base agent name otherwise. */
+export function recordEntryLabel(record: Pick<SubagentRecord, "agent" | "entry">): string {
+  return record.entry ? `${record.entry.kind}:${record.entry.name}` : record.agent;
+}
+
 export interface NewRecord {
   agent: string;
   preferredHandle: string;
@@ -53,6 +60,8 @@ export interface NewRecord {
   sessionFile: string;
   delivery: DeliveryMode;
   task: string;
+  /** Set for skill and command entries; absent means an agent entry. */
+  entry?: { kind: "skill" | "command"; name: string };
   /** Working directory for the child process (already resolved); absent means the main session's cwd. */
   cwd?: string;
   /** Set for chain steps: the chain this run belongs to and its 0-based position. */
@@ -63,7 +72,7 @@ export interface NewRecord {
 }
 
 export type RecordPatch = Partial<
-  Pick<SubagentRecord, "status" | "runId" | "lastSummary" | "error" | "delivery" | "task" | "sessionFile" | "childLeafId" | "cwd" | "chainId" | "stepIndex">
+  Pick<SubagentRecord, "status" | "runId" | "lastSummary" | "error" | "delivery" | "task" | "entry" | "sessionFile" | "childLeafId" | "cwd" | "chainId" | "stepIndex">
 >;
 
 function isRecord(value: unknown): value is SubagentRecord {
@@ -116,6 +125,7 @@ export class Registry {
       status: input.status ?? "running",
       delivery: input.delivery,
       task: input.task,
+      ...(input.entry ? { entry: { ...input.entry } } : {}),
       ...(input.cwd ? { cwd: input.cwd } : {}),
       ...(input.chainId ? { chainId: input.chainId, stepIndex: input.stepIndex ?? 0 } : {}),
       createdAt: t,

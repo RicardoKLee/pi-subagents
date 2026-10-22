@@ -7,6 +7,7 @@ import { createExtension } from "../src/index.ts";
 import type { ChildResult, ChildSpec, Runner } from "../src/runner/types.ts";
 import { FakePi, fakeCtx } from "./fake-pi.ts";
 import { FakeRunner, FakeSession, usage } from "./fakes.ts";
+import { writeSkill, writeTemplate } from "./fixtures/skill-fixtures.ts";
 import { cleanupTempDirs, tempDir } from "./tmp.ts";
 
 afterAll(cleanupTempDirs);
@@ -19,6 +20,8 @@ export async function boot(
     hold?: boolean;
     scripts?: ChildResult[][];
     extraAgents?: Record<string, string>;
+    extraSkills?: Record<string, string>;
+    extraTemplates?: Record<string, string>;
     hasUI?: boolean;
     branch?: unknown[];
     settings?: Record<string, unknown>;
@@ -34,6 +37,8 @@ export async function boot(
   writeFileSync(join(agentDir, "agents", "reviewer.md"), REVIEWER);
   writeFileSync(join(agentDir, "subagents.json"), JSON.stringify({ maxResident: 0, ...opts.settings }));
   for (const [name, content] of Object.entries(opts.extraAgents ?? {})) writeFileSync(join(agentDir, "agents", name), content);
+  for (const [name, body] of Object.entries(opts.extraSkills ?? {})) writeSkill(agentDir, name, body);
+  for (const [name, content] of Object.entries(opts.extraTemplates ?? {})) writeTemplate(agentDir, name, content);
   const cwd = join(root, "project");
   const sessionDir = join(root, "sessions");
   mkdirSync(cwd, { recursive: true });
@@ -68,7 +73,7 @@ export async function boot(
   await pi.emit("session_start", { type: "session_start" }, ctx);
   const tool = pi.tools.get("subagents");
   const callTool = (params: Record<string, unknown>) => tool.execute("call-1", params, undefined, undefined, ctx);
-  return { pi, ctx, notes, providers, runner, callTool, root, cwd, agentDir, rpcRunner: opts.rpcRunner, rpcResolvers };
+  return { pi, ctx, notes, providers, sent: pi.sent, runner, callTool, root, cwd, agentDir, rpcRunner: opts.rpcRunner, rpcResolvers };
 }
 
 const ok = (text: string): ChildResult => ({ text, stopReason: "stop", usage: usage() });
@@ -551,6 +556,93 @@ describe("/subagents command", () => {
     const trees = pi.branch.filter((e: any) => e.customType === "pi-subagents/tree") as any[];
     expect(trees.at(-1)!.data.text).toContain("chain 1");
     expect(trees.at(-1)!.data.text).toContain("step 2/2");
+  });
+});
+
+describe("/sub command", () => {
+  it("creates a subagent for an agent entry and reports the handle", async () => {
+    const { pi, ctx, notes, runner } = await boot({ scripts: [[ok("done")]] });
+    await pi.commands.get("sub").handler("reviewer 请审查这一段", ctx);
+    expect(notes.at(-1)!.message).toContain("已创建 @reviewer");
+    expect(runner.opened).toHaveLength(1);
+    expect(runner.sessions[0]!.prompts).toEqual(["请审查这一段"]);
+  });
+
+  it("runs a skill entry with the slash prompt and records the entry", async () => {
+    const { pi, ctx, runner, callTool } = await boot({ scripts: [[ok("done")]], extraSkills: { "pdf-tools": "BODY" } });
+    await pi.commands.get("sub").handler("/skill:pdf-tools extract a.pdf", ctx);
+    expect(runner.sessions[0]!.prompts).toEqual(["/skill:pdf-tools extract a.pdf"]);
+    const list = await callTool({ action: "list" });
+    expect(list.content[0].text).toMatch(/@pdf-tools\s+skill:pdf-tools/);
+  });
+
+  it("maps the symbol variants to their delivery modes and quotes the ask", async () => {
+    const { pi, ctx, sent } = await boot({ scripts: [[ok("a")], [ok("b")], [ok("c")]] });
+    await pi.commands.get("sub!").handler("reviewer one", ctx);
+    await pi.commands.get("sub~").handler("reviewer two", ctx);
+    await pi.commands.get("sub?").handler("reviewer three", ctx);
+    await vi.waitFor(() => expect(pi.branch.some((e: any) => e.customType === "pi-subagents/private")).toBe(true));
+    expect(sent.map((call) => call.options)).toEqual([{ triggerTurn: true, deliverAs: "followUp" }, { triggerTurn: false }]);
+    expect(sent[0]!.message.content).toContain("[user asked @reviewer]");
+    expect((pi.branch.find((e: any) => e.customType === "pi-subagents/private") as any).data.text).toContain("three");
+  });
+
+  it("uses the settings defaultDelivery when no symbol is given", async () => {
+    const { pi, ctx, sent } = await boot({ scripts: [[ok("done")]], settings: { defaultDelivery: "share" } });
+    await pi.commands.get("sub").handler("reviewer 任务", ctx);
+    await vi.waitFor(() => expect(sent).toHaveLength(1));
+    expect(sent[0]!.options).toEqual({ triggerTurn: false });
+  });
+
+  it("passes --cwd to the child", async () => {
+    const dir = tempDir("sub-cwd-");
+    const { pi, ctx, runner } = await boot({ scripts: [[ok("done")]] });
+    await pi.commands.get("sub").handler(`--cwd ${dir} reviewer x`, ctx);
+    expect(runner.opened[0]!.cwd).toBe(dir);
+  });
+
+  it("rejects an unknown skill without creating a record", async () => {
+    const { pi, ctx, notes, callTool } = await boot({ extraSkills: { "pdf-tools": "BODY" } });
+    await pi.commands.get("sub").handler("/skill:nope do it", ctx);
+    expect(notes.at(-1)!.message).toMatch(/unknown skill "nope"/);
+    expect((await callTool({ action: "list" })).content[0].text).toContain("No subagents yet.");
+  });
+
+  it("prints the usage text when nothing usable was given", async () => {
+    const { pi, ctx, notes } = await boot();
+    await pi.commands.get("sub").handler("", ctx);
+    expect(notes.at(-1)!.message).toContain("/sub [--cwd");
+    await pi.commands.get("sub").handler("reviewer", ctx);
+    expect(notes.at(-1)!.message).toMatch(/a task is required for agent "reviewer"/);
+  });
+
+  it("picks up the current model after a /model switch", async () => {
+    const mainModel = { provider: "p", id: "main", contextWindow: 1 };
+    const switchedModel = { provider: "p", id: "switched", contextWindow: 2 };
+    const find = (_provider: string, id: string) => (id === mainModel.id ? mainModel : switchedModel);
+    const inner = new FakeRunner((_spec, n) => new FakeSession(join(tempDir("rpc-"), `child-${n}.jsonl`), [ok("rpc answer")], false));
+    const rpcRunner: Runner = {
+      kind: "rpc",
+      open: (spec) => inner.open(spec),
+    };
+    const { pi, root, cwd, rpcResolvers } = await boot({ rpcRunner, scripts: [[ok("a")], [ok("b")]], model: mainModel, find });
+    expect(rpcResolvers[0]!(undefined)).toBe(mainModel);
+
+    // `/sub` sees the context of the command, so a model switched just before reaches the child.
+    const switched = fakeCtx(pi, { cwd, sessionDir: join(root, "sessions"), model: switchedModel, find }).ctx;
+    await pi.commands.get("sub").handler("reviewer 任务", switched);
+    expect(rpcResolvers[0]!(undefined)).toBe(switchedModel);
+
+    // The same applies to an `@` mention routed by the input hook.
+    const back = fakeCtx(pi, { cwd, sessionDir: join(root, "sessions"), model: mainModel, find }).ctx;
+    await input(pi, back, "@reviewer 再来一次");
+    expect(rpcResolvers[0]!(undefined)).toBe(mainModel);
+  });
+
+  it("completes agents, skills and templates", async () => {
+    const { pi } = await boot({ extraSkills: { "pdf-tools": "BODY" }, extraTemplates: { review: "T" } });
+    const values = (pi.commands.get("sub").getArgumentCompletions("") as { value: string }[]).map((i) => i.value);
+    expect(values).toEqual(expect.arrayContaining(["reviewer", "/skill:pdf-tools", "/review"]));
   });
 });
 

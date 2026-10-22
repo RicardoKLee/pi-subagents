@@ -17,6 +17,10 @@ export const echoAgent: AgentDef = { name: "echo", description: "test", systemPr
 export interface Harness {
   runner: Runner;
   spec: ChildSpec;
+  /** Isolated pi agent dir of the child (skills/prompts fixtures live under it). */
+  agentDir: string;
+  /** Working directory handed to the child. */
+  cwd: string;
   /** Replaces the scripted answers and restarts the script from its first step. */
   script(steps: ScriptStep[]): void;
   /** Messages of every model request so far, one JSON string per request. */
@@ -52,7 +56,7 @@ export async function harness(kind: "sdk" | "rpc"): Promise<Harness> {
     });
     modelRuntime.registerNativeProvider(provider.provider);
     const runner = new SdkRunner({ agentDir, resolveModel: () => provider.getModel(), modelRuntime });
-    return { runner, spec, script, seen };
+    return { runner, spec, script, seen, agentDir, cwd };
   }
   const runner = new RpcRunner({
     resolveModel: () => ({ provider: FAUX_PROVIDER, id: FAUX_MODEL }),
@@ -60,5 +64,5 @@ export async function harness(kind: "sdk" | "rpc"): Promise<Harness> {
     extraArgs: ["-e", FIXTURE, "--offline"],
     env: { PI_OFFLINE: "1", SCRIPTED_PROVIDER_SCRIPT: scriptFile, SCRIPTED_PROVIDER_SEEN: seenFile },
   });
-  return { runner, spec, script, seen };
+  return { runner, spec, script, seen, agentDir, cwd };
 }

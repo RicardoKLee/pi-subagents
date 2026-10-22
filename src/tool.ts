@@ -1,10 +1,13 @@
 import { type Static, Type } from "typebox";
+import { type EntryRequest, parseEntryRequest } from "./entries.ts";
 import type { BatchOutcome, SubagentManager } from "./manager.ts";
 import { renderTree } from "./tree.ts";
 
 const BatchItem = Type.Object({
-  agent: Type.String({ description: "Agent name" }),
-  task: Type.String({ description: "Task for this subagent" }),
+  agent: Type.Optional(Type.String({ description: "Agent name" })),
+  skill: Type.Optional(Type.String({ description: "Skill name, run as /skill:<name> in the child" })),
+  command: Type.Optional(Type.String({ description: "Prompt template name, run as /<name> in the child" })),
+  task: Type.Optional(Type.String({ description: "Task (agent entry) or arguments appended to the skill/template" })),
   cwd: Type.Optional(Type.String({ description: "Working directory (defaults to the main session's)" })),
 });
 
@@ -25,8 +28,10 @@ export const SubagentsParams = Type.Object({
     ],
     { description: "run = new subagent; parallel = many at once; chain = sequential with {previous}; resume = continue a finished/paused one by handle; continue = resume the step that stopped a chain and finish it" },
   ),
-  agent: Type.Optional(Type.String({ description: "Agent name (run)" })),
-  task: Type.Optional(Type.String({ description: "Task for a new subagent (run)" })),
+  agent: Type.Optional(Type.String({ description: "Agent name (run); give exactly one of agent, skill or command" })),
+  skill: Type.Optional(Type.String({ description: "Skill name (run), run as /skill:<name> in the child" })),
+  command: Type.Optional(Type.String({ description: "Prompt template name (run), run as /<name> in the child" })),
+  task: Type.Optional(Type.String({ description: "Task for an agent entry, or arguments appended to the skill/template (run)" })),
   handle: Type.Optional(Type.String({ description: "Existing subagent handle, e.g. reviewer-2 (resume/steer/interrupt/stop/continue)" })),
   message: Type.Optional(Type.String({ description: "Message for resume, steer or continue" })),
   cwd: Type.Optional(Type.String({ description: "Working directory for a single run (run)" })),
@@ -48,6 +53,16 @@ function need<T>(value: T | undefined, name: string, action: string): T {
 function needList<T>(value: readonly T[] | undefined, name: string, action: string): T[] {
   if (!value || value.length === 0) throw new Error(`action "${action}" requires a non-empty "${name}" array`);
   return [...value];
+}
+
+/** The entry fields of a tool call, only present when the caller set them (keeps call signatures stable). */
+function entryFields(input: SubagentsInput): EntryRequest {
+  return {
+    ...(input.agent ? { agent: input.agent } : {}),
+    ...(input.skill ? { skill: input.skill } : {}),
+    ...(input.command ? { command: input.command } : {}),
+    ...(input.task ? { task: input.task } : {}),
+  };
 }
 
 /**
@@ -98,9 +113,12 @@ async function dispatch(
   };
   switch (input.action) {
     case "run": {
+      const entry = entryFields(input);
+      // Structural validation only (exactly one entry kind, agent entries need a task); the manager re-parses and
+      // validates the names so nothing is created on a bad target.
+      parseEntryRequest(entry, "run");
       const { record, payload } = await manager.run({
-        agent: need(input.agent, "agent", "run"),
-        task: need(input.task, "task", "run"),
+        ...entry,
         ...(input.cwd ? { cwd: input.cwd } : {}),
         ...(input.background ? { background: true } : {}),
         ...(signal ? { signal } : {}),

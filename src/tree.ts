@@ -1,5 +1,5 @@
 import type { ChainRecord } from "./chain.ts";
-import type { SubagentRecord, Usage } from "./registry.ts";
+import { recordEntryLabel, type SubagentRecord, type Usage } from "./registry.ts";
 
 export type TreeView = "list" | "cost";
 export const TREE_ENTRY_TYPE = "pi-subagents/tree";
@@ -58,7 +58,7 @@ function cells(node: Node, view: TreeView): string[] {
   if (view === "cost") return [`@${r.handle}`, ...usageCells(r.usage)];
   const cost = node.children.length ? `${money(r.usage.cost)} (subtree ${money(subtree(node).cost)})` : money(r.usage.cost);
   const error = r.error ? r.error.split("\n")[0]!.slice(0, 60) : "";
-  return [`@${r.handle}`, r.agent, `run ${r.runId}`, cost, error, `[${r.status}]`];
+  return [`@${r.handle}`, recordEntryLabel(r), `run ${r.runId}`, cost, error, `[${r.status}]`];
 }
 
 function chainCells(group: { chain: ChainRecord; index: number; steps: readonly SubagentRecord[] }, view: TreeView): string[] {

@@ -38,6 +38,21 @@ describe("renderTree list", () => {
     expect(lines[1]!.indexOf("[completed]")).toBe(lines[2]!.indexOf("[paused]"));
   });
 
+  it("shows the entry kind of a skill or command record", () => {
+    const text = renderTree(
+      [
+        rec({ handle: "pdf-tools", agent: "subagent", entry: { kind: "skill", name: "pdf-tools" }, createdAt: 1 }),
+        rec({ handle: "review", agent: "subagent", entry: { kind: "command", name: "review" }, createdAt: 2 }),
+        rec({ handle: "code-agent", agent: "code-agent", createdAt: 3 }),
+      ],
+      "list",
+    );
+    const lines = text.split("\n");
+    expect(lines[1]).toMatch(/^├─ @pdf-tools\s+skill:pdf-tools\s+run 1/);
+    expect(lines[2]).toMatch(/^├─ @review\s+command:review\s+run 1/);
+    expect(lines[3]).toMatch(/^└─ @code-agent\s+code-agent\s+run 1/);
+  });
+
   it("nests children and shows the subtree total on the parent", () => {
     const text = renderTree(
       [

@@ -3,8 +3,9 @@ import { resolve } from "node:path";
 import type { AgentDef } from "./agents.ts";
 import { type ChainRecord, type ChainStatus, ChainStore } from "./chain.ts";
 import { type Ask, deliver, type DeliveryPort, deliverBatch, quoteAsk, renderAsks } from "./delivery.ts";
+import { BUILTIN_ENTRY_AGENT_DEF, type EntryRequest, parseEntryRequest, type ResolvedEntry, validateEntryTarget } from "./entries.ts";
 import { estimateTokens, type Payload, preparePayload, SUMMARY_INSTRUCTION, writeOutput } from "./output.ts";
-import { type Registry, type RunStatus, type SubagentRecord, type Usage, ZERO_USAGE } from "./registry.ts";
+import { recordEntryLabel, type Registry, type RunStatus, type SubagentRecord, type Usage, ZERO_USAGE } from "./registry.ts";
 import type { ChildResult, ChildSession, Runner } from "./runner/types.ts";
 import { type Scheduler, SubagentsDisabledError } from "./scheduler.ts";
 import type { DeliveryMode, RunnerKind, SubagentSettings } from "./settings.ts";
@@ -40,6 +41,8 @@ export interface ManagerDeps {
   /** Context window of a given agent's model, for the 30% rule between chain steps. */
   receiverContextWindowFor?: (agent: AgentDef) => number | undefined;
   cwd: string;
+  /** Agent directory used to validate skill and prompt template names. */
+  agentDir: string;
   sessionDir: string;
   outputDir: string;
   /** Project trust for a child cwd decided by the caller; the manager never guesses it. */
@@ -50,9 +53,7 @@ export interface ManagerDeps {
   onRecordCreated?: (record: SubagentRecord) => void;
 }
 
-export interface RunRequest {
-  agent: string;
-  task: string;
+export interface RunRequest extends EntryRequest {
   delivery?: DeliveryMode;
   background?: boolean;
   /** The calling tool's signal: aborting it cancels this run while queued, opening, or (foreground) running. */
@@ -64,6 +65,8 @@ export interface RunRequest {
   /** Set for chain steps: the chain this run belongs to and its 0-based position. */
   chainId?: string;
   stepIndex?: number;
+  /** The user's own message, quoted with the delivered result (used by `/sub`). */
+  ask?: string;
 }
 
 export interface RunOutcome {
@@ -72,9 +75,7 @@ export interface RunOutcome {
   payload?: Payload;
 }
 
-export interface BatchItem {
-  agent: string;
-  task: string;
+export interface BatchItem extends EntryRequest {
   cwd?: string;
 }
 
@@ -99,10 +100,13 @@ interface Prepared {
   cwd: string;
   trusted?: boolean;
   controller: AbortController;
+  /** The text handed to the child session (already built from the entry). */
+  prompt: string;
 }
 
-/** An item's agent, runner and cwd after validation; computed once so a whole batch can be checked before any record exists. */
+/** An item's entry, agent, runner and cwd after validation; computed once so a whole batch can be checked before any record exists. */
 interface Resolved {
+  entry: ResolvedEntry;
   agent: AgentDef;
   runner: Runner;
   cwd: string;
@@ -113,6 +117,8 @@ interface LaunchOptions {
   /** "batch" items never return early, never deliver on their own, and size their output by `receiverContextWindow`. */
   mode?: "single" | "batch";
   receiverContextWindow?: number;
+  /** User messages to quote with the delivered result. */
+  asks?: Ask[];
 }
 
 interface Live {
@@ -175,33 +181,33 @@ export class SubagentManager {
   }
 
   async run(req: RunRequest): Promise<RunOutcome> {
-    const prepared = this.prepare(req);
-    return this.launch(prepared, req.task, req.background ?? false, req.signal, {
+    const resolved = this.resolveTarget(req, "run");
+    const prepared = this.prepare(resolved, req);
+    return this.launch(prepared, req.background ?? false, req.signal, {
       ...(req.receiverContextWindow ? { receiverContextWindow: req.receiverContextWindow } : {}),
+      ...(req.ask ? { asks: [this.ask("ask", req.ask)] } : {}),
     });
   }
 
   /** Validates the request and creates the queued record (so it is listed and cancellable from the start). */
-  private prepare(
-    req: { agent: string; task: string; delivery?: DeliveryMode; cwd?: string; chainId?: string; stepIndex?: number },
-    resolved?: Resolved,
-  ): Prepared {
+  private prepare(resolved: Resolved, req: { delivery?: DeliveryMode; chainId?: string; stepIndex?: number }): Prepared {
     if (this.closed) throw shutDownError();
     if (this.deps.scheduler.disabled) throw new SubagentsDisabledError();
-    const { agent, runner, cwd, trusted } = resolved ?? this.resolveTarget(req);
+    const { agent, runner, cwd, trusted, entry } = resolved;
     // Runs started by the main agent's tool are always auto; `delivery` is only passed by internal callers.
     const delivery = req.delivery ?? "auto";
     // The record exists from the start so a run waiting for a slot is listed and can be cancelled by handle.
     const record = this.deps.registry.create({
       agent: agent.name,
-      preferredHandle: agent.handle ?? agent.name,
+      preferredHandle: entry.kind === "agent" ? agent.handle ?? agent.name : entry.name,
       runner: runner.kind,
       depth: 1,
       sessionFile: "",
       delivery,
-      task: req.task,
+      task: entry.prompt,
       cwd,
       status: "queued",
+      ...(entry.kind === "agent" ? {} : { entry: { kind: entry.kind, name: entry.name } }),
       ...(req.chainId ? { chainId: req.chainId, stepIndex: req.stepIndex ?? 0 } : {}),
     });
     try {
@@ -211,11 +217,11 @@ export class SubagentManager {
     }
     const controller = new AbortController();
     this.queued.set(record.id, controller);
-    return { record, agent, runner, cwd, trusted, controller };
+    return { record, agent, runner, cwd, trusted, controller, prompt: entry.prompt };
   }
 
   /** Waits for a slot, opens the child, then runs one turn. */
-  private async launch(prepared: Prepared, text: string, background: boolean, signal: AbortSignal | undefined, options: LaunchOptions = {}): Promise<RunOutcome> {
+  private async launch(prepared: Prepared, background: boolean, signal: AbortSignal | undefined, options: LaunchOptions = {}): Promise<RunOutcome> {
     const { record, agent, runner, cwd, trusted, controller } = prepared;
     const cancel = AbortSignal.any([this.lifetime.signal, controller.signal, ...(signal ? [signal] : [])]);
     let release: () => void;
@@ -247,7 +253,7 @@ export class SubagentManager {
       throw this.settleQueued(record.id, this.closed ? shutDownError() : runInterruptedError(), signal);
     }
     const running = this.deps.registry.update(record.id, { status: "running", sessionFile: session.sessionFile });
-    return this.execute(running, session, text, release, background, signal, [], options);
+    return this.execute(running, session, prepared.prompt, release, background, signal, options.asks ?? [], options);
   }
 
   /** Starts every task at once (the scheduler still caps concurrency) and summarizes the group afterwards. */
@@ -258,12 +264,12 @@ export class SubagentManager {
     if (max === 0) throw new SubagentsDisabledError("parallel is disabled (maxParallelTasks is 0)");
     // The n-th task is allowed exactly when the previous n - 1 are within the limit (max -1 = unlimited).
     if (!limitAllows(max, req.items.length - 1)) throw new Error(`too many parallel tasks (${req.items.length}); max is ${max}`);
-    // Validate every agent, runner and cwd up front, before any record exists: a bad item must not leave a half-created
+    // Validate every entry, runner and cwd up front, before any record exists: a bad item must not leave a half-created
     // batch behind (a queued record whose launch() is never reached would stay queued forever).
-    const resolved = req.items.map((item) => this.resolveTarget({ agent: item.agent, cwd: item.cwd }));
-    const prepared = req.items.map((item, i) => this.prepare({ agent: item.agent, task: item.task, cwd: item.cwd }, resolved[i]!));
+    const targets = req.items.map((item) => this.resolveTarget(item, "parallel"));
+    const prepared = req.items.map((_item, i) => this.prepare(targets[i]!, {}));
     // One item failing to start (runner.open, a cancel while queued/opening, shutdown) must not drop the others' results.
-    const settled = Promise.allSettled(prepared.map((p, i) => this.launch(p, req.items[i]!.task, true, req.signal, { mode: "batch" })));
+    const settled = Promise.allSettled(prepared.map((p) => this.launch(p, true, req.signal, { mode: "batch" })));
     const outcomes = settled.then((results) => results.map((result, i) => (result.status === "fulfilled" ? result.value : this.failureOutcome(prepared[i]!.record))));
     if (!req.background) {
       const done = await outcomes;
@@ -287,14 +293,20 @@ export class SubagentManager {
     // Refuse before the chain exists when the scheduler is disabled (maxConcurrent 0): prepare() would throw
     // afterwards and leave a chain stuck in "running" with no step records and no way to continue it.
     if (this.deps.scheduler.disabled) throw new SubagentsDisabledError();
-    // Validate every step's agent, runner and cwd before the chain exists, so a typo cannot leave a half-run chain behind.
-    const targets = req.steps.map((step) => this.resolveTarget({ agent: step.agent, cwd: step.cwd }));
-    const chain = this.deps.chainStore.create({
-      steps: req.steps.map((s) => ({ agent: s.agent, task: s.task, ...(s.cwd ? { cwd: s.cwd } : {}) })),
+    // Validate every step's entry, runner and cwd before the chain exists, so a typo cannot leave a half-run chain behind.
+    // Only the first step's task is fully known up front (`{previous}` is empty there); the rest are validated as they
+    // run, and a later step that becomes empty after substitution fails the chain as usual.
+    req.steps.forEach((step, i) => {
+      const task = i === 0 ? substitutePrevious(step.task ?? "", "") : step.task;
+      this.resolveTarget({ ...entryFields(step), ...(task === undefined ? {} : { task }) }, "chain");
     });
-    if (!req.background) return this.runChainLoop(chain, 0, "", req.signal, targets);
+    const chain = this.deps.chainStore.create({
+      // Keep the entry kind of every step (skill / command steps have no base agent) so reload and continue can replay it.
+      steps: req.steps.map((s) => ({ ...entryFields(s), task: s.task ?? "" })),
+    });
+    if (!req.background) return this.runChainLoop(chain, 0, "", req.signal);
     this.track(
-      this.runChainLoop(chain, 0, "", req.signal, targets).then((outcome) => {
+      this.runChainLoop(chain, 0, "", req.signal).then((outcome) => {
         this.sendBatch("chain", outcome.payload!, outcome.records, outcome.chain);
       }),
       (error) => this.reportBatchError(this.firstChainRecord(chain.id), error),
@@ -319,10 +331,10 @@ export class SubagentManager {
       );
     }
     // Validate the remaining steps before resuming, so a bad step cannot leave the chain half-advanced.
-    const targets = chain.steps.map((step, i) => (i > index ? this.resolveTarget({ agent: step.agent, cwd: step.cwd }) : undefined));
-    if (!opts.background) return this.continueChainLoop(chain, record, index, message, opts.signal, targets);
+    for (let i = index + 1; i < chain.steps.length; i++) this.resolveTarget(chain.steps[i]!, "chain");
+    if (!opts.background) return this.continueChainLoop(chain, record, index, message, opts.signal);
     this.track(
-      this.continueChainLoop(chain, record, index, message, opts.signal, targets).then((outcome) => {
+      this.continueChainLoop(chain, record, index, message, opts.signal).then((outcome) => {
         this.sendBatch("chain", outcome.payload!, outcome.records, outcome.chain);
       }),
       (error) => this.reportBatchError(this.firstChainRecord(chain.id), error),
@@ -343,12 +355,11 @@ export class SubagentManager {
     index: number,
     message: string | undefined,
     signal: AbortSignal | undefined,
-    targets: readonly (Resolved | undefined)[],
   ): Promise<BatchOutcome> {
     // The process can die between a step finishing and the chain advancing: that step must not run a second time.
     if (record.status === "completed") {
       const current = this.deps.chainStore.update(chain.id, { status: "running", usage: this.chainUsage(chain) });
-      const rest = await this.runChainLoop(current, index + 1, record.lastSummary ?? "", signal, targets, [{ record }]);
+      const rest = await this.runChainLoop(current, index + 1, record.lastSummary ?? "", signal, [{ record }]);
       return { records: rest.records, payload: rest.payload, chain: rest.chain };
     }
     // Resume the step that stopped the chain so it keeps its own session, then run the remaining steps.
@@ -365,7 +376,7 @@ export class SubagentManager {
     }
     // The resumed step keeps its record id, so the chain usage stays the sum of every started step's record.
     const current = this.deps.chainStore.update(chain.id, { status: "running", usage: this.chainUsage(chain) });
-    const rest = await this.runChainLoop(current, index + 1, resumed.payload?.text ?? "", signal, targets, [resumed]);
+    const rest = await this.runChainLoop(current, index + 1, resumed.payload?.text ?? "", signal, [resumed]);
     // `runChainLoop` already carries the resumed outcome, so its records and payload span the whole chain.
     return { records: rest.records, payload: rest.payload, chain: rest.chain };
   }
@@ -375,16 +386,19 @@ export class SubagentManager {
     from: number,
     previous: string,
     signal: AbortSignal | undefined,
-    targets: readonly (Resolved | undefined)[],
     outcomes: RunOutcome[] = [],
   ): Promise<BatchOutcome> {
     let current = chain;
     for (let i = from; i < chain.steps.length; i++) {
       const step = chain.steps[i]!;
-      const task = substitutePrevious(step.task, previous);
+      // `{previous}` only affects the task text; the entry kind and name were already validated before the chain existed.
+      const task = substitutePrevious(step.task ?? "", previous);
       let prepared: Prepared;
       try {
-        prepared = this.prepare({ agent: step.agent, task, cwd: step.cwd, chainId: chain.id, stepIndex: i }, targets[i]);
+        // Re-resolve with the substituted task: the chain stores the original template, but the child must get the
+        // substituted text. Name validation repeats here; a skill removed mid-chain settles the chain instead of
+        // leaving it running (the catch below).
+        prepared = this.prepare(this.resolveTarget({ ...entryFields(step), task }, "chain"), { chainId: chain.id, stepIndex: i });
       } catch (error) {
         // prepare() can only fail before the step's record exists (shutdown or disabled between steps). Never leave
         // the chain stuck in "running": settle it to stopped/failed and let the caller or the background error path
@@ -396,7 +410,7 @@ export class SubagentManager {
       const receiver = this.chainReceiverWindow(chain, i);
       let outcome: RunOutcome;
       try {
-        outcome = await this.launch(prepared, task, true, signal, { mode: "batch", ...(receiver ? { receiverContextWindow: receiver } : {}) });
+        outcome = await this.launch(prepared, true, signal, { mode: "batch", ...(receiver ? { receiverContextWindow: receiver } : {}) });
       } catch (error) {
         // The run was cancelled or its session could not open; the record already says why.
         const failed = this.deps.registry.get(prepared.record.id) ?? prepared.record;
@@ -418,7 +432,9 @@ export class SubagentManager {
 
   /** The window of whoever receives a step's output: the next step's agent, or the main session for the last step. */
   private chainReceiverWindow(chain: ChainRecord, index: number): number | undefined {
-    const next = chain.steps[index + 1] ? this.deps.agents().get(chain.steps[index + 1]!.agent) : undefined;
+    // A skill or command step has no base agent, so it falls back to the main session's window.
+    const name = chain.steps[index + 1]?.agent;
+    const next = name ? this.deps.agents().get(name) : undefined;
     return next ? this.deps.receiverContextWindowFor?.(next) : undefined;
   }
 
@@ -449,7 +465,7 @@ export class SubagentManager {
     const sections = outcomes.map((o) => {
       const r = o.record;
       const step = `step ${(r.stepIndex ?? 0) + 1}`;
-      return `### [@${r.handle}] (${r.agent}) ${step} ${r.status}${r.error ? `: ${r.error}` : ""}\n${r.lastSummary ?? ""}\nSession: ${r.sessionFile}`;
+      return `### [@${r.handle}] (${recordEntryLabel(r)}) ${step} ${r.status}${r.error ? `: ${r.error}` : ""}\n${r.lastSummary ?? ""}\nSession: ${r.sessionFile}`;
     });
     const last = outcomes.at(-1)?.payload?.text ?? "";
     return { text: `${head}\n\n${sections.join("\n\n")}${last ? `\n\n${last}` : ""}`, summary: head };
@@ -470,7 +486,7 @@ export class SubagentManager {
     const inline = texts.reduce((n, t) => n + estimateTokens(t), 0) <= window * ratio;
     const sections = outcomes.map((o, i) => {
       const r = o.record;
-      const head = `### [@${r.handle}] (${r.agent}) ${r.status}${r.error ? `: ${r.error}` : ""}`;
+      const head = `### [@${r.handle}] (${recordEntryLabel(r)}) ${r.status}${r.error ? `: ${r.error}` : ""}`;
       let body = texts[i] ?? "";
       if (!inline && body && !o.payload?.filePath) {
         const file = writeOutput(body, { outputDir: this.deps.outputDir, label: `${r.handle}-run${r.runId}` });
@@ -493,12 +509,16 @@ export class SubagentManager {
     });
   }
 
-  /** Resolves a run's agent, runner and cwd without creating a record, so a caller can validate it first. */
-  private resolveTarget(req: { agent: string; cwd?: string }): Resolved {
-    const agent = this.requireAgent(req.agent);
-    const runner = this.requireRunner(agent.runner ?? this.deps.settings().defaultRunner);
+  /** Resolves a run's entry, agent, runner and cwd without creating a record, so a whole batch can be validated first. */
+  private resolveTarget(req: EntryRequest & { cwd?: string }, action: string): Resolved {
+    const entry = parseEntryRequest(req, action);
     const cwd = this.resolveCwd(req.cwd);
-    return { agent, runner, cwd, trusted: this.deps.trustForCwd?.(cwd) };
+    if (entry.kind !== "agent") {
+      validateEntryTarget(entry, { cwd, agentDir: this.deps.agentDir, agents: this.deps.agents() });
+    }
+    const agent = entry.kind === "agent" ? this.requireAgent(entry.name) : BUILTIN_ENTRY_AGENT_DEF;
+    const runner = this.requireRunner(agent.runner ?? this.deps.settings().defaultRunner);
+    return { entry, agent, runner, cwd, trusted: this.deps.trustForCwd?.(cwd) };
   }
 
   /** Runs a promise in the background and keeps whenIdle()/shutdown() waiting for it. `onError` makes a detached failure visible. */
@@ -769,7 +789,7 @@ export class SubagentManager {
     asks: Ask[] = [],
     options: LaunchOptions = {},
   ): Promise<RunOutcome> {
-    const live: Live = { session, asks };
+    const live: Live = { session, asks: options.asks ?? asks };
     this.live.set(record.id, live);
     this.evictIdle();
     const batch = options.mode === "batch";
@@ -866,7 +886,7 @@ export class SubagentManager {
       try {
         deliver(this.deps.port, record.delivery, {
           handle: record.handle,
-          agent: record.agent,
+          agent: recordEntryLabel(record),
           status,
           text: payload.text,
           sessionFile: record.sessionFile,
@@ -990,7 +1010,7 @@ export class SubagentManager {
     if (!existsSync(record.sessionFile)) {
       throw new SubagentError("missing_session", `session file for @${record.handle} is missing: ${record.sessionFile}`);
     }
-    const agent = this.requireAgent(record.agent);
+    const agent = record.entry ? BUILTIN_ENTRY_AGENT_DEF : this.requireAgent(record.agent);
     const runner = this.requireRunner(record.runner);
     // Resolve last so a missing cwd is reported exactly like resume() does, after the other preflight errors.
     return { record, agent, runner, cwd: this.resolveCwd(record.cwd) };
@@ -1064,6 +1084,17 @@ export class SubagentManager {
 
 function runInterruptedError(): SubagentError {
   return new SubagentError("interrupted", "subagent run was interrupted before it started");
+}
+
+/** The entry fields of a batch item or chain step, present only when set (keeps empty strings out of the stored entry). */
+function entryFields(item: EntryRequest & { cwd?: string }): EntryRequest & { cwd?: string } {
+  return {
+    ...(item.agent ? { agent: item.agent } : {}),
+    ...(item.skill ? { skill: item.skill } : {}),
+    ...(item.command ? { command: item.command } : {}),
+    ...(item.task !== undefined ? { task: item.task } : {}),
+    ...(item.cwd ? { cwd: item.cwd } : {}),
+  };
 }
 
 /** The only placeholder a chain task may use: the previous step's final output. */
