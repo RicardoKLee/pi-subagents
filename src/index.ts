@@ -233,6 +233,8 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
     // `@handle message` in the TUI goes straight to the subagent; everything else (and other sources) passes through.
     pi.on("input", async (event, ctx) => {
       if (!state || event.source !== "interactive" || !ctx.hasUI) return { action: "continue" };
+      // The session context is captured once, but `/model` changes the current model: refresh it before routing.
+      state.ctx = ctx;
       const current = state;
       const route = routeMention(event.text, {
         resolve: (handle) => current.registry.resolve(handle),
@@ -279,6 +281,7 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
       getArgumentCompletions: (prefix) =>
         VIEWS.filter((v) => v.startsWith(prefix.trim().toLowerCase())).map((v) => ({ value: v, label: v, description: v === "list" ? "status and cost" : "tokens and cost" })),
       handler: async (args, ctx) => {
+        if (state) state.ctx = ctx;
         const raw = args.trim();
         const view = (raw.toLowerCase() || "list") as TreeView;
         if (!VIEWS.includes(view)) {
@@ -308,6 +311,8 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
             ctx.ui.notify("pi-subagents: not initialised for this session yet", "error");
             return;
           }
+          // Refresh the captured context so a `/model` switch made just before `/sub` reaches the child.
+          current.ctx = ctx;
           const parsed = parseSubCommand(args);
           if ("error" in parsed) {
             ctx.ui.notify(`pi-subagents: ${parsed.error}`, "error");

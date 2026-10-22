@@ -616,6 +616,29 @@ describe("/sub command", () => {
     expect(notes.at(-1)!.message).toMatch(/a task is required for agent "reviewer"/);
   });
 
+  it("picks up the current model after a /model switch", async () => {
+    const mainModel = { provider: "p", id: "main", contextWindow: 1 };
+    const switchedModel = { provider: "p", id: "switched", contextWindow: 2 };
+    const find = (_provider: string, id: string) => (id === mainModel.id ? mainModel : switchedModel);
+    const inner = new FakeRunner((_spec, n) => new FakeSession(join(tempDir("rpc-"), `child-${n}.jsonl`), [ok("rpc answer")], false));
+    const rpcRunner: Runner = {
+      kind: "rpc",
+      open: (spec) => inner.open(spec),
+    };
+    const { pi, root, cwd, rpcResolvers } = await boot({ rpcRunner, scripts: [[ok("a")], [ok("b")]], model: mainModel, find });
+    expect(rpcResolvers[0]!(undefined)).toBe(mainModel);
+
+    // `/sub` sees the context of the command, so a model switched just before reaches the child.
+    const switched = fakeCtx(pi, { cwd, sessionDir: join(root, "sessions"), model: switchedModel, find }).ctx;
+    await pi.commands.get("sub").handler("reviewer 任务", switched);
+    expect(rpcResolvers[0]!(undefined)).toBe(switchedModel);
+
+    // The same applies to an `@` mention routed by the input hook.
+    const back = fakeCtx(pi, { cwd, sessionDir: join(root, "sessions"), model: mainModel, find }).ctx;
+    await input(pi, back, "@reviewer 再来一次");
+    expect(rpcResolvers[0]!(undefined)).toBe(mainModel);
+  });
+
   it("completes agents, skills and templates", async () => {
     const { pi } = await boot({ extraSkills: { "pdf-tools": "BODY" }, extraTemplates: { review: "T" } });
     const values = (pi.commands.get("sub").getArgumentCompletions("") as { value: string }[]).map((i) => i.value);
