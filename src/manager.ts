@@ -5,7 +5,7 @@ import { type ChainRecord, type ChainStatus, type ChainStep, ChainStore } from "
 import { type Ask, deliver, type DeliveryPort, deliverBatch, quoteAsk, renderAsks } from "./delivery.ts";
 import { BUILTIN_ENTRY_AGENT_DEF, type EntryRequest, parseEntryRequest, type ResolvedEntry, validateEntryTarget } from "./entries.ts";
 import { estimateTokens, type Payload, preparePayload, SUMMARY_INSTRUCTION, writeOutput } from "./output.ts";
-import { type Registry, type RunStatus, type SubagentRecord, type Usage, ZERO_USAGE } from "./registry.ts";
+import { recordEntryLabel, type Registry, type RunStatus, type SubagentRecord, type Usage, ZERO_USAGE } from "./registry.ts";
 import type { ChildResult, ChildSession, Runner } from "./runner/types.ts";
 import { type Scheduler, SubagentsDisabledError } from "./scheduler.ts";
 import type { DeliveryMode, RunnerKind, SubagentSettings } from "./settings.ts";
@@ -460,7 +460,7 @@ export class SubagentManager {
     const sections = outcomes.map((o) => {
       const r = o.record;
       const step = `step ${(r.stepIndex ?? 0) + 1}`;
-      return `### [@${r.handle}] (${r.agent}) ${step} ${r.status}${r.error ? `: ${r.error}` : ""}\n${r.lastSummary ?? ""}\nSession: ${r.sessionFile}`;
+      return `### [@${r.handle}] (${recordEntryLabel(r)}) ${step} ${r.status}${r.error ? `: ${r.error}` : ""}\n${r.lastSummary ?? ""}\nSession: ${r.sessionFile}`;
     });
     const last = outcomes.at(-1)?.payload?.text ?? "";
     return { text: `${head}\n\n${sections.join("\n\n")}${last ? `\n\n${last}` : ""}`, summary: head };
@@ -481,7 +481,7 @@ export class SubagentManager {
     const inline = texts.reduce((n, t) => n + estimateTokens(t), 0) <= window * ratio;
     const sections = outcomes.map((o, i) => {
       const r = o.record;
-      const head = `### [@${r.handle}] (${r.agent}) ${r.status}${r.error ? `: ${r.error}` : ""}`;
+      const head = `### [@${r.handle}] (${recordEntryLabel(r)}) ${r.status}${r.error ? `: ${r.error}` : ""}`;
       let body = texts[i] ?? "";
       if (!inline && body && !o.payload?.filePath) {
         const file = writeOutput(body, { outputDir: this.deps.outputDir, label: `${r.handle}-run${r.runId}` });

@@ -78,6 +78,21 @@ describe("skill and command entries", () => {
     expect(manager.list()).toHaveLength(0);
   });
 
+  it("validates a skill against the run's cwd and starts the child there", async () => {
+    const { manager, runner, root } = setup({ scripts: [[ok("done")]] });
+    const project = join(root, "project");
+    writeSkill(join(project, ".pi"), "project-skill", "Body.");
+
+    // The skill only exists under the child cwd, so the manager cwd alone must not validate it.
+    await expect(manager.run({ skill: "project-skill", task: "x" })).rejects.toThrow(/unknown skill "project-skill"/);
+    expect(manager.list()).toHaveLength(0);
+
+    const { record } = await manager.run({ skill: "project-skill", task: "x", cwd: project });
+    expect(record.cwd).toBe(project);
+    expect(record.entry).toEqual({ kind: "skill", name: "project-skill" });
+    expect(runner.opened[0]!.cwd).toBe(project);
+  });
+
   it("rejects a mix of entry kinds and a missing agent task", async () => {
     const { manager } = setup({ withSkill: true });
     await expect(manager.run({ agent: "code-agent", skill: "pdf-tools" })).rejects.toThrow(/exactly one of/);
@@ -121,6 +136,14 @@ describe("skill and command entries", () => {
     expect(out.chain!.status).toBe("completed");
     expect(runner.sessions[1]!.prompts).toEqual(["/skill:pdf-tools summarise alpha"]);
     expect(out.records[1]!.entry).toEqual({ kind: "skill", name: "pdf-tools" });
+  });
+
+  it("names a skill entry by its entry kind in parallel and chain summaries", async () => {
+    const { manager } = setup({ withSkill: true, scripts: [[ok("a")], [ok("b")], [ok("c")]] });
+    const parallel = await manager.runParallel({ items: [{ skill: "pdf-tools", task: "one" }] });
+    expect(parallel.payload!.text).toContain("### [@pdf-tools] (skill:pdf-tools) completed");
+    const chain = await manager.runChain({ steps: [{ skill: "pdf-tools", task: "two" }, { agent: "code-agent", task: "three" }] });
+    expect(chain.payload!.text).toMatch(/### \[@[^\]]+\] \(skill:pdf-tools\) step 1 completed/);
   });
 
   it("quotes the ask in a mention-style delivery", async () => {

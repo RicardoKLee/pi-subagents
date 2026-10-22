@@ -46,6 +46,11 @@ export interface SubagentRecord {
   error?: string;
 }
 
+/** The entry an existing record was started from: `skill:<name>` / `command:<name>` for skill and command entries, the base agent name otherwise. */
+export function recordEntryLabel(record: Pick<SubagentRecord, "agent" | "entry">): string {
+  return record.entry ? `${record.entry.kind}:${record.entry.name}` : record.agent;
+}
+
 export interface NewRecord {
   agent: string;
   preferredHandle: string;

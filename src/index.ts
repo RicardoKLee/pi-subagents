@@ -348,7 +348,7 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
       name: "subagents",
       label: "Subagents",
       description:
-        "Delegate work to named, persistent subagents. action=run starts a new one (agent + task) and returns its @handle. " +
+        "Delegate work to named, persistent subagents. action=run starts a new one from exactly one entry — agent (needs task), skill or command — and returns its @handle. " +
         "action=parallel runs many at once; chain runs steps in order, where {previous} is the previous step's output; continue resumes the step that stopped a chain and finishes it. " +
         "action=resume continues an existing one in its own context (handle + message); prefer it when the user wants the same subagent to revise its work. " +
         "action=steer guides a running one; interrupt pauses; stop ends it permanently; list shows all.",
