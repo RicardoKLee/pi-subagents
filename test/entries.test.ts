@@ -2,7 +2,16 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import type { AgentDef } from "../src/agents.ts";
-import { BUILTIN_ENTRY_AGENT, BUILTIN_ENTRY_AGENT_DEF, parseEntryRequest, parseSubCommand, skillNames, templateNames, validateEntryTarget } from "../src/entries.ts";
+import {
+  BUILTIN_ENTRY_AGENT,
+  BUILTIN_ENTRY_AGENT_DEF,
+  createNameCache,
+  parseEntryRequest,
+  parseSubCommand,
+  skillNames,
+  templateNames,
+  validateEntryTarget,
+} from "../src/entries.ts";
 import { tempDir, cleanupTempDirs } from "./tmp.ts";
 
 afterAll(cleanupTempDirs);
@@ -90,6 +99,41 @@ describe("validateEntryTarget", () => {
     }
     expect(message).toContain("+5 more");
     expect(message).toContain("/sub /skill:<TAB>");
+  });
+
+  it("reports the skills the loader had to skip", () => {
+    const c = ctx();
+    mkdirSync(join(c.agentDir, "skills", "broken"), { recursive: true });
+    writeFileSync(join(c.agentDir, "skills", "broken", "SKILL.md"), "---\nname: [oops\ndescription: x\n---\nbody\n");
+    let message = "";
+    try {
+      validateEntryTarget({ kind: "skill", name: "nope", prompt: "x" }, c);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain("Skipped skills:");
+    expect(message).toContain("broken");
+  });
+
+  it("caches discovered names for the ttl and keys by context", () => {
+    let clock = 1_000;
+    let builds = 0;
+    const cache = createNameCache(5_000, () => clock);
+    const build = () => {
+      builds++;
+      return ["a"];
+    };
+    expect(cache.names("k", build)).toEqual(["a"]);
+    expect(cache.names("k", build)).toEqual(["a"]);
+    expect(builds).toBe(1);
+    clock += 4_000;
+    cache.names("k", build);
+    expect(builds).toBe(1);
+    clock += 2_000;
+    cache.names("k", build);
+    expect(builds).toBe(2);
+    cache.names("other", build);
+    expect(builds).toBe(3);
   });
 
   it("finds skills and templates in the project directories of the child cwd", () => {

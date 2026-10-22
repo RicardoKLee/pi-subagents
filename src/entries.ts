@@ -1,7 +1,7 @@
 import { readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { loadSkills } from "@earendil-works/pi-coding-agent";
+import { loadSkills, type ResourceDiagnostic } from "@earendil-works/pi-coding-agent";
 import type { AgentDef } from "./agents.ts";
 
 /** Name recorded as the base of skill and command entries (never resolved from the agents directory). */
@@ -94,14 +94,25 @@ function listed(names: readonly string[], hint?: string): string {
  * are skipped because they require pi's project-trust context, and pi settings / package-resolved
  * explicit skill paths are not reflected here.
  */
-export function skillNames(ctx: Pick<EntryValidationContext, "cwd" | "agentDir" | "skillPaths" | "homeDir">): string[] {
-  const { skills } = loadSkills({
+export interface SkillDiscovery {
+  names: string[];
+  /** Diagnostics of the loader: a skill that failed to load shows up here instead of silently missing. */
+  diagnostics: ResourceDiagnostic[];
+}
+
+/** Skill names and loader diagnostics for this cwd and agent dir (same discovery the child uses). */
+export function discoverSkills(ctx: Pick<EntryValidationContext, "cwd" | "agentDir" | "skillPaths" | "homeDir">): SkillDiscovery {
+  const { skills, diagnostics } = loadSkills({
     cwd: ctx.cwd,
     agentDir: ctx.agentDir,
     skillPaths: [...(ctx.skillPaths ?? []), join(ctx.homeDir ?? homeDir(), ".agents", "skills")],
     includeDefaults: true,
   });
-  return [...new Set(skills.map((s) => s.name))].sort();
+  return { names: [...new Set(skills.map((s) => s.name))].sort(), diagnostics };
+}
+
+export function skillNames(ctx: Pick<EntryValidationContext, "cwd" | "agentDir" | "skillPaths" | "homeDir">): string[] {
+  return discoverSkills(ctx).names;
 }
 
 /** Prompt template names from the conventional directories (pi does not export its template loader). */
@@ -127,9 +138,14 @@ export function validateEntryTarget(entry: ResolvedEntry, ctx: EntryValidationCo
     throw new Error(`unknown agent "${entry.name}". Available: ${listed([...ctx.agents.keys()])}\n\n${SUB_USAGE}`);
   }
   if (entry.kind === "skill") {
-    const names = skillNames(ctx);
+    const { names, diagnostics } = discoverSkills(ctx);
     if (names.includes(entry.name)) return;
-    throw new Error(`unknown skill "${entry.name}". Available: ${listed(names, "Use /sub /skill:<TAB> to see the full list.")}\n\n${SUB_USAGE}`);
+    const skipped = diagnostics
+      .slice(0, 3)
+      .map((d) => `${d.type}: ${d.message}${d.path ? ` (${d.path})` : ""}`)
+      .join("\n");
+    const detail = skipped ? `\nSkipped skills:\n${skipped}` : "";
+    throw new Error(`unknown skill "${entry.name}". Available: ${listed(names, "Use /sub /skill:<TAB> to see the full list.")}${detail}\n\n${SUB_USAGE}`);
   }
   const names = templateNames(ctx);
   if (names.includes(entry.name)) return;
@@ -168,4 +184,21 @@ export function parseSubCommand(args: string): { cwd?: string; target: SubTarget
   }
   if (!rest) return { error: `a task is required for agent "${first}"\n\n${SUB_USAGE}` };
   return { ...(cwd ? { cwd } : {}), target: { kind: "agent", name: first }, rest };
+}
+
+/**
+ * TTL cache for the directory scans behind `/sub` completions: they run on every keystroke, and the discovery
+ * result only changes when skills or templates are added. Injectable clock so the TTL is testable.
+ */
+export function createNameCache(ttlMs = 5_000, now: () => number = Date.now): { names(key: string, build: () => string[]): string[] } {
+  let entry: { key: string; at: number; names: string[] } | undefined;
+  return {
+    names(key: string, build: () => string[]): string[] {
+      const at = now();
+      if (entry && entry.key === key && at - entry.at < ttlMs) return entry.names;
+      const names = build();
+      entry = { key, at, names };
+      return names;
+    },
+  };
 }

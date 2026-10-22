@@ -8,7 +8,7 @@ import { type AgentDef, loadAgents } from "./agents.ts";
 import { CHAIN_ENTRY_TYPE, ChainStore } from "./chain.ts";
 import { mentionProvider } from "./complete.ts";
 import { PRIVATE_ENTRY_TYPE, type PrivateEntryData } from "./delivery.ts";
-import { parseEntryRequest, parseSubCommand, skillNames, templateNames, type EntryRequest } from "./entries.ts";
+import { createNameCache, parseEntryRequest, parseSubCommand, SUB_USAGE, skillNames, templateNames, type EntryRequest } from "./entries.ts";
 import { handleRoute } from "./input.ts";
 import { SubagentManager } from "./manager.ts";
 import { routeMention } from "./mention.ts";
@@ -370,6 +370,9 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
 
 export default createExtension();
 
+/** Directory scans behind the completions run on every keystroke; cache them per cwd and agent dir. */
+const completionNames = createNameCache();
+
 /** Agents, skills and templates the current session can start. */
 function subCompletions(prefix: string, state: State | undefined): AutocompleteItem[] {
   if (!state) return [];
@@ -380,10 +383,13 @@ function subCompletions(prefix: string, state: State | undefined): AutocompleteI
     skillPaths: state.skillPaths,
     promptPaths: state.promptPaths,
   };
+  const startable = completionNames.names(`${ctx.agentDir}\u0000${ctx.cwd}`, () => [
+    ...skillNames(ctx).map((name) => `/skill:${name}`),
+    ...templateNames(ctx).map((name) => `/${name}`),
+  ]);
   const items: AutocompleteItem[] = [
     ...[...ctx.agents.keys()].map((name) => ({ value: name, label: name, description: "agent" })),
-    ...skillNames(ctx).map((name) => ({ value: `/skill:${name}`, label: `/skill:${name}`, description: "skill" })),
-    ...templateNames(ctx).map((name) => ({ value: `/${name}`, label: `/${name}`, description: "prompt template" })),
+    ...startable.map((value) => ({ value, label: value, description: value.startsWith("/skill:") ? "skill" : "prompt template" })),
   ];
   const token = prefix.trim();
   return items.filter((item) => item.value.startsWith(token)).slice(0, 50);
