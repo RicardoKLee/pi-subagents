@@ -3,10 +3,12 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
-import { loadAgents } from "./agents.ts";
+import type { AutocompleteItem } from "@earendil-works/pi-tui";
+import { type AgentDef, loadAgents } from "./agents.ts";
 import { CHAIN_ENTRY_TYPE, ChainStore } from "./chain.ts";
 import { mentionProvider } from "./complete.ts";
 import { PRIVATE_ENTRY_TYPE, type PrivateEntryData } from "./delivery.ts";
+import { parseEntryRequest, parseSubCommand, skillNames, templateNames, type EntryRequest } from "./entries.ts";
 import { handleRoute } from "./input.ts";
 import { SubagentManager } from "./manager.ts";
 import { routeMention } from "./mention.ts";
@@ -15,7 +17,7 @@ import { RpcRunner } from "./runner/rpc.ts";
 import { type ModelResolver, SdkRunner, defaultProjectTrust } from "./runner/sdk.ts";
 import type { Runner } from "./runner/types.ts";
 import { Scheduler } from "./scheduler.ts";
-import { loadSettings, type SubagentSettings } from "./settings.ts";
+import { loadSettings, type DeliveryMode, type SubagentSettings } from "./settings.ts";
 import { executeAction, SubagentsParams, type SubagentsInput } from "./tool.ts";
 import { renderTree, TREE_ENTRY_TYPE, type TreeEntryData, type TreeView } from "./tree.ts";
 
@@ -27,6 +29,13 @@ interface State {
   chains: ChainStore;
   ctx: ExtensionContext;
   settings: SubagentSettings;
+  /** pi's agent dir: where the agent files and the skill / template directories live. */
+  agentDir: string;
+  /** Explicit resource paths; first version reads none, so these stay empty (future work). */
+  skillPaths: string[];
+  promptPaths: string[];
+  /** The same loader the manager uses, so `/sub` completion and validation see the same agent set. */
+  managerAgents: () => Map<string, AgentDef>;
   snapshotFile?: string;
 }
 
@@ -144,16 +153,18 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
             },
             projectTrusted: () => (state?.ctx ?? ctx).isProjectTrusted?.(),
           });
+      // Agent files are re-read on every run; the manager and the /sub completion list share one loader.
+      const agents = (): Map<string, AgentDef> => {
+        const loaded = loadAgents({ userDir: join(agentDir, "agents"), projectDir: join(ctx.cwd, ".pi", "agents"), scope: "user" });
+        for (const w of loaded.warnings) warnOnce(w);
+        return loaded.agents;
+      };
       const manager = new SubagentManager({
         registry,
         chainStore: chains,
         scheduler: new Scheduler(() => settings.maxConcurrent),
         runners: { sdk, rpc },
-        agents: () => {
-          const loaded = loadAgents({ userDir: join(agentDir, "agents"), projectDir: join(ctx.cwd, ".pi", "agents"), scope: "user" });
-          for (const w of loaded.warnings) warnOnce(w);
-          return loaded.agents;
-        },
+        agents,
         settings: () => settings,
         port: {
           sendMessage: (message, options) => pi.sendMessage(message, options),
@@ -176,7 +187,19 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
           }
         },
       });
-      state = { manager, registry, chains, ctx, settings, ...(snapshotFile ? { snapshotFile } : {}) };
+      state = {
+        manager,
+        registry,
+        chains,
+        ctx,
+        settings,
+        agentDir,
+        // Explicit skill / prompt paths from the settings are not read yet (future work); only the default directories.
+        skillPaths: [],
+        promptPaths: [],
+        managerAgents: agents,
+        ...(snapshotFile ? { snapshotFile } : {}),
+      };
       for (const w of warnings) warnOnce(w);
       const recovered = manager.recoverInterrupted();
       // Reload/restart settled the running steps; bring any chain entry left "running" back in line so it can be continued.
@@ -268,6 +291,54 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
       },
     });
 
+    // `/sub` creates a subagent without going through the main model; the symbol in the command name picks the delivery.
+    const SUB_COMMANDS: { name: string; delivery?: DeliveryMode }[] = [
+      { name: "sub" },
+      { name: "sub!", delivery: "auto" },
+      { name: "sub~", delivery: "share" },
+      { name: "sub?", delivery: "private" },
+    ];
+    for (const command of SUB_COMMANDS) {
+      pi.registerCommand(command.name, {
+        description: `Create a subagent (${command.delivery ?? "settings defaultDelivery"}): /${command.name} [--cwd <dir>] <agent> | /skill:<name> | /<template> [args]`,
+        getArgumentCompletions: (prefix) => subCompletions(prefix, state),
+        handler: async (args, ctx) => {
+          const current = state;
+          if (!current) {
+            ctx.ui.notify("pi-subagents: not initialised for this session yet", "error");
+            return;
+          }
+          const parsed = parseSubCommand(args);
+          if ("error" in parsed) {
+            ctx.ui.notify(`pi-subagents: ${parsed.error}`, "error");
+            return;
+          }
+          const delivery = command.delivery ?? current.settings.defaultDelivery;
+          try {
+            const request: EntryRequest =
+              parsed.target.kind === "agent"
+                ? { agent: parsed.target.name }
+                : parsed.target.kind === "skill"
+                  ? { skill: parsed.target.name }
+                  : { command: parsed.target.name };
+            if (parsed.rest) request.task = parsed.rest;
+            const entry = parseEntryRequest(request, command.name);
+            const { record } = await current.manager.run({
+              ...request,
+              ...(parsed.cwd ? { cwd: parsed.cwd } : {}),
+              delivery,
+              background: true,
+              ask: entry.prompt,
+            });
+            const label = entry.kind === "agent" ? entry.name : `${entry.kind}:${entry.name}`;
+            ctx.ui.notify(`pi-subagents: 已创建 @${record.handle}（${label} · ${delivery}）；结果会自动送达`, "info");
+          } catch (error) {
+            ctx.ui.notify(`pi-subagents: ${(error as Error).message}`, "error");
+          }
+        },
+      });
+    }
+
     pi.on("session_shutdown", async () => {
       await state?.manager.shutdown();
       await state?.manager.whenIdle();
@@ -293,3 +364,22 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
 }
 
 export default createExtension();
+
+/** Agents, skills and templates the current session can start. */
+function subCompletions(prefix: string, state: State | undefined): AutocompleteItem[] {
+  if (!state) return [];
+  const ctx = {
+    cwd: state.ctx.cwd,
+    agentDir: state.agentDir,
+    agents: state.managerAgents(),
+    skillPaths: state.skillPaths,
+    promptPaths: state.promptPaths,
+  };
+  const items: AutocompleteItem[] = [
+    ...[...ctx.agents.keys()].map((name) => ({ value: name, label: name, description: "agent" })),
+    ...skillNames(ctx).map((name) => ({ value: `/skill:${name}`, label: `/skill:${name}`, description: "skill" })),
+    ...templateNames(ctx).map((name) => ({ value: `/${name}`, label: `/${name}`, description: "prompt template" })),
+  ];
+  const token = prefix.trim();
+  return items.filter((item) => item.value.startsWith(token)).slice(0, 50);
+}
