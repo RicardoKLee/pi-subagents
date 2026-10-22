@@ -77,10 +77,11 @@ export function homeDir(): string {
 
 const MAX_LISTED = 30;
 
-function listed(names: readonly string[]): string {
+function listed(names: readonly string[], hint?: string): string {
   if (!names.length) return "(none)";
   if (names.length <= MAX_LISTED) return names.join(", ");
-  return `${names.slice(0, MAX_LISTED).join(", ")} (+${names.length - MAX_LISTED} more)`;
+  const head = `${names.slice(0, MAX_LISTED).join(", ")} (+${names.length - MAX_LISTED} more)`;
+  return hint ? `${head}\n${hint}` : head;
 }
 
 /**
@@ -128,11 +129,11 @@ export function validateEntryTarget(entry: ResolvedEntry, ctx: EntryValidationCo
   if (entry.kind === "skill") {
     const names = skillNames(ctx);
     if (names.includes(entry.name)) return;
-    throw new Error(`unknown skill "${entry.name}". Available: ${listed(names)}\n\n${SUB_USAGE}`);
+    throw new Error(`unknown skill "${entry.name}". Available: ${listed(names, "Use /sub /skill:<TAB> to see the full list.")}\n\n${SUB_USAGE}`);
   }
   const names = templateNames(ctx);
   if (names.includes(entry.name)) return;
-  throw new Error(`unknown prompt template "${entry.name}". Available: ${listed(names)}\n\n${SUB_USAGE}`);
+  throw new Error(`unknown prompt template "${entry.name}". Available: ${listed(names, "Use /sub /<TAB> to see the full list.")}\n\n${SUB_USAGE}`);
 }
 
 export type SubTarget = { kind: EntryKind; name: string };

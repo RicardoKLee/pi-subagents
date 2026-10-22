@@ -103,7 +103,8 @@ describe("executeAction", () => {
   it("exposes skill and command in the item schema", () => {
     const item = (SubagentsParams.properties.tasks as { items: { properties: Record<string, unknown> } }).items.properties;
     expect(Object.keys(item)).toEqual(expect.arrayContaining(["agent", "skill", "command", "task", "cwd"]));
-    expect((SubagentsParams.properties as Record<string, unknown>).run ?? {}).toBeDefined();
+    const actions = (SubagentsParams.properties.action as { anyOf: { const: string }[] }).anyOf.map((a) => a.const);
+    expect(actions).toEqual(expect.arrayContaining(["run", "parallel", "chain", "continue", "list"]));
   });
 
   it("passes a skill entry through to run", async () => {

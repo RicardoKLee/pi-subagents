@@ -1,7 +1,7 @@
 import { existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import type { AgentDef } from "./agents.ts";
-import { type ChainRecord, type ChainStatus, type ChainStep, ChainStore } from "./chain.ts";
+import { type ChainRecord, type ChainStatus, ChainStore } from "./chain.ts";
 import { type Ask, deliver, type DeliveryPort, deliverBatch, quoteAsk, renderAsks } from "./delivery.ts";
 import { BUILTIN_ENTRY_AGENT_DEF, type EntryRequest, parseEntryRequest, type ResolvedEntry, validateEntryTarget } from "./entries.ts";
 import { estimateTokens, type Payload, preparePayload, SUMMARY_INSTRUCTION, writeOutput } from "./output.ts";
@@ -881,7 +881,7 @@ export class SubagentManager {
       try {
         deliver(this.deps.port, record.delivery, {
           handle: record.handle,
-          agent: record.agent,
+          agent: recordEntryLabel(record),
           status,
           text: payload.text,
           sessionFile: record.sessionFile,

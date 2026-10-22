@@ -89,6 +89,7 @@ describe("validateEntryTarget", () => {
       message = (error as Error).message;
     }
     expect(message).toContain("+5 more");
+    expect(message).toContain("/sub /skill:<TAB>");
   });
 
   it("finds skills and templates in the project directories of the child cwd", () => {

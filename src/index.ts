@@ -12,7 +12,7 @@ import { parseEntryRequest, parseSubCommand, skillNames, templateNames, type Ent
 import { handleRoute } from "./input.ts";
 import { SubagentManager } from "./manager.ts";
 import { routeMention } from "./mention.ts";
-import { REGISTRY_ENTRY_TYPE, Registry, writeSnapshot } from "./registry.ts";
+import { recordEntryLabel, REGISTRY_ENTRY_TYPE, Registry, writeSnapshot } from "./registry.ts";
 import { RpcRunner } from "./runner/rpc.ts";
 import { type ModelResolver, SdkRunner, defaultProjectTrust } from "./runner/sdk.ts";
 import type { Runner } from "./runner/types.ts";
@@ -211,7 +211,7 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
         completionUi = ctx.ui;
         ctx.ui.addAutocompleteProvider((current) =>
           mentionProvider(current, () =>
-            (state?.registry.list() ?? []).map((r) => ({ handle: r.handle, agent: r.agent, status: r.status, clash: fileExists(r.handle) })),
+            (state?.registry.list() ?? []).map((r) => ({ handle: r.handle, agent: recordEntryLabel(r), status: r.status, clash: fileExists(r.handle) })),
           ),
         );
       }

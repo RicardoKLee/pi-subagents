@@ -152,6 +152,8 @@ describe("skill and command entries", () => {
     await manager.whenIdle();
     expect(sent[0]![0].content).toContain("[user asked @pdf-tools]");
     expect(sent[0]![0].content).toContain("/skill:pdf-tools extract a.pdf");
+    // The delivered message names the entry kind, not the internal base agent.
+    expect(sent[0]![0].content).toContain("(skill:pdf-tools)");
   });
 
   it("continues a chain that failed on a skill step by replaying the slash prompt", async () => {
