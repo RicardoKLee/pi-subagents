@@ -42,9 +42,10 @@ function setup(opts: { scripts?: ChildResult[][]; settings?: Partial<SubagentSet
   });
   const sent: Parameters<DeliveryPort["sendMessage"]>[] = [];
   const registry = new Registry(() => {});
+  const chainStore = new ChainStore(() => {});
   const manager = new SubagentManager({
     registry,
-    chainStore: new ChainStore(() => {}),
+    chainStore,
     scheduler: new Scheduler(() => 4),
     runners: { sdk: runner, rpc: undefined },
     agents: () => new Map([[codeAgent.name, codeAgent]]),
@@ -56,7 +57,7 @@ function setup(opts: { scripts?: ChildResult[][]; settings?: Partial<SubagentSet
     sessionDir: join(root, "sessions"),
     outputDir: join(root, "out"),
   });
-  return { manager, runner, registry, sent, root, agentDir };
+  return { manager, runner, registry, sent, root, agentDir, chainStore };
 }
 
 describe("skill and command entries", () => {
@@ -144,6 +145,13 @@ describe("skill and command entries", () => {
     expect(parallel.payload!.text).toContain("### [@pdf-tools] (skill:pdf-tools) completed");
     const chain = await manager.runChain({ steps: [{ skill: "pdf-tools", task: "two" }, { agent: "code-agent", task: "three" }] });
     expect(chain.payload!.text).toMatch(/### \[@[^\]]+\] \(skill:pdf-tools\) step 1 completed/);
+  });
+
+  it("rejects a chain step whose task is only {previous} when nothing came before it", async () => {
+    const { manager, chainStore } = setup();
+    await expect(manager.runChain({ steps: [{ agent: "code-agent", task: "{previous}" }] })).rejects.toThrow(/requires "task" for an agent entry/);
+    // Validation happens before the chain exists, so no half-built chain is left behind.
+    expect(chainStore.list()).toHaveLength(0);
   });
 
   it("quotes the ask in a mention-style delivery", async () => {

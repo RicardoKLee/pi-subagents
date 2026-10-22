@@ -294,7 +294,12 @@ export class SubagentManager {
     // afterwards and leave a chain stuck in "running" with no step records and no way to continue it.
     if (this.deps.scheduler.disabled) throw new SubagentsDisabledError();
     // Validate every step's entry, runner and cwd before the chain exists, so a typo cannot leave a half-run chain behind.
-    for (const step of req.steps) this.resolveTarget(step, "chain");
+    // Only the first step's task is fully known up front (`{previous}` is empty there); the rest are validated as they
+    // run, and a later step that becomes empty after substitution fails the chain as usual.
+    req.steps.forEach((step, i) => {
+      const task = i === 0 ? substitutePrevious(step.task ?? "", "") : step.task;
+      this.resolveTarget({ ...entryFields(step), ...(task === undefined ? {} : { task }) }, "chain");
+    });
     const chain = this.deps.chainStore.create({
       // Keep the entry kind of every step (skill / command steps have no base agent) so reload and continue can replay it.
       steps: req.steps.map((s) => ({ ...entryFields(s), task: s.task ?? "" })),

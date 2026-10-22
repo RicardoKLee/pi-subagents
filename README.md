@@ -162,7 +162,7 @@ and a read-only snapshot `<sessionDir>/<sessionId>.subagents.json` (never used f
 - Not yet available: nested subagents. It is planned for a later milestone.
 - `pi` rewrites its process title to `pi`; to see the resident RPC children, list the main pi's children whose comm is `pi` (`ps --ppid <main pi> -o pid,comm`), instead of `grep`ping the command line.
 - Chain steps run one after another; a parallel group inside a chain is not supported yet.
-- A step's prompt is the substituted task text (with `{previous}` already replaced), and `continue` replays that same text when no message is given.
+- A step's prompt is the substituted task text (with `{previous}` already replaced), and `continue` replays that same text when no message is given. A step whose task is only `{previous}` and whose previous step produced no output is rejected as an empty agent task (the chain is not created).
 - An RPC child starts in about a second; resuming a resident child has no start-up cost.
 - RPC children load no extensions until nesting (M6).
 - Project skills and prompt templates are loaded regardless of project trust (pi only gates `SYSTEM.md` / `APPEND_SYSTEM.md` by trust), so `/sub /skill:x` works in an untrusted project too. pi expands the slash command inside the child and passes an unknown name through unchanged, so if a skill cannot be loaded there (a malformed or unreadable file, or a discovery difference) the model receives the literal `/skill:x …` text instead of an error.
