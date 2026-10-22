@@ -99,4 +99,22 @@ describe("executeAction", () => {
     await executeAction(m, { action: "resume", handle: "reviewer", message: "again", background: true });
     expect(m.resume).toHaveBeenCalledWith("reviewer", "again", { background: true, delivery: "auto" });
   });
+
+  it("exposes skill and command in the item schema", () => {
+    const item = (SubagentsParams.properties.tasks as { items: { properties: Record<string, unknown> } }).items.properties;
+    expect(Object.keys(item)).toEqual(expect.arrayContaining(["agent", "skill", "command", "task", "cwd"]));
+    expect((SubagentsParams.properties as Record<string, unknown>).run ?? {}).toBeDefined();
+  });
+
+  it("passes a skill entry through to run", async () => {
+    const m = fakeManager();
+    await executeAction(m, { action: "run", skill: "pdf-tools", task: "extract" });
+    expect(m.run).toHaveBeenCalledWith({ skill: "pdf-tools", task: "extract" });
+  });
+
+  it("rejects two entry kinds without calling the manager", async () => {
+    const m = fakeManager();
+    await expect(executeAction(m, { action: "run", agent: "reviewer", skill: "pdf-tools", task: "x" })).rejects.toThrow(/exactly one of/);
+    expect(m.run).not.toHaveBeenCalled();
+  });
 });

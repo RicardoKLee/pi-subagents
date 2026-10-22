@@ -56,6 +56,7 @@ function setup(settings: Partial<SubagentSettings> = {}) {
     port: { sendMessage: () => {}, appendEntry: () => {} },
     receiverContextWindow: () => 200000,
     cwd: root,
+    agentDir: join(root, "agent"),
     sessionDir: join(root, "sessions"),
     outputDir: join(root, "out"),
   });

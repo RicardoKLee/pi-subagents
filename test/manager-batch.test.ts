@@ -62,6 +62,7 @@ function setup(
     port: opts.port ?? { sendMessage: (...args) => sent.push(args), appendEntry: () => {} },
     receiverContextWindow: () => opts.contextWindow ?? 200000,
     cwd: root,
+    agentDir: join(root, "agent"),
     sessionDir: join(root, "sessions"),
     outputDir: join(root, "out"),
     ...(opts.onDeliveryError ? { onDeliveryError: opts.onDeliveryError } : {}),

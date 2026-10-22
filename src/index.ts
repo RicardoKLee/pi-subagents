@@ -162,6 +162,7 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
         receiverContextWindow: () => state?.ctx.model?.contextWindow ?? 200000,
         receiverContextWindowFor: (agent) => modelWindow(agent.model),
         cwd: ctx.cwd,
+        agentDir,
         sessionDir: childDir,
         outputDir,
         // Trust follows the resolved cwd: the main session's decision only applies to the main cwd. Any other

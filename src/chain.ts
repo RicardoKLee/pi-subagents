@@ -6,7 +6,10 @@ export const CHAIN_ENTRY_TYPE = "pi-subagents/chain";
 export type ChainStatus = "running" | "paused" | "completed" | "failed" | "stopped";
 
 export interface ChainStep {
-  agent: string;
+  /** Exactly one of agent / skill / command is set (agent entries also carry the base agent name). */
+  agent?: string;
+  skill?: string;
+  command?: string;
   task: string;
   cwd?: string;
 }
@@ -36,7 +39,9 @@ const CHAIN_STATUSES: readonly string[] = ["running", "paused", "completed", "fa
 
 function isStep(value: unknown): value is ChainStep {
   const s = value as Partial<ChainStep> | null;
-  return !!s && typeof s.agent === "string" && typeof s.task === "string";
+  if (!s || typeof s !== "object") return false;
+  const kinds = [s.agent, s.skill, s.command].filter((v) => typeof v === "string" && v.length > 0);
+  return kinds.length === 1 && typeof s.task === "string";
 }
 
 function isUsage(value: unknown): value is Usage {

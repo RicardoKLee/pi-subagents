@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { ChainStore } from "../src/chain.ts";
 import { SubagentManager } from "../src/manager.ts";
@@ -53,6 +54,7 @@ async function setup(kind: "sdk" | "rpc", settings: Partial<SubagentSettings> = 
     port: { sendMessage: () => {}, appendEntry: () => {} },
     receiverContextWindow: () => 200000,
     cwd: h.spec.cwd,
+    agentDir: join(h.spec.cwd, "..", "agent"),
     sessionDir: h.spec.sessionDir,
     outputDir: `${h.spec.sessionDir}-out`,
   });
