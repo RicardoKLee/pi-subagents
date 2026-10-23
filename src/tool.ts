@@ -138,9 +138,14 @@ export async function executeAction(
   manager: SubagentManager,
   input: DispatchInput,
   signal?: AbortSignal,
+  /**
+   * What an aborted tool call means for live children. The main session (the default) pauses every running
+   * subagent so Esc / session switch makes the call return. The delegation path overrides it: a child's own
+   * interrupt must not cascade (plan 6.9 decision 8), so it passes a scoped no-op.
+   */
+  onAbort: () => void = () => void manager.interruptAll(),
 ): Promise<{ text: string; details: Record<string, unknown> }> {
   // Esc / session switch aborts the tool call; pause the children so the call can return.
-  const onAbort = () => void manager.interruptAll();
   if (signal?.aborted) onAbort();
   else signal?.addEventListener("abort", onAbort, { once: true });
   try {

@@ -6,6 +6,7 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { type AgentDef, loadAgents } from "./agents.ts";
 import { CHAIN_ENTRY_TYPE, ChainStore } from "./chain.ts";
+import { childExtension, childRecordId, type DelegationHost, mailboxHost } from "./child.ts";
 import { mentionProvider } from "./complete.ts";
 import { PRIVATE_ENTRY_TYPE, type PrivateEntryData } from "./delivery.ts";
 import { createNameCache, parseEntryRequest, parseSubCommand, SUB_USAGE, skillNames, templateNames, type EntryRequest } from "./entries.ts";
@@ -93,7 +94,18 @@ function writeSnapshotSafely(file: string | undefined, registry: Registry): void
   }
 }
 
+/** Set when this process was started as a subagent: it then loads only the proxy tool (plan 6.9 item 1). */
+const CHILD_RECORD = childRecordId();
+
 export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI) => void {
+  if (CHILD_RECORD) {
+    // This process was started as a subagent: only the proxy tool, no manager of its own. The host writes into the
+    // parent session's mailbox; the parent's manager stays the only scheduler and registry.
+    return childExtension({
+      canDelegate: process.env.PI_SUBAGENTS_DELEGATE === "1",
+      host: mailboxHost(process.env.PI_SUBAGENTS_MAILBOX ?? "", CHILD_RECORD),
+    });
+  }
   return (pi: ExtensionAPI): void => {
     const agentDir = opts.agentDir ?? getAgentDir();
     let state: State | undefined;
@@ -132,6 +144,9 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
 
       const { settings, warnings } = loadSettings(join(agentDir, "subagents.json"));
       const { childDir, outputDir, snapshotFile } = subagentPaths(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+      // A nested child's mailbox lives beside its sibling sessions; without a session dir it follows the temp layout
+      // subagentPaths already chose, so a sessionless run still gets an isolated mailbox.
+      const mailboxDir = join(childDir, "mailbox");
       const registry = Registry.rebuild(ctx.sessionManager.getBranch(), (record) => {
         pi.appendEntry(REGISTRY_ENTRY_TYPE, record);
         writeSnapshotSafely(snapshotFile, registry);
@@ -141,9 +156,19 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
       const mainCwd = resolvePath(ctx.cwd);
       const modelWindow = (spec: string | undefined) => resolveModel(state?.ctx ?? ctx, spec)?.contextWindow;
       const modelResolver: ModelResolver = (spec) => resolveModel(state?.ctx ?? ctx, spec);
+      // An SDK child runs in this process: its delegation requests go straight to this session's manager. `state` is
+      // assigned below, before any child can call; a call that somehow arrives earlier fails loudly instead of
+      // silently spawning nothing.
+      const delegationHost: DelegationHost = {
+        request: (parentRecordId, payload, signal) => {
+          const manager = state?.manager;
+          if (!manager) throw new Error("pi-subagents is not initialised for this session yet");
+          return manager.delegate(parentRecordId, payload, signal);
+        },
+      };
       const sdk = opts.createRunner
         ? opts.createRunner(modelResolver)
-        : new SdkRunner({ agentDir, resolveModel: modelResolver, projectTrusted: () => (state?.ctx ?? ctx).isProjectTrusted?.() });
+        : new SdkRunner({ agentDir, resolveModel: modelResolver, projectTrusted: () => (state?.ctx ?? ctx).isProjectTrusted?.(), delegationHost });
       const rpc = opts.createRpcRunner
         ? opts.createRpcRunner(modelResolver)
         : new RpcRunner({
@@ -176,6 +201,7 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
         agentDir,
         sessionDir: childDir,
         outputDir,
+        mailboxDir,
         // Trust follows the resolved cwd: the main session's decision only applies to the main cwd. Any other
         // directory gets its own non-interactive decision (never the main session's trust). Both sides are
         // normalized so equivalent spellings of the same directory match without letting a different one through.

@@ -452,3 +452,27 @@ describe("SdkChildSession turn boundary", () => {
     expect(fake.listenerCount()).toBe(0);
   });
 });
+
+describe("SdkChildSession deliver", () => {
+  it("should_open_a_turn_for_start_and_queue_a_follow_up_for_queue", async () => {
+    // Arrange: only sendCustomMessage is needed for deliver.
+    const calls: { message: unknown; options: unknown }[] = [];
+    const fake = {
+      async sendCustomMessage(message: unknown, options: unknown) {
+        calls.push({ message, options });
+      },
+      dispose() {},
+    };
+    const child = new SdkChildSession(fake as unknown as AgentSession);
+
+    // Act
+    await child.deliver("first", "start");
+    await child.deliver("second", "queue");
+
+    // Assert: the custom message type is the shared carrier; `start` triggers a turn, `queue` is a follow-up.
+    expect(calls).toEqual([
+      { message: { customType: "pi-subagents/child-results", content: "first", display: true }, options: { triggerTurn: true } },
+      { message: { customType: "pi-subagents/child-results", content: "second", display: true }, options: { deliverAs: "followUp" } },
+    ]);
+  });
+});

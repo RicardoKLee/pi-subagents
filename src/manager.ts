@@ -6,10 +6,12 @@ import { type Ask, deliver, type DeliveryPort, deliverBatch, quoteAsk, renderAsk
 import { BUILTIN_ENTRY_AGENT_DEF, type EntryRequest, parseEntryRequest, type ResolvedEntry, validateEntryTarget } from "./entries.ts";
 import { estimateTokens, type Payload, preparePayload, SUMMARY_INSTRUCTION, writeOutput } from "./output.ts";
 import { recordEntryLabel, type Registry, type RunStatus, type SubagentRecord, type Usage, ZERO_USAGE } from "./registry.ts";
-import type { ChildResult, ChildSession, Runner } from "./runner/types.ts";
+import type { ChildDelegation, ChildResult, ChildSession, Runner } from "./runner/types.ts";
 import { type Scheduler, SubagentsDisabledError } from "./scheduler.ts";
 import type { DeliveryMode, RunnerKind, SubagentSettings } from "./settings.ts";
 import { limitAllows } from "./settings.ts";
+import { executeAction, type DispatchInput, type SubagentsInput } from "./tool.ts";
+import { renderTree } from "./tree.ts";
 
 export type SubagentErrorCode =
   | "unknown_agent"
@@ -51,6 +53,8 @@ export interface ManagerDeps {
   onDeliveryError?: (record: SubagentRecord, message: string) => void;
   /** Called once a new record exists (queued); used to warn about handles that clash with files. */
   onRecordCreated?: (record: SubagentRecord) => void;
+  /** Directory of the file mailbox a nested child uses to delegate (M6). Absent disables nesting. */
+  mailboxDir?: string;
 }
 
 export interface RunRequest extends EntryRequest {
@@ -293,6 +297,78 @@ export class SubagentManager {
     return this.descendants(id).reduce((acc, r) => addUsage(acc, r.usage), { ...ZERO_USAGE });
   }
 
+  /**
+   * Resolves a delegated `handle` against the delegating record's own subtree. This is deliberately narrower than
+   * `requireRecord`: a handle that does not exist and a handle that exists in another tree are refused with the same
+   * text, which names only the requested handle and never the global inventory (plan 6.9 item 7, REVIEW-026).
+   * Both the short handle and the record id resolve, matching `Registry.resolve`.
+   *
+   * TODO(addressing): task 5 extends this to `父/子` paths — split the cleaned value on "/" and walk direct children
+   * segment by segment, keeping this single-segment lookup as the leaf case; the subtree gate stays the only gate.
+   */
+  private resolveOwnedRecord(parent: SubagentRecord, handle: string): SubagentRecord {
+    const cleaned = handle.replace(/^@/, "");
+    const target = this.descendants(parent.id).find((r) => r.id === cleaned || r.handle === cleaned.toLowerCase());
+    if (!target) throw new Error(`@${cleaned} is not one of your subagents`);
+    return target;
+  }
+
+  /**
+   * Runs one delegation request coming from a child session: scope-checked against that child, and attributed to it.
+   * `payload` is the raw tool input (`action`, `agent`, `task`, `handle`, ...). Called in-process by an SDK child and
+   * through the mailbox by an RPC child (plan 6.9 items 1 and 2).
+   */
+  async delegate(parentRecordId: string, payload: Record<string, unknown>, signal?: AbortSignal): Promise<{ text: string; details: Record<string, unknown> }> {
+    const parent = this.deps.registry.get(parentRecordId);
+    if (!parent) throw new Error(`unknown parent subagent ${parentRecordId}`);
+    const input = payload as SubagentsInput;
+    if (input.action === "list") {
+      // A child sees only its own subtree: never its parent, its siblings, or its parent's other branches.
+      const records = this.descendants(parent.id);
+      const ids = new Set(records.map((r) => r.id));
+      const chains = this.listChains().filter((c) => c.stepRecordIds.some((id) => ids.has(id)));
+      return { text: renderTree(records, "list", chains), details: { count: records.length } };
+    }
+    const scoped: DispatchInput = { ...input };
+    if (input.handle) {
+      // Resolve inside the delegating child's own subtree only. `requireRecord` must NOT be used here: its miss text
+      // enumerates every global handle, which would hand a child its ancestors' and siblings' handles (REVIEW-026,
+      // plan 6.9 item 7). Existence and ownership collapse into one refusal so a foreign handle leaks nothing.
+      const target = this.resolveOwnedRecord(parent, input.handle);
+      // Carry the record id on: it resolves back to the same record, and a later record cannot take the name over.
+      scoped.handle = target.id;
+    }
+    if (input.action === "run" || input.action === "parallel" || input.action === "chain") {
+      // Only spawning actions create records, so only they need the parent; resume/continue/steer/interrupt/stop act
+      // on a record that already exists.
+      return executeAction(this, { ...scoped, parentId: parent.id, depth: parent.depth + 1 }, signal, noCascade);
+    }
+    return executeAction(this, scoped, signal, noCascade);
+  }
+
+  /**
+   * The delegation a child session of this record gets (M6 nesting), or undefined when the session has no mailbox
+   * (nesting is gated on `deps.mailboxDir`). `recordId` becomes the parent of anything the child spawns, `depth` is
+   * the child's own depth, and `canDelegate` is recomputed now so a resume after a settings change never keeps a
+   * stale answer. Every path that opens a child session (launch, and resume — which `continueChainLoop` uses to
+   * reopen the stopped step) must pass this, or a resumed child silently loses its proxy tool.
+   */
+  private delegationSpecFor(record: SubagentRecord): ChildDelegation | undefined {
+    const mailboxDir = this.deps.mailboxDir;
+    if (!mailboxDir) return undefined;
+    return { recordId: record.id, depth: record.depth, canDelegate: this.delegationFor(record).canDelegate, mailboxDir };
+  }
+
+  /** Starts the mailbox poller while at least one child session may delegate. */
+  private ensureMailbox(): void {
+    // TODO(mailbox): milestone 6 task 3 starts a MailboxServer here and stops it in maybeStopMailbox().
+  }
+
+  /** Stops the mailbox poller once no child can ask any more. */
+  private maybeStopMailbox(): void {
+    // TODO(mailbox): milestone 6 task 3 stops the MailboxServer here.
+  }
+
   /** Resolves a run's working directory; the main cwd when omitted. Absolute inputs are normalized too, so equivalent paths compare equal. */
   resolveCwd(cwd: string | undefined): string {
     if (!cwd) return this.deps.cwd;
@@ -379,12 +455,17 @@ export class SubagentManager {
     }
     let session: ChildSession;
     try {
+      // A child of a session that has a mailbox may delegate: the runner turns this into the in-process proxy
+      // extension (SDK) or `-ne -e <this extension>` plus the PI_SUBAGENTS_* env (RPC). `delegationFor` decides
+      // whether the child gets the tool at all (depth/permission); the manager remains the only authority.
+      const delegation = this.delegationSpecFor(record);
       session = await runner.open({
         agent,
         cwd,
         sessionDir: this.deps.sessionDir,
         ...(trusted !== undefined ? { projectTrusted: trusted } : {}),
         appendSystemPrompt: [agent.systemPrompt, SUMMARY_INSTRUCTION].filter(Boolean),
+        ...(delegation ? { delegation } : {}),
       });
     } catch (error) {
       this.queued.delete(record.id);
@@ -773,6 +854,9 @@ export class SubagentManager {
     try {
       release = await this.deps.scheduler.acquire(claim.controller.signal);
       try {
+        // A resumed child that may delegate must get its proxy tool back (REVIEW-021): recompute the delegation for
+        // this record instead of dropping it, exactly as launch() does.
+        const delegation = this.delegationSpecFor(record);
         session =
           (await this.takeIdle(record)) ??
           // takeIdle has waited for any close of this record still in flight, so the file has no other writer.
@@ -784,6 +868,7 @@ export class SubagentManager {
             ...(record.childLeafId ? { resumeLeafId: record.childLeafId } : {}),
             ...(trusted !== undefined ? { projectTrusted: trusted } : {}),
             appendSystemPrompt: [agent.systemPrompt, SUMMARY_INSTRUCTION].filter(Boolean),
+            ...(delegation ? { delegation } : {}),
           }));
         if (this.closed) {
           // Shutdown during open: dispose here; release and rollback run in the handlers below.
@@ -1268,6 +1353,15 @@ export class SubagentManager {
 function runInterruptedError(): SubagentError {
   return new SubagentError("interrupted", "subagent run was interrupted before it started");
 }
+
+/**
+ * The abort scope for a delegated tool call: nothing (REVIEW-019). A child's tool call is aborted when the child
+ * itself is interrupted or stopped; plan 6.9 decision 8 says an interrupt never cascades, so the child's own
+ * descendants keep running and queue their results. The record this very call starts is already cancelled by the same
+ * `signal` that is threaded into manager.run/runParallel/runChain/resume, so no global `interruptAll()` may fire here
+ * (that would pause unrelated siblings and other trees). Only the main session's Esc keeps the default callback.
+ */
+const noCascade = (): void => {};
 
 /** The entry fields of a batch item or chain step, present only when set (keeps empty strings out of the stored entry). */
 function entryFields(item: EntryRequest & { cwd?: string }): EntryRequest & { cwd?: string } {

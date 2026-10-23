@@ -11,6 +11,16 @@ export function toStopReason(value: unknown): StopReason {
   return STOP_REASONS.includes(value as StopReason) ? (value as StopReason) : "stop";
 }
 
+export interface ChildDelegation {
+  /** Record id of the child itself; it becomes the parent of anything the child spawns. */
+  recordId: string;
+  depth: number;
+  /** False when the child may not spawn (depth/permission): the proxy tool is then not registered. */
+  canDelegate: boolean;
+  /** Mailbox of the owning session (RPC children only). */
+  mailboxDir?: string;
+}
+
 export interface ChildSpec {
   agent: AgentDef;
   cwd: string;
@@ -23,6 +33,8 @@ export interface ChildSpec {
   appendSystemPrompt: string[];
   /** Project trust decided by the caller for this cwd; runners fall back to their own resolution when absent. */
   projectTrusted?: boolean;
+  /** Set when this child may delegate to subagents of its own (M6 nesting). */
+  delegation?: ChildDelegation;
 }
 
 export interface ChildResult {
@@ -46,6 +58,11 @@ export interface ChildSession {
   onExit(listener: (reason: string) => void): () => void;
   /** Resolves when the child is idle after handling `text`. */
   prompt(text: string): Promise<ChildResult>;
+  /**
+   * Injects a result produced elsewhere into this child session (M6 nesting).
+   * `start` opens a new turn (idle child); `queue` waits for the current turn to finish (running child).
+   */
+  deliver(text: string, mode: "start" | "queue"): Promise<void>;
   steer(text: string, mode: "steer" | "followUp"): Promise<void>;
   abort(): Promise<void>;
   /**

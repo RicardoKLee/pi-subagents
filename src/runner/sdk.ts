@@ -9,6 +9,7 @@ import {
   SettingsManager,
   hasTrustRequiringProjectResources,
 } from "@earendil-works/pi-coding-agent";
+import { childExtension, type DelegationHost } from "../child.ts";
 import type { Usage } from "../registry.ts";
 import { type TurnMessage, turnResult } from "./result.ts";
 import type { ChildResult, ChildSession, ChildSpec, Runner } from "./types.ts";
@@ -21,6 +22,43 @@ export interface SdkRunnerOptions {
   modelRuntime?: ModelRuntime;
   /** The main session's project trust; undefined decides the way a `pi --mode rpc` child without -a/-na would. */
   projectTrusted?: () => boolean | undefined;
+  /** Where a child's delegation requests go (the main manager, in-process). Absent disables delegation for SDK children. */
+  delegationHost?: DelegationHost;
+}
+
+/**
+ * The `DefaultResourceLoader` options for one child. Extracted so tests can assert the inline proxy extension is
+ * injected only when the spec carries delegation; `noExtensions` only disables automatic discovery, explicit
+ * `extensionFactories` still load (plan 6.9 item 12).
+ */
+export function buildLoaderOptions(
+  spec: ChildSpec,
+  opts: { agentDir: string; settingsManager: SettingsManager; host?: DelegationHost },
+): ConstructorParameters<typeof DefaultResourceLoader>[0] {
+  return {
+    cwd: spec.cwd,
+    agentDir: opts.agentDir,
+    settingsManager: opts.settingsManager,
+    noExtensions: true,
+    appendSystemPrompt: spec.appendSystemPrompt,
+    ...(spec.delegation
+      ? {
+          extensionFactories: [
+            childExtension({
+              canDelegate: spec.delegation.canDelegate,
+              // In-process SDK children have no PI_SUBAGENTS_CHILD of their own, so the spec is the only source of
+              // the record id the host needs to attribute the delegation.
+              recordId: spec.delegation.recordId,
+              host: opts.host ?? {
+                request: async () => {
+                  throw new Error("no delegation host is configured for this child session");
+                },
+              },
+            }),
+          ],
+        }
+      : {}),
+  };
 }
 
 /**
@@ -95,6 +133,15 @@ export class SdkChildSession implements ChildSession {
     return { ...turnResult(turn, aborted), usage: delta(totals(this.session), before) };
   }
 
+  async deliver(text: string, mode: "start" | "queue"): Promise<void> {
+    // A custom message enters the child's model context as `pi-subagents/child-results`; `start` opens a new turn,
+    // `queue` waits for the running one (agent-session.d.ts:607).
+    await this.session.sendCustomMessage(
+      { customType: "pi-subagents/child-results", content: text, display: true },
+      mode === "start" ? { triggerTurn: true } : { deliverAs: "followUp" },
+    );
+  }
+
   async steer(text: string, mode: "steer" | "followUp"): Promise<void> {
     if (mode === "steer") await this.session.steer(text);
     else await this.session.followUp(text);
@@ -123,13 +170,13 @@ export class SdkRunner implements Runner {
     const projectTrusted = spec.projectTrusted ?? this.opts.projectTrusted?.() ?? defaultProjectTrust(spec.cwd, this.opts.agentDir);
     // Same user settings as a normal pi run (and as the RPC runner's child process).
     const settingsManager = SettingsManager.create(spec.cwd, this.opts.agentDir, { projectTrusted });
-    const resourceLoader = new DefaultResourceLoader({
-      cwd: spec.cwd,
-      agentDir: this.opts.agentDir,
-      settingsManager,
-      noExtensions: true,
-      appendSystemPrompt: spec.appendSystemPrompt,
-    });
+    const resourceLoader = new DefaultResourceLoader(
+      buildLoaderOptions(spec, {
+        agentDir: this.opts.agentDir,
+        settingsManager,
+        ...(this.opts.delegationHost ? { host: this.opts.delegationHost } : {}),
+      }),
+    );
     await resourceLoader.reload();
     const sessionManager = spec.resumeFile ? SessionManager.open(spec.resumeFile) : SessionManager.create(spec.cwd, spec.sessionDir);
     // Continue from the entry this record last ended on, not from whatever another branch appended later.
