@@ -67,6 +67,10 @@ export interface RunRequest extends EntryRequest {
   stepIndex?: number;
   /** The user's own message, quoted with the delivered result (used by `/sub`). */
   ask?: string;
+  /** Set by the delegation path: the subagent that asked for this run becomes its parent. */
+  parentId?: string;
+  /** Informational only: a record's depth is always derived from its parent (root subagents are depth 1). */
+  depth?: number;
 }
 
 export interface RunOutcome {
@@ -77,6 +81,10 @@ export interface RunOutcome {
 
 export interface BatchItem extends EntryRequest {
   cwd?: string;
+  /** Set by the delegation path: the subagent that asked for this item becomes its parent. */
+  parentId?: string;
+  /** Informational only: a record's depth is always derived from its parent (root subagents are depth 1). */
+  depth?: number;
 }
 
 export interface BatchOutcome {
@@ -158,6 +166,133 @@ export class SubagentManager {
     return this.deps.chainStore.list();
   }
 
+  /** The effective spawn policy for a record: depth plus the intersection of its ancestors' whitelists. */
+  private requesterPolicy(record: SubagentRecord): { depth: number; allowed: Set<string> | null } {
+    let allowed: Set<string> | null = null;
+    for (const ancestor of [...this.ancestorChain(record), record]) {
+      const agent = this.deps.agents().get(ancestor.agent);
+      const list = agent?.allowedSubagents;
+      // An empty list is a whitelist that allows nothing, so only `undefined` means "no restriction".
+      if (!list) continue;
+      if (!allowed) {
+        allowed = new Set<string>(list);
+        continue;
+      }
+      // Intersect: a level may only narrow what its ancestors allowed, never widen it.
+      const narrowed = new Set<string>();
+      for (const name of allowed) if (list.includes(name)) narrowed.add(name);
+      allowed = narrowed;
+    }
+    return { depth: record.depth, allowed };
+  }
+
+  /** The record's ancestors, nearest first. */
+  private ancestorChain(record: SubagentRecord): SubagentRecord[] {
+    const chain: SubagentRecord[] = [];
+    // `seen` closes a corrupt registry (a parentId cycle): without it a bad record would loop forever. `record`
+    // itself is seeded so a record that points back at itself also terminates.
+    const seen = new Set<string>([record.id]);
+    for (let current = record.parentId ? this.deps.registry.get(record.parentId) : undefined; current; ) {
+      if (seen.has(current.id)) break;
+      seen.add(current.id);
+      chain.push(current);
+      current = current.parentId ? this.deps.registry.get(current.parentId) : undefined;
+    }
+    return chain;
+  }
+
+  /** The main session acts as a requester with depth 0 and no whitelist. */
+  private policyFor(record: SubagentRecord | undefined): { depth: number; allowed: Set<string> | null } {
+    return record ? this.requesterPolicy(record) : { depth: 0, allowed: null };
+  }
+
+  /** Whether this session may start subagents at all (depth 0 against maxDepth). */
+  canStartSubagents(): boolean {
+    return limitAllows(this.deps.settings().maxDepth, 0);
+  }
+
+  /** May this record start subagents at all? */
+  delegationFor(record: SubagentRecord): { canDelegate: boolean; reason?: string } {
+    const max = this.deps.settings().maxDepth;
+    if (!limitAllows(max, record.depth)) {
+      return { canDelegate: false, reason: `reached the maximum nesting depth (maxDepth=${max}); you cannot start more subagents` };
+    }
+    const { allowed } = this.policyFor(record);
+    if (allowed && allowed.size === 0) return { canDelegate: false, reason: "your agent definition does not allow spawning any subagent" };
+    return { canDelegate: true };
+  }
+
+  /** Throws unless `requester` (undefined = the main session) may spawn the resolved entry right now. */
+  private assertCanSpawn(requester: SubagentRecord | undefined, entry: ResolvedEntry, reserved = 0): void {
+    const { depth, allowed } = this.policyFor(requester);
+    const max = this.deps.settings().maxDepth;
+    if (!limitAllows(max, depth)) throw new Error(`reached the maximum nesting depth (maxDepth=${max}); you cannot start more subagents`);
+    if (allowed && (!allowed.size || entry.kind !== "agent" || !allowed.has(entry.name))) {
+      const name = entry.kind === "agent" ? entry.name : `${entry.kind}:${entry.name}`;
+      throw new Error(`your agent definition does not allow spawning "${name}" (allowed: ${[...allowed].join(", ") || "none"})`);
+    }
+    if (requester) {
+      // `reserved` counts items already accepted earlier in the same batch: their records do not exist yet, so the
+      // batch would otherwise validate every item against the same stale registry count and start past the cap.
+      // The `<n>` in the fixed message below therefore counts running/queued children plus those already accepted
+      // in this batch; the wording is a fixed contract (tests and model self-correction) and must not change.
+      const running = this.countChildren(requester.id) + reserved;
+      const cap = this.deps.settings().maxChildrenPerParent;
+      if (!limitAllows(cap, running)) throw new Error(`you already have ${running} running or queued subagents (maxChildrenPerParent=${cap})`);
+    }
+  }
+
+  /** Direct children that hold or wait for a slot. */
+  private countChildren(id: string): number {
+    return this.deps.registry.list().filter((r) => r.parentId === id && (r.status === "running" || r.status === "queued")).length;
+  }
+
+  /**
+   * Gives every item/step its effective parent. The top-level `parentId` only ever comes from the trusted delegation
+   * path, so when it is present it wins outright over a `parentId` the item itself carries: `SubagentsParams` never
+   * declares the field, and a stray copy must neither re-attribute the run nor lift the delegating agent's
+   * depth/whitelist/child-cap policy. Without a top-level parent the item's own id is kept (internal callers may
+   * declare one) and validated fail-closed by `requesterFor()` before anything is created.
+   */
+  private inheritParent<T extends { parentId?: string }>(items: readonly T[], parentId: string | undefined): T[] {
+    if (!parentId) return [...items];
+    return items.map((item) => ({ ...item, parentId }));
+  }
+
+  /** Fail closed: an explicitly named parent with no record must never fall back to the main-session policy. */
+  private requireParent(id: string): SubagentRecord {
+    const record = this.deps.registry.get(id);
+    if (!record) throw new Error(`unknown parent subagent "${id}"`);
+    return record;
+  }
+
+  /** The record a request is attributed to, or undefined for the main session (depth 0, no whitelist). */
+  private requesterFor(parentId: string | undefined): SubagentRecord | undefined {
+    return parentId === undefined ? undefined : this.requireParent(parentId);
+  }
+
+  /** Every descendant of a record, nearest first. */
+  descendants(id: string): SubagentRecord[] {
+    const out: SubagentRecord[] = [];
+    // `visited` guards a corrupt registry (a parentId cycle): a cycle would otherwise recurse until the stack blows.
+    const visited = new Set<string>([id]);
+    const walk = (parentId: string) => {
+      for (const r of this.deps.registry.list()) {
+        if (r.parentId !== parentId || visited.has(r.id)) continue;
+        visited.add(r.id);
+        out.push(r);
+        walk(r.id);
+      }
+    };
+    walk(id);
+    return out;
+  }
+
+  /** Usage of every descendant, recursively (the record's own usage is not included). */
+  subtreeUsage(id: string): Usage {
+    return this.descendants(id).reduce((acc, r) => addUsage(acc, r.usage), { ...ZERO_USAGE });
+  }
+
   /** Resolves a run's working directory; the main cwd when omitted. Absolute inputs are normalized too, so equivalent paths compare equal. */
   resolveCwd(cwd: string | undefined): string {
     if (!cwd) return this.deps.cwd;
@@ -181,7 +316,8 @@ export class SubagentManager {
   }
 
   async run(req: RunRequest): Promise<RunOutcome> {
-    const resolved = this.resolveTarget(req, "run");
+    const requester = this.requesterFor(req.parentId);
+    const resolved = this.resolveTarget(req, "run", requester);
     const prepared = this.prepare(resolved, req);
     return this.launch(prepared, req.background ?? false, req.signal, {
       ...(req.receiverContextWindow ? { receiverContextWindow: req.receiverContextWindow } : {}),
@@ -190,10 +326,19 @@ export class SubagentManager {
   }
 
   /** Validates the request and creates the queued record (so it is listed and cancellable from the start). */
-  private prepare(resolved: Resolved, req: { delivery?: DeliveryMode; chainId?: string; stepIndex?: number }): Prepared {
+  private prepare(
+    resolved: Resolved,
+    req: { delivery?: DeliveryMode; chainId?: string; stepIndex?: number; parentId?: string },
+  ): Prepared {
     if (this.closed) throw shutDownError();
     if (this.deps.scheduler.disabled) throw new SubagentsDisabledError();
     const { agent, runner, cwd, trusted, entry } = resolved;
+    // A record's depth is always derived from its parent: the main session's subagents are depth 1. A `depth` passed
+    // by the caller is informational only (a node with no parent is a root, whatever the caller claimed).
+    // Fail closed again here (the callers already validated it): a parent that vanished between validation and
+    // creation must not silently turn into a root run under the main session's policy.
+    const parent = req.parentId ? this.requireParent(req.parentId) : undefined;
+    const depth = parent ? parent.depth + 1 : 1;
     // Runs started by the main agent's tool are always auto; `delivery` is only passed by internal callers.
     const delivery = req.delivery ?? "auto";
     // The record exists from the start so a run waiting for a slot is listed and can be cancelled by handle.
@@ -201,7 +346,8 @@ export class SubagentManager {
       agent: agent.name,
       preferredHandle: entry.kind === "agent" ? agent.handle ?? agent.name : entry.name,
       runner: runner.kind,
-      depth: 1,
+      depth,
+      ...(parent ? { parentId: parent.id } : {}),
       sessionFile: "",
       delivery,
       task: entry.prompt,
@@ -257,17 +403,28 @@ export class SubagentManager {
   }
 
   /** Starts every task at once (the scheduler still caps concurrency) and summarizes the group afterwards. */
-  async runParallel(req: { items: readonly BatchItem[]; background?: boolean; signal?: AbortSignal }): Promise<BatchOutcome> {
+  async runParallel(req: { items: readonly BatchItem[]; parentId?: string; background?: boolean; signal?: AbortSignal }): Promise<BatchOutcome> {
     if (this.closed) throw shutDownError();
-    if (req.items.length === 0) throw new Error("a parallel batch needs at least one item");
+    // A nested batch names its parent once at the top; each item inherits it unless it names one itself.
+    const items = this.inheritParent(req.items, req.parentId);
+    if (items.length === 0) throw new Error("a parallel batch needs at least one item");
     const max = this.deps.settings().maxParallelTasks;
     if (max === 0) throw new SubagentsDisabledError("parallel is disabled (maxParallelTasks is 0)");
     // The n-th task is allowed exactly when the previous n - 1 are within the limit (max -1 = unlimited).
-    if (!limitAllows(max, req.items.length - 1)) throw new Error(`too many parallel tasks (${req.items.length}); max is ${max}`);
+    if (!limitAllows(max, items.length - 1)) throw new Error(`too many parallel tasks (${items.length}); max is ${max}`);
     // Validate every entry, runner and cwd up front, before any record exists: a bad item must not leave a half-created
-    // batch behind (a queued record whose launch() is never reached would stay queued forever).
-    const targets = req.items.map((item) => this.resolveTarget(item, "parallel"));
-    const prepared = req.items.map((_item, i) => this.prepare(targets[i]!, {}));
+    // batch behind (a queued record whose launch() is never reached would stay queued forever). Items targeting the
+    // same parent also count against maxChildrenPerParent as a group, not one at a time (see `assertCanSpawn`).
+    const reserved = new Map<string, number>();
+    const targets = items.map((item) => {
+      const requester = this.requesterFor(item.parentId);
+      const held = requester ? reserved.get(requester.id) ?? 0 : 0;
+      const resolved = this.resolveTarget(item, "parallel", requester, held);
+      // Only an accepted item reserves a slot, so a rejected batch never counts toward the next one.
+      if (requester) reserved.set(requester.id, held + 1);
+      return resolved;
+    });
+    const prepared = items.map((item, i) => this.prepare(targets[i]!, { ...(item.parentId ? { parentId: item.parentId } : {}) }));
     // One item failing to start (runner.open, a cancel while queued/opening, shutdown) must not drop the others' results.
     const settled = Promise.allSettled(prepared.map((p) => this.launch(p, true, req.signal, { mode: "batch" })));
     const outcomes = settled.then((results) => results.map((result, i) => (result.status === "fulfilled" ? result.value : this.failureOutcome(prepared[i]!.record))));
@@ -284,29 +441,36 @@ export class SubagentManager {
   }
 
   /** Runs the steps one after another; a failing, interrupted or stopped step stops the chain and can be continued later. */
-  async runChain(req: { steps: readonly BatchItem[]; background?: boolean; signal?: AbortSignal }): Promise<BatchOutcome> {
+  async runChain(req: { steps: readonly BatchItem[]; parentId?: string; background?: boolean; signal?: AbortSignal }): Promise<BatchOutcome> {
     if (this.closed) throw shutDownError();
-    if (req.steps.length === 0) throw new Error("a chain needs at least one step");
+    // A nested chain names its parent once at the top; each step inherits it unless it names one itself.
+    const steps = this.inheritParent(req.steps, req.parentId);
+    if (steps.length === 0) throw new Error("a chain needs at least one step");
     const max = this.deps.settings().maxChainSteps;
     if (max === 0) throw new SubagentsDisabledError("chains are disabled (maxChainSteps is 0)");
-    if (!limitAllows(max, req.steps.length - 1)) throw new Error(`too many chain steps (${req.steps.length}); max is ${max}`);
+    if (!limitAllows(max, steps.length - 1)) throw new Error(`too many chain steps (${steps.length}); max is ${max}`);
     // Refuse before the chain exists when the scheduler is disabled (maxConcurrent 0): prepare() would throw
     // afterwards and leave a chain stuck in "running" with no step records and no way to continue it.
     if (this.deps.scheduler.disabled) throw new SubagentsDisabledError();
     // Validate every step's entry, runner and cwd before the chain exists, so a typo cannot leave a half-run chain behind.
     // Only the first step's task is fully known up front (`{previous}` is empty there); the rest are validated as they
     // run, and a later step that becomes empty after substitution fails the chain as usual.
-    req.steps.forEach((step, i) => {
+    steps.forEach((step, i) => {
       const task = i === 0 ? substitutePrevious(step.task ?? "", "") : step.task;
-      this.resolveTarget({ ...entryFields(step), ...(task === undefined ? {} : { task }) }, "chain");
+      this.resolveTarget({ ...entryFields(step), ...(task === undefined ? {} : { task }) }, "chain", this.requesterFor(step.parentId));
     });
     const chain = this.deps.chainStore.create({
       // Keep the entry kind of every step (skill / command steps have no base agent) so reload and continue can replay it.
-      steps: req.steps.map((s) => ({ ...entryFields(s), task: s.task ?? "" })),
+      steps: steps.map((s) => ({ ...entryFields(s), task: s.task ?? "" })),
     });
-    if (!req.background) return this.runChainLoop(chain, 0, "", req.signal);
+    // Each step keeps its own effective parent (a top-level delegation parent wins; otherwise the step's own id),
+    // matching `runParallel`'s per-item attribution instead of pinning the whole chain to the first step's parent.
+    // `chainStore` does not persist `parentId`, so the original `steps` array is the only source here; a continued
+    // chain falls back to the resumed record's parent instead (see `continueChainLoop`).
+    const parentOf = (index: number): string | undefined => steps[index]?.parentId;
+    if (!req.background) return this.runChainLoop(chain, 0, "", req.signal, [], parentOf);
     this.track(
-      this.runChainLoop(chain, 0, "", req.signal).then((outcome) => {
+      this.runChainLoop(chain, 0, "", req.signal, [], parentOf).then((outcome) => {
         this.sendBatch("chain", outcome.payload!, outcome.records, outcome.chain);
       }),
       (error) => this.reportBatchError(this.firstChainRecord(chain.id), error),
@@ -331,10 +495,14 @@ export class SubagentManager {
       );
     }
     // Validate the remaining steps before resuming, so a bad step cannot leave the chain half-advanced.
-    for (let i = index + 1; i < chain.steps.length; i++) this.resolveTarget(chain.steps[i]!, "chain");
-    if (!opts.background) return this.continueChainLoop(chain, record, index, message, opts.signal);
+    // `chainStore` does not persist a step's `parentId`, so the steps left in a continued chain can only inherit the
+    // resumed record's parent (the chain's original requester); an unknown one fails closed instead of becoming root.
+    for (let i = index + 1; i < chain.steps.length; i++) {
+      this.resolveTarget(chain.steps[i]!, "chain", this.requesterFor(record.parentId));
+    }
+    if (!opts.background) return this.continueChainLoop(chain, record, index, message, opts.signal, record.parentId);
     this.track(
-      this.continueChainLoop(chain, record, index, message, opts.signal).then((outcome) => {
+      this.continueChainLoop(chain, record, index, message, opts.signal, record.parentId).then((outcome) => {
         this.sendBatch("chain", outcome.payload!, outcome.records, outcome.chain);
       }),
       (error) => this.reportBatchError(this.firstChainRecord(chain.id), error),
@@ -355,11 +523,12 @@ export class SubagentManager {
     index: number,
     message: string | undefined,
     signal: AbortSignal | undefined,
+    parentId?: string,
   ): Promise<BatchOutcome> {
     // The process can die between a step finishing and the chain advancing: that step must not run a second time.
     if (record.status === "completed") {
       const current = this.deps.chainStore.update(chain.id, { status: "running", usage: this.chainUsage(chain) });
-      const rest = await this.runChainLoop(current, index + 1, record.lastSummary ?? "", signal, [{ record }]);
+      const rest = await this.runChainLoop(current, index + 1, record.lastSummary ?? "", signal, [{ record }], () => parentId);
       return { records: rest.records, payload: rest.payload, chain: rest.chain };
     }
     // Resume the step that stopped the chain so it keeps its own session, then run the remaining steps.
@@ -376,7 +545,7 @@ export class SubagentManager {
     }
     // The resumed step keeps its record id, so the chain usage stays the sum of every started step's record.
     const current = this.deps.chainStore.update(chain.id, { status: "running", usage: this.chainUsage(chain) });
-    const rest = await this.runChainLoop(current, index + 1, resumed.payload?.text ?? "", signal, [resumed]);
+    const rest = await this.runChainLoop(current, index + 1, resumed.payload?.text ?? "", signal, [resumed], () => parentId);
     // `runChainLoop` already carries the resumed outcome, so its records and payload span the whole chain.
     return { records: rest.records, payload: rest.payload, chain: rest.chain };
   }
@@ -387,6 +556,7 @@ export class SubagentManager {
     previous: string,
     signal: AbortSignal | undefined,
     outcomes: RunOutcome[] = [],
+    parentOf: (index: number) => string | undefined = () => undefined,
   ): Promise<BatchOutcome> {
     let current = chain;
     for (let i = from; i < chain.steps.length; i++) {
@@ -398,7 +568,17 @@ export class SubagentManager {
         // Re-resolve with the substituted task: the chain stores the original template, but the child must get the
         // substituted text. Name validation repeats here; a skill removed mid-chain settles the chain instead of
         // leaving it running (the catch below).
-        prepared = this.prepare(this.resolveTarget({ ...entryFields(step), task }, "chain"), { chainId: chain.id, stepIndex: i });
+        // Each step resolves its own effective parent so nested chain steps stay attributed to the delegating
+        // subagent; `parentOf` wins the trusted top-level parent over a step's own id (REVIEW-010) and fails closed
+        // on an unknown id. The chain's own `chain.steps` cannot carry it (not persisted), so `parentOf` indexes the
+        // original in-memory step list.
+        const parentId = parentOf(i);
+        const requester = this.requesterFor(parentId);
+        prepared = this.prepare(this.resolveTarget({ ...entryFields(step), task }, "chain", requester), {
+          chainId: chain.id,
+          stepIndex: i,
+          ...(parentId ? { parentId } : {}),
+        });
       } catch (error) {
         // prepare() can only fail before the step's record exists (shutdown or disabled between steps). Never leave
         // the chain stuck in "running": settle it to stopped/failed and let the caller or the background error path
@@ -510,9 +690,12 @@ export class SubagentManager {
   }
 
   /** Resolves a run's entry, agent, runner and cwd without creating a record, so a whole batch can be validated first. */
-  private resolveTarget(req: EntryRequest & { cwd?: string }, action: string): Resolved {
+  private resolveTarget(req: EntryRequest & { cwd?: string }, action: string, requester?: SubagentRecord, reserved = 0): Resolved {
     const entry = parseEntryRequest(req, action);
     const cwd = this.resolveCwd(req.cwd);
+    // The spawn policy is checked before name validation: a whitelist rejection must not depend on whether the target
+    // exists, and a restricted child must not get discovery results it is not allowed to use.
+    this.assertCanSpawn(requester, entry, reserved);
     if (entry.kind !== "agent") {
       validateEntryTarget(entry, { cwd, agentDir: this.deps.agentDir, agents: this.deps.agents() });
     }

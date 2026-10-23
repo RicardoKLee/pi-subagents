@@ -45,6 +45,56 @@ export type SubagentsInput = {
   action: "run" | "parallel" | "chain" | "resume" | "continue" | "steer" | "interrupt" | "stop" | "list";
 } & Partial<Omit<Static<typeof SubagentsParams>, "action">>;
 
+/**
+ * Internal delegation scope, threaded only by the child-session path (the `delegate()` host of M6).
+ * `SubagentsParams` deliberately knows nothing about it, so the model-visible tool schema never exposes a parent;
+ * `toolCallInput()` also drops a stray copy from raw model arguments, keeping the main-session path at requester
+ * `undefined` (depth 0, no whitelist).
+ */
+export interface DelegationScope {
+  /** Record id of the subagent that asked for this action; the manager derives the child's depth from that record. */
+  parentId?: string;
+  /** Informational only: the manager always derives depth from `parentId`, so a caller's claim is ignored. */
+  depth?: number;
+}
+
+/** A dispatch request: the model-visible input plus the internal delegation scope. */
+export type DispatchInput = SubagentsInput & DelegationScope;
+
+/**
+ * Strips the internal delegation fields from a tool call. Extra JSON properties are not part of `SubagentsParams`,
+ * but a model could still send one; it must never reach the manager as if it came from the internal delegation path.
+ * The top-level `parentId` and any `parentId` inside `tasks[]` / `chain[]` items are dropped (the model-visible
+ * schema declares the field nowhere).
+ */
+export function toolCallInput(params: SubagentsInput): SubagentsInput {
+  const candidate = params as SubagentsInput & { parentId?: unknown };
+  const tasks = stripItemParents(candidate.tasks);
+  const chain = stripItemParents(candidate.chain);
+  if (candidate.parentId === undefined && tasks === candidate.tasks && chain === candidate.chain) return params;
+  const { parentId: _internal, ...rest } = candidate;
+  return {
+    ...rest,
+    ...(tasks !== candidate.tasks ? { tasks } : {}),
+    ...(chain !== candidate.chain ? { chain } : {}),
+  };
+}
+
+/** Drops a stray `parentId` from every batch item; returns the original array when there is nothing to strip. */
+function stripItemParents<T>(items: readonly T[] | undefined): T[] | undefined {
+  if (!Array.isArray(items)) return undefined;
+  let changed = false;
+  const out = items.map((item) => {
+    if (!item || typeof item !== "object") return item;
+    const record = item as Record<string, unknown>;
+    if (record.parentId === undefined) return item;
+    const { parentId: _internal, ...rest } = record;
+    changed = true;
+    return rest as T;
+  });
+  return changed ? out : (items as T[]);
+}
+
 function need<T>(value: T | undefined, name: string, action: string): T {
   if (value === undefined || value === "") throw new Error(`action "${action}" requires "${name}"`);
   return value;
@@ -86,7 +136,7 @@ function batchResult(out: BatchOutcome, action: string): { text: string; details
 
 export async function executeAction(
   manager: SubagentManager,
-  input: SubagentsInput,
+  input: DispatchInput,
   signal?: AbortSignal,
 ): Promise<{ text: string; details: Record<string, unknown> }> {
   // Esc / session switch aborts the tool call; pause the children so the call can return.
@@ -102,7 +152,7 @@ export async function executeAction(
 
 async function dispatch(
   manager: SubagentManager,
-  input: SubagentsInput,
+  input: DispatchInput,
   signal?: AbortSignal,
 ): Promise<{ text: string; details: Record<string, unknown> }> {
   // `signal` is only added when present so callers without one see the same arguments as before.
@@ -111,6 +161,9 @@ async function dispatch(
     ...(input.background ? { background: true, delivery: "auto" as const } : {}),
     ...(signal ? { signal } : {}),
   };
+  // Internal only: the parent record the delegation path attributes runs to. The main agent's tool call never
+  // carries it, so `run`/`parallel`/`chain` keep the depth-0 requester (no whitelist) for the main session.
+  const parentId = input.parentId;
   switch (input.action) {
     case "run": {
       const entry = entryFields(input);
@@ -119,6 +172,7 @@ async function dispatch(
       parseEntryRequest(entry, "run");
       const { record, payload } = await manager.run({
         ...entry,
+        ...(parentId ? { parentId } : {}),
         ...(input.cwd ? { cwd: input.cwd } : {}),
         ...(input.background ? { background: true } : {}),
         ...(signal ? { signal } : {}),
@@ -129,6 +183,7 @@ async function dispatch(
     case "parallel": {
       const out = await manager.runParallel({
         items: needList(input.tasks, "tasks", "parallel"),
+        ...(parentId ? { parentId } : {}),
         background: input.background ?? false,
         ...(signal ? { signal } : {}),
       });
@@ -137,6 +192,7 @@ async function dispatch(
     case "chain": {
       const out = await manager.runChain({
         steps: needList(input.chain, "chain", "chain"),
+        ...(parentId ? { parentId } : {}),
         background: input.background ?? false,
         ...(signal ? { signal } : {}),
       });

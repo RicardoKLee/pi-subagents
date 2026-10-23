@@ -18,7 +18,7 @@ import { type ModelResolver, SdkRunner, defaultProjectTrust } from "./runner/sdk
 import type { Runner } from "./runner/types.ts";
 import { Scheduler } from "./scheduler.ts";
 import { loadSettings, type DeliveryMode, type SubagentSettings } from "./settings.ts";
-import { executeAction, SubagentsParams, type SubagentsInput } from "./tool.ts";
+import { executeAction, SubagentsParams, toolCallInput, type SubagentsInput } from "./tool.ts";
 import { renderTree, TREE_ENTRY_TYPE, type TreeEntryData, type TreeView } from "./tree.ts";
 
 const PRIVATE_PREVIEW_LINES = 20;
@@ -361,7 +361,9 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
         if (!state) throw new Error("pi-subagents is not initialised for this session yet");
         state.ctx = ctx;
-        const out = await executeAction(state.manager, params as SubagentsInput, signal);
+        // The model's arguments never carry the internal delegation parent: `toolCallInput` drops a stray copy so
+        // the main session always dispatches as the depth-0 requester with no whitelist.
+        const out = await executeAction(state.manager, toolCallInput(params as SubagentsInput), signal);
         return { content: [{ type: "text", text: out.text }], details: out.details };
       },
     });
