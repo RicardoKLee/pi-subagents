@@ -11,21 +11,17 @@ const BatchItem = Type.Object({
   cwd: Type.Optional(Type.String({ description: "Working directory (defaults to the main session's)" })),
 });
 
+/**
+ * Every action the `subagents` tool accepts. The schema union, the delegating session's gate and the dispatcher all
+ * read this one list, so adding an action cannot silently miss one of them (REVIEW-040).
+ */
+export const SUBAGENT_ACTIONS = ["run", "parallel", "chain", "resume", "continue", "steer", "interrupt", "stop", "list"] as const;
+
 // TODO(delivery): background results from the main agent are always delivered with "auto". Add a `delivery`
 // parameter back if a use case appears (plan section 6.5 item 4).
 export const SubagentsParams = Type.Object({
   action: Type.Union(
-    [
-      Type.Literal("run"),
-      Type.Literal("parallel"),
-      Type.Literal("chain"),
-      Type.Literal("resume"),
-      Type.Literal("continue"),
-      Type.Literal("steer"),
-      Type.Literal("interrupt"),
-      Type.Literal("stop"),
-      Type.Literal("list"),
-    ],
+    SUBAGENT_ACTIONS.map((action) => Type.Literal(action)),
     { description: "run = new subagent; parallel = many at once; chain = sequential with {previous}; resume = continue a finished/paused one by handle; continue = resume the step that stopped a chain and finish it" },
   ),
   agent: Type.Optional(Type.String({ description: "Agent name (run); give exactly one of agent, skill or command" })),
@@ -42,7 +38,7 @@ export const SubagentsParams = Type.Object({
 });
 
 export type SubagentsInput = {
-  action: "run" | "parallel" | "chain" | "resume" | "continue" | "steer" | "interrupt" | "stop" | "list";
+  action: (typeof SUBAGENT_ACTIONS)[number];
 } & Partial<Omit<Static<typeof SubagentsParams>, "action">>;
 
 /**
@@ -232,5 +228,9 @@ async function dispatch(
       const records = manager.list();
       return { text: renderTree(records, "list", manager.listChains()), details: { count: records.length } };
     }
+    default:
+      // Every `SubagentsParams` action has a branch above; this is unreachable through the tool schema. It turns a
+      // future action added only to the schema into a clear error instead of a silent `undefined` result (REVIEW-040).
+      throw new Error("unsupported subagents action");
   }
 }

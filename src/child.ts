@@ -1,4 +1,6 @@
+import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { callViaMailbox } from "./mailbox.ts";
 import { SubagentsParams } from "./tool.ts";
 
 export interface DelegationHost {
@@ -48,14 +50,28 @@ export function childExtension(opts: ChildDelegationOptions): ExtensionFactory {
 }
 
 /**
- * The RPC child's host: it hands one delegation request to the owning session through the file mailbox.
- * TODO(mailbox): milestone 6 task 3 replaces this placeholder with `callViaMailbox()` from `./mailbox.ts`; the tool
- * contract (`DelegationHost`) and the wiring in `index.ts` are already final, so only the transport changes.
+ * The RPC child's host: it hands one delegation request to the owning session through the file mailbox
+ * (`callViaMailbox`) and waits for that session's manager to answer.
  */
 export function mailboxHost(dir: string, parentRecordId: string): DelegationHost {
   return {
-    async request(_parentRecordId, _payload, _signal) {
-      throw new Error(`delegation from an RPC child is not wired up yet (mailbox ${dir || "(none)"}, parent ${parentRecordId || "(none)"})`);
+    async request(_parentRecordId, payload, signal) {
+      let response;
+      try {
+        response = await callViaMailbox(dir, { id: randomUUID(), parentRecordId, payload }, { ...(signal ? { signal } : {}) });
+      } catch (error) {
+        // REVIEW-023: the child's model must never see the internal mailbox path. A filesystem error (ENOTDIR and so
+        // on) embeds it, so strip every occurrence before it becomes a tool error the model can read.
+        throw new Error(withoutMailboxPath(error instanceof Error ? error.message : String(error), dir));
+      }
+      if (!response.ok) throw new Error(withoutMailboxPath(response.error ?? "delegation failed", dir));
+      return { text: response.text ?? "", details: response.details };
     },
   };
+}
+
+/** Removes the mailbox directory from an error message so a child never learns an internal path (REVIEW-023). */
+function withoutMailboxPath(message: string, dir: string): string {
+  if (!dir) return message;
+  return message.split(dir).join("<mailbox>");
 }

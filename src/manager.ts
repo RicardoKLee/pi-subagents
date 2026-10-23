@@ -1,16 +1,18 @@
+import { Value } from "typebox/value";
 import { existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import type { AgentDef } from "./agents.ts";
 import { type ChainRecord, type ChainStatus, ChainStore } from "./chain.ts";
 import { type Ask, deliver, type DeliveryPort, deliverBatch, quoteAsk, renderAsks } from "./delivery.ts";
 import { BUILTIN_ENTRY_AGENT_DEF, type EntryRequest, parseEntryRequest, type ResolvedEntry, validateEntryTarget } from "./entries.ts";
+import { type MailboxErrorInfo, MailboxServer } from "./mailbox.ts";
 import { estimateTokens, type Payload, preparePayload, SUMMARY_INSTRUCTION, writeOutput } from "./output.ts";
 import { recordEntryLabel, type Registry, type RunStatus, type SubagentRecord, type Usage, ZERO_USAGE } from "./registry.ts";
 import type { ChildDelegation, ChildResult, ChildSession, Runner } from "./runner/types.ts";
 import { type Scheduler, SubagentsDisabledError } from "./scheduler.ts";
 import type { DeliveryMode, RunnerKind, SubagentSettings } from "./settings.ts";
 import { limitAllows } from "./settings.ts";
-import { executeAction, type DispatchInput, type SubagentsInput } from "./tool.ts";
+import { executeAction, SUBAGENT_ACTIONS, SubagentsParams, type DispatchInput, type SubagentsInput } from "./tool.ts";
 import { renderTree } from "./tree.ts";
 
 export type SubagentErrorCode =
@@ -29,6 +31,13 @@ export class SubagentError extends Error {
     this.name = "SubagentError";
   }
 }
+
+/**
+ * The actions a delegation request may carry, taken from the one action list the tool schema is built from (REVIEW-040).
+ * The mailbox hands the manager arbitrary JSON, so the action is checked here (REVIEW-033) instead of trusting that
+ * every request came from the model-validated tool schema.
+ */
+const DELEGATION_ACTIONS = new Set<string>(SUBAGENT_ACTIONS);
 
 export interface ManagerDeps {
   registry: Registry;
@@ -155,6 +164,8 @@ export class SubagentManager {
   private readonly closing = new Map<string, Promise<void>>();
   /** Sessions whose onExit is already wired (a session is parked many times). */
   private readonly watched = new WeakSet<ChildSession>();
+  /** The file mailbox that serves delegations from RPC children while at least one can ask (M6). */
+  private mailbox?: MailboxServer;
   private closed = false;
   /** Aborted on shutdown so queued run/resume calls stop waiting for a slot. */
   private readonly lifetime = new AbortController();
@@ -319,9 +330,25 @@ export class SubagentManager {
    * through the mailbox by an RPC child (plan 6.9 items 1 and 2).
    */
   async delegate(parentRecordId: string, payload: Record<string, unknown>, signal?: AbortSignal): Promise<{ text: string; details: Record<string, unknown> }> {
+    // REVIEW-033: the mailbox can hand the manager arbitrary JSON, so validate the action before it reaches the
+    // dispatcher (an unknown one would otherwise fall through its switch and yield a confusing TypeError).
+    const action = payload?.action;
+    if (typeof action !== "string" || !DELEGATION_ACTIONS.has(action)) {
+      throw new Error(`unknown action ${JSON.stringify(action)}; valid actions are ${[...DELEGATION_ACTIONS].join(", ")}`);
+    }
+    if (!Value.Check(SubagentsParams, payload)) {
+      // The mailbox can deliver any JSON, and the model-visible schema is the only shape the dispatcher understands.
+      // A malformed request is refused with one controlled sentence instead of leaking a TypeError (REVIEW-037).
+      throw new Error("invalid delegation request");
+    }
     const parent = this.deps.registry.get(parentRecordId);
     if (!parent) throw new Error(`unknown parent subagent ${parentRecordId}`);
-    const input = payload as SubagentsInput;
+    // `SubagentsParams` never declares the internal delegation fields, so a stray copy must not reach the dispatcher
+    // as if the trusted path had set it: this method applies the real parent itself (see `inheritParent`).
+    const rest: Record<string, unknown> = { ...payload };
+    delete rest.parentId;
+    delete rest.depth;
+    const input = rest as SubagentsInput;
     if (input.action === "list") {
       // A child sees only its own subtree: never its parent, its siblings, or its parent's other branches.
       const records = this.descendants(parent.id);
@@ -361,12 +388,35 @@ export class SubagentManager {
 
   /** Starts the mailbox poller while at least one child session may delegate. */
   private ensureMailbox(): void {
-    // TODO(mailbox): milestone 6 task 3 starts a MailboxServer here and stops it in maybeStopMailbox().
+    const dir = this.deps.mailboxDir;
+    if (!dir || this.mailbox) return;
+    // The handler is the same `delegate` the in-process SDK host calls, so both transports enforce identical scope.
+    this.mailbox = new MailboxServer(dir, (req) => this.delegate(req.parentRecordId, req.payload).then((out) => ({ id: req.id, parentRecordId: req.parentRecordId, ok: true, text: out.text, details: out.details })), {
+      // Mailbox failures (a response that could not be written, an unreadable directory) are surfaced through the
+      // manager's existing delivery-error channel instead of disappearing (REVIEW-038).
+      onError: (info) => this.reportMailboxError(info),
+    });
+    this.mailbox.start();
   }
 
-  /** Stops the mailbox poller once no child can ask any more. */
+  /** Maps a mailbox failure onto the child that asked for it, with the manager's existing notifier (REVIEW-038). */
+  private reportMailboxError(info: MailboxErrorInfo): void {
+    const record = info.parentRecordId ? this.deps.registry.get(info.parentRecordId) : undefined;
+    if (!record) return;
+    try {
+      this.deps.onDeliveryError?.(record, `mailbox: ${info.message}`);
+    } catch {
+      // The notifier must never turn a mailbox failure into an unhandled rejection.
+    }
+  }
+
+  /** Stops the mailbox poller once no child can ask any more (or the manager shut down). */
   private maybeStopMailbox(): void {
-    // TODO(mailbox): milestone 6 task 3 stops the MailboxServer here.
+    if (!this.mailbox) return;
+    // A closed manager can never serve another request; otherwise keep polling while any child is live, claiming or queued.
+    if (!this.closed && (this.live.size || this.claims.size || this.queued.size)) return;
+    this.mailbox.stop();
+    this.mailbox = undefined;
   }
 
   /** Resolves a run's working directory; the main cwd when omitted. Absolute inputs are normalized too, so equivalent paths compare equal. */
@@ -453,12 +503,13 @@ export class SubagentManager {
       this.queued.delete(record.id);
       throw this.settleQueued(record.id, error, signal);
     }
+    let delegation: ChildDelegation | undefined;
     let session: ChildSession;
     try {
       // A child of a session that has a mailbox may delegate: the runner turns this into the in-process proxy
       // extension (SDK) or `-ne -e <this extension>` plus the PI_SUBAGENTS_* env (RPC). `delegationFor` decides
       // whether the child gets the tool at all (depth/permission); the manager remains the only authority.
-      const delegation = this.delegationSpecFor(record);
+      delegation = this.delegationSpecFor(record);
       session = await runner.open({
         agent,
         cwd,
@@ -478,6 +529,19 @@ export class SubagentManager {
       release();
       await this.close(record.id, session);
       throw this.settleQueued(record.id, this.closed ? shutDownError() : runInterruptedError(), signal);
+    }
+    // Started only once the session is genuinely opening a turn: a failed open above must not leave a poller behind.
+    if (delegation?.canDelegate) {
+      try {
+        this.ensureMailbox();
+      } catch (error) {
+        // `mailboxDir` could not be created (a plain file, permissions). Failing through the normal path releases the
+        // scheduler slot, closes the child session and settles the record, so nothing stays queued (REVIEW-036).
+        this.maybeStopMailbox();
+        release();
+        await this.close(record.id, session);
+        throw this.settleQueued(record.id, error, signal);
+      }
     }
     const running = this.deps.registry.update(record.id, { status: "running", sessionFile: session.sessionFile });
     return this.execute(running, session, prepared.prompt, release, background, signal, options.asks ?? [], options);
@@ -850,13 +914,14 @@ export class SubagentManager {
       return new SubagentError("stopped", `@${record.handle} was stopped while waiting to resume`);
     };
     let release: () => void;
+    let delegation: ChildDelegation | undefined;
     let session: ChildSession;
     try {
       release = await this.deps.scheduler.acquire(claim.controller.signal);
       try {
         // A resumed child that may delegate must get its proxy tool back (REVIEW-021): recompute the delegation for
         // this record instead of dropping it, exactly as launch() does.
-        const delegation = this.delegationSpecFor(record);
+        delegation = this.delegationSpecFor(record);
         session =
           (await this.takeIdle(record)) ??
           // takeIdle has waited for any close of this record still in flight, so the file has no other writer.
@@ -898,6 +963,19 @@ export class SubagentManager {
       release();
       await this.close(record.id, session);
       throw stoppedWhileWaiting();
+    }
+    if (delegation?.canDelegate) {
+      try {
+        this.ensureMailbox();
+      } catch (error) {
+        // As in launch(): a mailbox that cannot be created must release the slot, close the session and roll the
+        // record back to the status it had before this resume, never leaving it stuck running (REVIEW-036).
+        this.maybeStopMailbox();
+        release();
+        await this.close(record.id, session);
+        this.deps.registry.update(record.id, previous);
+        throw error;
+      }
     }
     return this.execute(claimed, session, message, release, opts.background ?? false, signal, opts.mention ? [this.ask("ask", message)] : [], {
       ...(opts.mode ? { mode: opts.mode } : {}),
@@ -992,6 +1070,8 @@ export class SubagentManager {
     // Idle children and children already closing (evicted, pruned, stopped); interrupted live children close as their
     // runs end, which whenIdle() waits for.
     await Promise.all([...this.closing.values()]);
+    // Shutdown is terminal: no child may ask again, so the poller stops even if a live run has not unwound yet.
+    this.maybeStopMailbox();
   }
 
   /** After a branch switch: close idle children whose record is no longer on this branch (tracked by whenIdle/shutdown). */
@@ -1087,6 +1167,8 @@ export class SubagentManager {
         release();
         // A child that is not kept has finished closing before the run ends, as in M2.
         await this.park(record.id, session, live);
+        // The last live child of a delegating session just ended: stop polling an empty mailbox (review point 4).
+        this.maybeStopMailbox();
       }
       try {
         return this.finish(record.id, result, live, background, leafId, options);
