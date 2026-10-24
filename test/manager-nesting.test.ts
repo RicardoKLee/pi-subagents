@@ -107,6 +107,18 @@ describe("nesting attribution", () => {
   });
 });
 
+describe("nested working directory", () => {
+  it("runs a nested delegation in the parent's working directory", async () => {
+    const { manager, runner } = setup({ scripts: [[ok("p")], [ok("c")]] });
+    const other = tempDir("nest-cwd-");
+    const { record: parent } = await manager.run({ agent: "lead", task: "p", cwd: other });
+    expect(runner.opened[0]!.cwd).toBe(other);
+    await manager.delegate(parent.id, { action: "run", agent: "worker", task: "x", background: true });
+    await manager.whenIdle();
+    expect(runner.opened[1]!.cwd).toBe(other);
+  });
+});
+
 describe("nesting limits", () => {
   it("allows one nesting level by default and stops at the depth limit", async () => {
     const { manager } = setup({ scripts: [[ok("p")], [ok("c")]] });

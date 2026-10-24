@@ -13,6 +13,9 @@ describe("parseMention", () => {
     ["@Reviewer hi", { form: "bare", handle: "reviewer", raw: "Reviewer", message: "hi" }],
     ["@reviewer", { form: "bare", handle: "reviewer", raw: "reviewer", message: "" }],
     ["@reviewer\nline two", { form: "bare", handle: "reviewer", raw: "reviewer", message: "line two" }],
+    ["@lead/worker hi", { form: "bare", handle: "lead/worker", raw: "lead/worker", message: "hi" }],
+    ["@lead/worker? hi", { form: "bare", handle: "lead/worker", raw: "lead/worker", delivery: "private", message: "hi" }],
+    ["@a/b/c hi", { form: "bare", handle: "a/b/c", raw: "a/b/c", message: "hi" }],
   ])("parses %j", (text, expected) => {
     expect(parseMention(text)).toEqual(expected);
   });
@@ -132,6 +135,16 @@ describe("routeMention", () => {
 
   it("reports a malformed @sub: reference", () => {
     expect(routeMention("@sub: hi", ctx([]))).toMatchObject({ action: "error" });
+  });
+
+  it("resolves a parent/child path and reports an unknown one", () => {
+    const records = [record("lead", "completed"), record("worker", "completed")];
+    const base = ctx(records);
+    const c: typeof base = { ...base, resolve: (h) => (h.includes("/") ? (h === "lead/worker" ? records[1] : undefined) : records.find((r) => r.handle === h)) };
+    expect(routeMention("@lead/worker hi", c)).toMatchObject({ action: "resume", handle: "worker" });
+    // A path is explicit: an unknown one is an error, not a file mention passed to the model.
+    expect(routeMention("@lead/nope hi", c)).toMatchObject({ action: "error", message: expect.stringContaining("lead/nope") });
+    expect(routeMention("@src/index.ts explain", c)).toEqual({ action: "pass" });
   });
 
   it("ignores text that is not a mention", () => {

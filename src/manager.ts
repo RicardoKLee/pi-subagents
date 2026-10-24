@@ -224,6 +224,15 @@ export class SubagentManager {
    * path is just its handle. Used by the `@` completion description and by path addressing, so a nested handle can be
    * told apart from a root one.
    */
+  /** Non-throwing, path-aware lookup used by the `@` router (`@lead/worker` resolves like the tool's handle). */
+  findRecord(handle: string): SubagentRecord | undefined {
+    try {
+      return this.requireRecord(handle);
+    } catch {
+      return undefined;
+    }
+  }
+
   recordPath(record: SubagentRecord): string {
     const parts = [record.handle];
     // `seen` guards a corrupt registry (a parentId cycle), exactly like `ancestorChain`.
@@ -498,7 +507,9 @@ export class SubagentManager {
     if (input.action === "run" || input.action === "parallel" || input.action === "chain") {
       // Only spawning actions create records, so only they need the parent; resume/continue/steer/interrupt/stop act
       // on a record that already exists.
-      return executeAction(this, { ...scoped, parentId: parent.id, depth: parent.depth + 1, ...(detach ? { detach: true } : {}) }, signal, noCascade);
+      // A nested run works where its parent works unless the caller asked for another directory.
+      const inherit = parent.cwd && !payload.cwd ? { cwd: parent.cwd } : {};
+      return executeAction(this, { ...scoped, ...inherit, parentId: parent.id, depth: parent.depth + 1, ...(detach ? { detach: true } : {}) }, signal, noCascade);
     }
     return executeAction(this, { ...scoped, ...(detach ? { detach: true } : {}) }, signal, noCascade);
   }

@@ -280,7 +280,7 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
       state.ctx = ctx;
       const current = state;
       const route = routeMention(event.text, {
-        resolve: (handle) => current.registry.resolve(handle),
+        resolve: (handle) => current.manager.findRecord(handle),
         known: () => current.registry.list().map((r) => r.handle),
         fileExists,
         defaultDelivery: current.settings.defaultDelivery,
