@@ -355,6 +355,35 @@ describe("pending edge cases", () => {
 });
 
 describe("foreground delegation yields the scheduler slot", () => {
+  it("sizes drained results for the caller while internal delivery uses the parent's window", async () => {
+    const big = `CHILD-${"z".repeat(3000)}`;
+    // The caller (main session) has a small window, the parent agent's model window is large, the parent stays resident.
+    const { manager, runner, registry } = setup({ hold: true, settings: { maxResident: 4 }, contextWindow: 500, leadWindow: 200_000, scripts: [[ok("lead")], [ok(big)], [ok(big)]] });
+    const { record: parent } = await manager.run({ agent: "lead", task: "plan", background: true });
+    // The parked session must look like it is still at the record's leaf, or delivery would open a fresh session.
+    runner.sessions[0]!.leafId = "leaf-parent";
+    runner.sessions[0]!.finish();
+    await expect.poll(() => runner.sessions[0]!.prompts.length).toBe(1);
+
+    await manager.run(nested(parent, { agent: "worker", task: "x", background: true }) as never);
+    runner.sessions[1]!.finish();
+    // Delivery resumes the resident parent: its large window keeps the merged text inline (no extra file).
+    await expect.poll(() => runner.sessions[0]!.prompts.length).toBe(2);
+    expect(runner.sessions[0]!.prompts[1]).toContain("worker-run1");
+    expect(runner.sessions[0]!.prompts[1]).not.toContain("lead-child-results");
+
+    // Pause that delivered turn, then let another child finish: it must queue instead of injecting.
+    await manager.interrupt(parent.handle);
+    await manager.whenIdle();
+    await manager.run(nested(parent, { agent: "worker", task: "b", background: true }) as never);
+    runner.sessions[2]!.finish();
+    await expect.poll(() => (registry.get(parent.id)!.pending ?? []).length).toBe(1);
+    // A caller with a small window gets the merged text moved to a file instead.
+    const drained = await manager.drainPending(parent.handle);
+    expect(drained.text).toContain("lead-child-results");
+    expect(registry.get(parent.id)!.pending ?? []).toHaveLength(0);
+  });
+
   it("yields the parent's slot while it waits for a child", async () => {
     const { manager, runner, scheduler } = setup({ limit: 1, hold: true, scripts: [[ok("lead")], [ok("child")]] });
     const { record: parent } = await manager.run({ agent: "lead", task: "plan", background: true });

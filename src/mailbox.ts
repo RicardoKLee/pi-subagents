@@ -37,6 +37,11 @@ export interface MailboxResponse {
  * can ever wait: a response file older than it can never be claimed, and is therefore safe to delete (REVIEW-034).
  */
 const DEFAULT_TIMEOUT_MS = 30_000;
+/**
+ * How long a child waits for its delegation answer. A foreground grandchild run is a full agent turn, so it can take
+ * far longer than a control command: this is deliberately generous, and a caller may still override it.
+ */
+export const DELEGATION_TIMEOUT_MS = 30 * 60_000;
 const DEFAULT_CLIENT_POLL_MS = 25;
 /** The main process scans its mailbox at 200ms (plan 6.9 decision 1). */
 const DEFAULT_SERVER_POLL_MS = 200;
@@ -119,7 +124,7 @@ export async function callViaMailbox(dir: string, req: MailboxRequest, opts: Mai
   const paths = ensureMailbox(dir);
   const requestFile = join(paths.requests, `${req.id}.json`);
   const responseFile = join(paths.responses, `${req.id}.json`);
-  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const timeoutMs = opts.timeoutMs ?? DELEGATION_TIMEOUT_MS;
   // A non-positive poll would spin on the event loop (setTimeout(0)) instead of waiting; clamp it (REVIEW-041).
   const pollMs = Math.max(1, opts.pollMs ?? DEFAULT_CLIENT_POLL_MS);
   writeFileSync(requestFile, JSON.stringify(req), { mode: 0o600 });

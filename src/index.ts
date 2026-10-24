@@ -20,7 +20,7 @@ import type { Runner } from "./runner/types.ts";
 import { Scheduler } from "./scheduler.ts";
 import { loadSettings, limitAllows, type DeliveryMode, type SubagentSettings } from "./settings.ts";
 import { executeAction, SubagentsParams, toolCallInput, type SubagentsInput } from "./tool.ts";
-import { renderTree, TREE_ENTRY_TYPE, type TreeEntryData, type TreeView } from "./tree.ts";
+import { pendingReminderText, renderTree, TREE_ENTRY_TYPE, type TreeEntryData, type TreeView } from "./tree.ts";
 
 const PRIVATE_PREVIEW_LINES = 20;
 
@@ -210,10 +210,7 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
         trustForCwd: (cwd) => (resolvePath(cwd) === mainCwd ? (state?.ctx ?? ctx).isProjectTrusted?.() : defaultProjectTrust(cwd, agentDir)),
         onDeliveryError: (record, message) => notify(`result of @${record.handle} was not delivered: ${message}`, "warning"),
         onPendingReminder: (record, count, minutes) =>
-          notify(
-            `@${record.handle} is paused with ${count} child result(s) waiting (${minutes}m). Resume it with "@${record.handle} …", hand them over with subagents action=drain handle=${record.handle}, or discard them with action=drop handle=${record.handle}.`,
-            "warning",
-          ),
+          notify(pendingReminderText(record, count, minutes, state?.manager.recordPath(record) ?? record.handle), "warning"),
         onRecordCreated: (record) => {
           if (existsSync(join(ctx.cwd, record.handle))) {
             warnOnce(`@${record.handle} has the same name as a file in ${ctx.cwd}; use @sub:${record.handle} to reach the subagent`);
@@ -349,7 +346,6 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
           pi.appendEntry<TreeEntryData>(TREE_ENTRY_TYPE, { view, text: renderTree(state?.registry.list() ?? [], view, state?.manager.listChains() ?? []) });
         },
       });
-  
       // `/sub` creates a subagent without going through the main model; the symbol in the command name picks the delivery.
       const SUB_COMMANDS: { name: string; delivery?: DeliveryMode }[] = [
         { name: "sub" },
@@ -407,7 +403,8 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
           "Delegate work to named, persistent subagents. action=run starts a new one from exactly one entry — agent (needs task), skill or command — and returns its @handle. " +
           "action=parallel runs many at once; chain runs steps in order, where {previous} is the previous step's output; continue resumes the step that stopped a chain and finishes it. " +
           "action=resume continues an existing one in its own context (handle + message); prefer it when the user wants the same subagent to revise its work. " +
-          "action=steer guides a running one; interrupt pauses; stop ends it permanently; list shows all.",
+          "action=steer guides a running one; interrupt pauses; stop ends it (and every descendant); list shows all; " +
+          "action=drain hands a paused parent's waiting child results to the caller; action=drop discards them.",
         parameters: SubagentsParams,
         async execute(_toolCallId, params, signal, _onUpdate, ctx) {
           if (!state) throw new Error("pi-subagents is not initialised for this session yet");

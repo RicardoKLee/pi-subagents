@@ -1609,11 +1609,12 @@ export class SubagentManager {
   }
 
   /** The merged message for pending child results, sized for the parent's model window (30% rule). */
-  childResultsText(parent: SubagentRecord, entries: readonly PendingResult[]): string {
+  childResultsText(parent: SubagentRecord, entries: readonly PendingResult[], receiverWindow?: number): string {
     const sections = entries.map((e) => `### [@${e.handle}] completed\n${e.summary}\nSession: ${e.sessionFile}${e.filePath ? `\nFull output: ${e.filePath}` : ""}`);
     const text = sections.join("\n\n");
     const agent = this.deps.agents().get(parent.agent);
-    const receiverContextWindow = (agent ? this.deps.receiverContextWindowFor?.(agent) : undefined) ?? this.deps.receiverContextWindow();
+    // A caller (drain) can pass its own window: the text is then sized for whoever receives it, not for the parent.
+    const receiverContextWindow = receiverWindow ?? ((agent ? this.deps.receiverContextWindowFor?.(agent) : undefined) ?? this.deps.receiverContextWindow());
     return preparePayload({
       text,
       receiverContextWindow,
@@ -1662,7 +1663,7 @@ export class SubagentManager {
     const record = this.requireRecord(handle);
     const pending = record.pending ?? [];
     if (!pending.length) return { text: "no child results are waiting", count: 0 };
-    const text = this.childResultsText(record, pending);
+    const text = this.childResultsText(record, pending, this.deps.receiverContextWindow());
     this.deps.registry.update(record.id, { pending: [], pendingNotifiedAt: undefined });
     return { text, count: pending.length };
   }

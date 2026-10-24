@@ -4,7 +4,7 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import type { AgentDef } from "../src/agents.ts";
 import { ChainStore } from "../src/chain.ts";
 import { mailboxHost } from "../src/child.ts";
-import { callViaMailbox, ensureMailbox, MailboxServer, mailboxPaths, type MailboxErrorInfo, type MailboxRequest } from "../src/mailbox.ts";
+import { callViaMailbox, DELEGATION_TIMEOUT_MS, ensureMailbox, MailboxServer, mailboxPaths, type MailboxErrorInfo, type MailboxRequest } from "../src/mailbox.ts";
 import { SubagentManager } from "../src/manager.ts";
 import { Registry } from "../src/registry.ts";
 import type { ChildResult } from "../src/runner/types.ts";
@@ -127,6 +127,10 @@ describe("callViaMailbox", () => {
     // The client removes the request it wrote and the response it consumed: nothing is left behind.
     expect(readdirSync(paths.requests)).toHaveLength(0);
     expect(readdirSync(paths.responses)).toHaveLength(0);
+  });
+
+  it("waits far longer than a control command for a delegation answer", () => {
+    expect(DELEGATION_TIMEOUT_MS).toBeGreaterThanOrEqual(30 * 60_000);
   });
 
   it("times out when nobody answers", async () => {
