@@ -1507,10 +1507,18 @@ export class SubagentManager {
     // Private instructions are never shown to it.
     const shown = live.asks.filter((a) => !a.private);
     if (!background && shown.length) payload = { ...payload, text: `${renderAsks(current.handle, shown)}\n\n${payload.text}` };
+    if (record.parentId && status === "completed" && !batch) {
+      // A nested run hands its result to its own parent, never to the main session. A paused parent cannot take it
+      // right now (this includes a foreground delegation whose tool call was interrupted with the parent), so it is
+      // queued for its resume instead of being dropped.
+      const parent = registry.get(record.parentId);
+      if (parent?.status === "paused") this.queuePending(parent, this.pendingEntry(record, payload));
+      else if (background) this.routeChildResult(record, payload);
+      // A foreground run with a live parent is delivered by the tool result itself.
+    }
     if (background && !batch && status !== "stopped" && status !== "paused") {
       if (record.parentId) {
-        // A nested run hands its result to its own parent, never to the main session.
-        if (status === "completed") this.routeChildResult(record, payload);
+        // (already handled above)
       } else {
         // Only a private run's own private entry may quote private instructions.
         const quoted = record.delivery === "private" ? live.asks : shown;
@@ -1540,18 +1548,23 @@ export class SubagentManager {
     return { record, payload };
   }
 
-  /** Hands a finished child's result to its parent: continue it, queue into it, or wait for its resume. */
-  private routeChildResult(child: SubagentRecord, payload: Payload): void {
-    const parent = this.deps.registry.get(child.parentId!);
-    if (!parent) return;
-    this.routeToParent(parent, {
+  /** The queue entry for a finished child's result. */
+  private pendingEntry(child: SubagentRecord, payload: Payload): PendingResult {
+    return {
       fromId: child.id,
       handle: child.handle,
       summary: payload.summary,
       sessionFile: child.sessionFile,
       ...(payload.filePath ? { filePath: payload.filePath } : {}),
       at: this.now(),
-    });
+    };
+  }
+
+  /** Hands a finished child's result to its parent: continue it, queue into it, or wait for its resume. */
+  private routeChildResult(child: SubagentRecord, payload: Payload): void {
+    const parent = this.deps.registry.get(child.parentId!);
+    if (!parent) return;
+    this.routeToParent(parent, this.pendingEntry(child, payload));
   }
 
   /**

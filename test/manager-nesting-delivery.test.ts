@@ -118,6 +118,22 @@ describe("child result delivery", () => {
     expect(registry.get(parent.id)!.pending ?? []).toHaveLength(0);
   });
 
+  it("queues a foreground child when the parent was interrupted while it ran", async () => {
+    const { manager, runner, registry } = setup({ hold: true, scripts: [[ok("lead")], [ok("child")]] });
+    const { record: parent } = await manager.run({ agent: "lead", task: "plan", background: true });
+    await manager.interrupt(parent.handle);
+    await manager.whenIdle();
+
+    // A foreground nested run (the parent's tool call is not awaiting any more: it was interrupted).
+    const pendingChild = manager.run(nested(parent, { agent: "worker", task: "x" }) as never);
+    await expect.poll(() => runner.sessions.length).toBe(2);
+    runner.sessions[1]!.finish();
+    const child = await pendingChild;
+    expect(child.record.status).toBe("completed");
+    expect(runner.sessions[1]!.delivered).toEqual([]);
+    expect(registry.get(parent.id)!.pending?.map((p) => p.handle)).toEqual(["worker"]);
+  });
+
   it("queues into a running parent instead of starting a turn", async () => {
     const { manager, runner } = setup({ hold: true, scripts: [[ok("lead")], [ok("child")]] });
     const { record: parent } = await manager.run({ agent: "lead", task: "plan", background: true });
