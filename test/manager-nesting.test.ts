@@ -282,3 +282,210 @@ describe("nesting limits", () => {
     expect(runner.opened).toHaveLength(3);
   });
 });
+
+describe("nesting addressing and cascade stop", () => {
+  const statuses = (registry: Registry, ids: readonly string[]): string[] => ids.map((id) => registry.get(id)!.status);
+
+  it("stops every descendant", async () => {
+    const { manager, runner, registry } = setup({ hold: true, settings: { maxDepth: 3 } });
+    const { record: root } = await manager.run({ agent: "top", task: "root", background: true });
+    const { record: child } = await manager.run(nested(root, { agent: "mid", task: "child", background: true }) as never);
+    const { record: grand } = await manager.run(nested(child, { agent: "worker", task: "grand", background: true }) as never);
+    expect(statuses(registry, [root.id, child.id, grand.id])).toEqual(["running", "running", "running"]);
+    // The path spells out the whole ancestor chain, root first.
+    expect(manager.recordPath(grand)).toBe("top/mid/worker");
+
+    await manager.stop(root.handle);
+    await manager.whenIdle();
+
+    expect(statuses(registry, [root.id, child.id, grand.id])).toEqual(["stopped", "stopped", "stopped"]);
+    // A cascade stop aborts and disposes every child session, not just the target's.
+    expect(runner.sessions.map((s) => s.disposed)).toEqual([true, true, true]);
+  });
+
+  it("interrupt leaves descendants running", async () => {
+    const { manager, registry } = setup({ hold: true, settings: { maxDepth: 3 } });
+    const { record: root } = await manager.run({ agent: "top", task: "root", background: true });
+    const { record: child } = await manager.run(nested(root, { agent: "mid", task: "child", background: true }) as never);
+
+    await manager.interrupt(root.handle);
+    await expect.poll(() => registry.get(root.id)!.status).toBe("paused");
+    // Decision 8: an interrupt never cascades, so the child keeps running.
+    expect(registry.get(child.id)!.status).toBe("running");
+
+    // Cleanup, explicitly per record: this test must not depend on the cascade it is checking the absence of.
+    await manager.stop(child.handle);
+    await manager.stop(root.handle);
+    await manager.whenIdle();
+  });
+
+  it("resolves a parent/child path and reports the children when it fails", async () => {
+    const { manager, registry } = setup({ settings: { maxDepth: 3 }, scripts: [[ok("root")], [ok("child")], [ok("resumed")]] });
+    const { record: root } = await manager.run({ agent: "top", task: "root" });
+    const { record: child } = await manager.run(nested(root, { agent: "mid", task: "child" }) as never);
+
+    // The path resolves to the same record as the bare child handle.
+    const resumed = await manager.resume(`${root.handle}/${child.handle}`, "again");
+    expect(resumed.record.id).toBe(child.id);
+    expect(registry.get(child.id)!.runId).toBe(2);
+
+    // A miss under a resolved parent names that parent and its direct children.
+    const message = await manager.resume(`${root.handle}/nope`, "again").then(
+      () => "",
+      (error: Error) => error.message,
+    );
+    expect(message).toMatch(/no subagent ".*nope".*children of @/s);
+    expect(message).toContain(`@${child.handle}`);
+  });
+
+  it("stops idempotently and discards the child results waiting for the parent", async () => {
+    const { manager, runner, registry } = setup({ hold: true, settings: { maxDepth: 3 }, scripts: [[ok("lead")], [ok("child")]] });
+    const { record: parent } = await manager.run({ agent: "top", task: "lead", background: true });
+    await manager.interrupt(parent.handle);
+    await expect.poll(() => registry.get(parent.id)!.status).toBe("paused");
+
+    const child = manager.run(nested(parent, { agent: "mid", task: "child", background: true }) as never);
+    await expect.poll(() => runner.sessions.length).toBe(2);
+    runner.sessions[1]!.finish();
+    await child;
+    await manager.whenIdle();
+    expect(registry.get(parent.id)!.pending ?? []).toHaveLength(1);
+
+    // Decision 9: stopping the parent drops the queued child results.
+    await manager.stop(parent.handle);
+    expect(registry.get(parent.id)!.status).toBe("stopped");
+    expect(registry.get(parent.id)!.pending ?? []).toEqual([]);
+    expect(registry.get(parent.id)!.pendingNotifiedAt).toBeUndefined();
+
+    // A second stop is a no-op: it neither throws nor changes the record.
+    await expect(manager.stop(parent.handle)).resolves.toBeUndefined();
+    expect(registry.get(parent.id)!.status).toBe("stopped");
+  });
+
+  it("resolves a path inside a child's own subtree but never another branch", async () => {
+    const { manager, registry } = setup({ settings: { maxDepth: 4 } });
+    const { record: root } = await manager.run({ agent: "top", task: "root" });
+    const { record: childA } = await manager.run(nested(root, { agent: "mid", task: "childA" }) as never);
+    const { record: childB } = await manager.run(nested(root, { agent: "mid", task: "childB" }) as never);
+    const { record: grandA } = await manager.run(nested(childA, { agent: "worker", task: "grandA" }) as never);
+    const { record: greatA } = await manager.run(nested(grandA, { agent: "worker", task: "greatA" }) as never);
+    const { record: grandB } = await manager.run(nested(childB, { agent: "worker", task: "grandB" }) as never);
+
+    // A path relative to the delegating child's own subtree resolves and addresses that record.
+    const stopped = await manager.delegate(childA.id, { action: "stop", handle: `${grandA.handle}/${greatA.handle}` });
+    expect(stopped.text).toContain("stopped");
+    expect(registry.get(greatA.id)!.status).toBe("stopped");
+
+    // A path that leaves that subtree is refused with the scope-only message: no parent, no sibling, no `Known:`.
+    const message = await manager.delegate(childA.id, { action: "stop", handle: `${childB.handle}/${grandB.handle}` }).then(
+      () => "",
+      (error: Error) => error.message,
+    );
+    expect(message).toMatch(/is not one of your subagents/);
+    // The refusal names only the requested value: no global `Known:` inventory, no parent and no sibling.
+    expect(message).toBe(`@${childB.handle}/${grandB.handle} is not one of your subagents`);
+    expect(message).not.toMatch(/Known:/);
+    expect(registry.get(childB.id)!.status).toBe("completed");
+    expect(registry.get(grandB.id)!.status).toBe("completed");
+  });
+
+  it("stops queued descendants without opening their sessions", async () => {
+    const { manager, runner, registry } = setup({ limit: 1, hold: true, settings: { maxDepth: 3 }, scripts: [[ok("root")], [ok("holder")]] });
+    const { record: root } = await manager.run({ agent: "top", task: "root", background: true });
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+    expect(registry.get(root.id)!.status).toBe("completed");
+
+    // An unrelated live run holds the only slot, so both descendants stay queued with no child session.
+    await manager.run({ agent: "top", task: "holder", background: true });
+    const { record: child } = await manager.run(nested(root, { agent: "mid", task: "child", background: true, detach: true }) as never);
+    const { record: grand } = await manager.run(nested(child, { agent: "worker", task: "grand", background: true, detach: true }) as never);
+    expect(statuses(registry, [root.id, child.id, grand.id])).toEqual(["completed", "queued", "queued"]);
+    expect(runner.sessions).toHaveLength(2);
+
+    await manager.stop(root.handle);
+    // The queued descendants are cancelled for the cascade too, even under a completed root.
+    expect(statuses(registry, [root.id, child.id, grand.id])).toEqual(["stopped", "stopped", "stopped"]);
+
+    await manager.shutdown();
+    await manager.whenIdle();
+    // The slot stayed held by the unrelated run, so the cancelled descendants never opened a session.
+    expect(runner.sessions).toHaveLength(2);
+  });
+
+  it("stops paused and completed descendants in the same cascade", async () => {
+    const { manager, runner, registry } = setup({ limit: 2, hold: true, settings: { maxDepth: 3 }, scripts: [[ok("root")], [ok("child")], [ok("grand")]] });
+    const { record: root } = await manager.run({ agent: "top", task: "root", background: true });
+    const { record: child } = await manager.run(nested(root, { agent: "mid", task: "child", background: true }) as never);
+    expect(statuses(registry, [root.id, child.id])).toEqual(["running", "running"]);
+
+    // Pause the child: its run ends, but the record is neither queued nor live when the cascade reaches it.
+    await manager.interrupt(child.handle);
+    await expect.poll(() => registry.get(child.id)!.status).toBe("paused");
+
+    // A grandchild that finished its own turn before the cascade: a completed record is still marked stopped.
+    const { record: grand } = await manager.run(nested(child, { agent: "worker", task: "grand", background: true }) as never);
+    runner.sessions[2]!.finish();
+    await expect.poll(() => registry.get(grand.id)!.status).toBe("completed");
+
+    await manager.stop(root.handle);
+    await manager.whenIdle();
+
+    expect(statuses(registry, [root.id, child.id, grand.id])).toEqual(["stopped", "stopped", "stopped"]);
+  });
+
+  it("cancels a descendant's pending resume claim", async () => {
+    // Two slots let the tree run and finish; both are then held by unrelated runs, so a resume of the completed
+    // descendant claims the record but cannot start until a slot frees (the claim `stopRecord` must cancel).
+    const { manager, runner, registry } = setup({ limit: 2, hold: true, settings: { maxDepth: 3 }, scripts: [[ok("root")], [ok("child")], [ok("grand")], [ok("h1")], [ok("h2")]] });
+    const { record: root } = await manager.run({ agent: "top", task: "root", background: true });
+    runner.sessions[0]!.finish();
+    await expect.poll(() => registry.get(root.id)!.status).toBe("completed");
+    const { record: child } = await manager.run(nested(root, { agent: "mid", task: "child", background: true }) as never);
+    runner.sessions[1]!.finish();
+    await expect.poll(() => registry.get(child.id)!.status).toBe("completed");
+    const { record: grand } = await manager.run(nested(child, { agent: "worker", task: "grand", background: true }) as never);
+    runner.sessions[2]!.finish();
+    await expect.poll(() => registry.get(grand.id)!.status).toBe("completed");
+
+    // Hold both slots with runs that are not part of the subtree, so stopping the completed root frees nothing.
+    await manager.run({ agent: "top", task: "h1", background: true });
+    await manager.run({ agent: "top", task: "h2", background: true });
+    const claimed = await manager.resume(grand.handle, "again", { background: true, detach: true });
+    expect(claimed.record.status).toBe("running");
+    expect(runner.opened).toHaveLength(5);
+
+    await manager.stop(root.handle);
+    expect(registry.get(grand.id)!.status).toBe("stopped");
+
+    await manager.shutdown();
+    await manager.whenIdle();
+    // The claimed resume was aborted by the cascade before it could open a session.
+    expect(runner.opened).toHaveLength(5);
+  });
+
+  it("prefers a handle or id lookup and never resolves a later path segment globally", async () => {
+    const { manager, registry } = setup({ settings: { maxDepth: 3 }, scripts: [[ok("root")], [ok("child")], [ok("other")], [ok("again")], [ok("again")]] });
+    const { record: root } = await manager.run({ agent: "top", task: "root" });
+    const { record: child } = await manager.run(nested(root, { agent: "mid", task: "child" }) as never);
+    const { record: other } = await manager.run({ agent: "top", task: "other" });
+
+    // A bare record id still resolves through the whole-string handle/id lookup.
+    const byId = await manager.resume(child.id, "again");
+    expect(byId.record.id).toBe(child.id);
+
+    // Every path segment may also be a record id, not only a handle.
+    const byPathIds = await manager.resume(`${root.id}/${child.id}`, "again");
+    expect(byPathIds.record.id).toBe(child.id);
+
+    // `other` is a known global handle but not a direct child of `root`: a later segment must never fall back to it.
+    const message = await manager.resume(`${root.handle}/${other.handle}`, "again").then(
+      () => "",
+      (error: Error) => error.message,
+    );
+    expect(message).toMatch(new RegExp(`no subagent ".*"; children of @${root.handle}`));
+    expect(message).toContain(`@${child.handle}`);
+    expect(message).not.toContain(`@${other.handle}`);
+    expect(registry.get(other.id)!.runId).toBe(1);
+  });
+});

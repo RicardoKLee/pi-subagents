@@ -219,6 +219,24 @@ export class SubagentManager {
     return this.deps.chainStore.list();
   }
 
+  /**
+   * The `父/子` path of a record: the handle of every ancestor from the root down, then its own handle. A root record's
+   * path is just its handle. Used by the `@` completion description and by path addressing, so a nested handle can be
+   * told apart from a root one.
+   */
+  recordPath(record: SubagentRecord): string {
+    const parts = [record.handle];
+    // `seen` guards a corrupt registry (a parentId cycle), exactly like `ancestorChain`.
+    const seen = new Set<string>([record.id]);
+    for (let current = record.parentId ? this.deps.registry.get(record.parentId) : undefined; current; ) {
+      if (seen.has(current.id)) break;
+      seen.add(current.id);
+      parts.unshift(current.handle);
+      current = current.parentId ? this.deps.registry.get(current.parentId) : undefined;
+    }
+    return parts.join("/");
+  }
+
   /** The effective spawn policy for a record: depth plus the intersection of its ancestors' whitelists. */
   private requesterPolicy(record: SubagentRecord): { depth: number; allowed: Set<string> | null } {
     let allowed: Set<string> | null = null;
@@ -324,6 +342,18 @@ export class SubagentManager {
     return parentId === undefined ? undefined : this.requireParent(parentId);
   }
 
+  /** The direct children of a record, in creation order. */
+  private directChildren(id: string): SubagentRecord[] {
+    return this.deps.registry.list().filter((r) => r.parentId === id);
+  }
+
+  /** One segment of a `父/子` path below a known parent: a direct child matched by handle or by record id. */
+  // TODO(addressing): wildcard paths like @*/scout and cross-parent fuzzy matching are explicitly out of scope
+  // (plan 6.9 decision 7).
+  private childBySegment(parent: SubagentRecord, segment: string): SubagentRecord | undefined {
+    return this.directChildren(parent.id).find((r) => r.id === segment || r.handle === segment.toLowerCase());
+  }
+
   /** Every descendant of a record, nearest first. */
   descendants(id: string): SubagentRecord[] {
     const out: SubagentRecord[] = [];
@@ -348,16 +378,26 @@ export class SubagentManager {
 
   /**
    * Resolves a delegated `handle` against the delegating record's own subtree. This is deliberately narrower than
-   * `requireRecord`: a handle that does not exist and a handle that exists in another tree are refused with the same
-   * text, which names only the requested handle and never the global inventory (plan 6.9 item 7, REVIEW-026).
-   * Both the short handle and the record id resolve, matching `Registry.resolve`.
-   *
-   * TODO(addressing): task 5 extends this to `父/子` paths — split the cleaned value on "/" and walk direct children
-   * segment by segment, keeping this single-segment lookup as the leaf case; the subtree gate stays the only gate.
+   * `requireRecord`: a handle or path that does not exist and one that exists in another tree are refused with the
+   * same text, which names only the requested value and never the global inventory (plan 6.9 item 7, REVIEW-026).
+   * A single segment resolves anywhere in the subtree, matching `Registry.resolve`; a `父/子` path is relative to the
+   * delegating record, so every segment must be a direct child of the previous one and the subtree gate stays the
+   * only gate. The refusal text must not change: it must never list parents, siblings or the global `Known:` set.
    */
   private resolveOwnedRecord(parent: SubagentRecord, handle: string): SubagentRecord {
     const cleaned = handle.replace(/^@/, "");
-    const target = this.descendants(parent.id).find((r) => r.id === cleaned || r.handle === cleaned.toLowerCase());
+    const segments = cleaned.split("/").filter((segment) => segment.length > 0);
+    let target: SubagentRecord | undefined;
+    if (segments.length > 1) {
+      let current: SubagentRecord | undefined = parent;
+      for (const segment of segments) {
+        current = current ? this.childBySegment(current, segment) : undefined;
+        if (!current) break;
+      }
+      target = current;
+    } else {
+      target = this.descendants(parent.id).find((r) => r.id === cleaned || r.handle === cleaned.toLowerCase());
+    }
     if (!target) throw new Error(`@${cleaned} is not one of your subagents`);
     return target;
   }
@@ -1191,8 +1231,39 @@ export class SubagentManager {
     return "paused";
   }
 
+  /**
+   * Stops a record and every descendant. The target is marked first (which also drops the child results waiting for it,
+   * plan 6.9 decision 9), then the descendant snapshot taken before any marking is stopped top-down. Every state is
+   * covered (queued, claiming a resume, live, paused, completed) and stopping twice is a no-op. Unlike `interrupt`,
+   * which only aborts the target's current turn, a stop ends the whole subtree.
+   */
   async stop(handle: string): Promise<void> {
     const record = this.requireRecord(handle);
+    // Take the snapshot before anything is marked: the cascade must still reach a descendant whose record the stop of
+    // its parent could otherwise make unreachable.
+    const descendants = this.descendants(record.id);
+    const persistErrors: unknown[] = [];
+    // A failed persist must not stop the cascade: the record is still stopped in memory and the queued/claiming run is
+    // cancelled below by `stopRecord`. The first error is rethrown at the end, so a stop that could not be persisted
+    // still rejects (and a cancelled run never starts, as `cancelQueued` guarantees).
+    const mark = (id: string): void => {
+      try {
+        this.markStoppedAndDiscardPending(id);
+      } catch (error) {
+        persistErrors.push(error);
+      }
+    };
+    mark(record.id);
+    await this.stopRecord(record);
+    for (const descendant of descendants) {
+      mark(descendant.id);
+      await this.stopRecord(descendant);
+    }
+    if (persistErrors.length) throw persistErrors[0];
+  }
+
+  /** Stops one record's own run; its descendants are the caller's concern (see `stop`). */
+  private async stopRecord(record: SubagentRecord): Promise<void> {
     if (this.cancelQueued(record)) return;
     // Start closing the idle child synchronously (before any await), and return only once it has finished closing.
     const closingIdle = this.closeIdle(record.id);
@@ -1202,16 +1273,13 @@ export class SubagentManager {
         // A resume is still waiting for a slot or a session; cancel it.
         claim.intent = "stop";
         claim.controller.abort();
-        this.markStopped(record.id);
         return;
       }
       const live = this.live.get(record.id);
       if (live) {
         live.intent = "stop";
         await live.session.abort();
-        return;
       }
-      if (record.status !== "stopped") this.deps.registry.update(record.id, { status: "stopped" });
     } finally {
       await closingIdle;
     }
@@ -1720,6 +1788,18 @@ export class SubagentManager {
     if (this.deps.registry.get(id)?.status !== "stopped") this.deps.registry.update(id, { status: "stopped" });
   }
 
+  /**
+   * Marks a record stopped and drops the child results waiting for it (plan 6.9 decision 9: a stopped parent discards
+   * them). Idempotent: a record already stopped with nothing queued is left untouched.
+   */
+  private markStoppedAndDiscardPending(id: string): void {
+    const record = this.deps.registry.get(id);
+    if (!record) return;
+    const queued = (record.pending ?? []).length > 0 || record.pendingNotifiedAt !== undefined;
+    if (record.status === "stopped" && !queued) return;
+    this.deps.registry.update(id, { status: "stopped", ...(queued ? { pending: [], pendingNotifiedAt: undefined } : {}) });
+  }
+
   private requireAgent(name: string): AgentDef {
     const agents = this.deps.agents();
     const agent = agents.get(name);
@@ -1733,8 +1813,29 @@ export class SubagentManager {
     return runner;
   }
 
+  /**
+   * Resolves a `父/子` path: the first segment is any record and every later segment must be a direct child of the
+   * previous one. Returns undefined when the first segment does not resolve at all (the caller then reports the
+   * existing global miss); a miss below a resolved parent names that parent's direct children instead.
+   */
+  private resolvePath(cleaned: string): SubagentRecord | undefined {
+    let current: SubagentRecord | undefined;
+    for (const segment of cleaned.split("/").filter((s) => s.length > 0)) {
+      const next = current ? this.childBySegment(current, segment) : this.deps.registry.resolve(segment);
+      if (!next) {
+        if (!current) return undefined;
+        const children = this.directChildren(current.id).map((r) => `@${r.handle}`).join(", ") || "(none)";
+        throw new SubagentError("unknown_handle", `no subagent "${cleaned}"; children of @${current.handle}: ${children}`);
+      }
+      current = next;
+    }
+    return current;
+  }
+
   private requireRecord(handle: string): SubagentRecord {
-    const record = this.deps.registry.resolve(handle.replace(/^@/, ""));
+    const cleaned = handle.replace(/^@/, "");
+    // The existing handle/id lookup stays first; the `父/子` path branch is only tried when that misses.
+    const record = this.deps.registry.resolve(cleaned) ?? this.resolvePath(cleaned);
     if (!record) {
       const known = this.deps.registry.list().map((r) => `@${r.handle}`).join(", ") || "(none)";
       throw new SubagentError("unknown_handle", `no subagent "${handle}". Known: ${known}`);

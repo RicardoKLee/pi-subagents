@@ -236,9 +236,13 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
       if (ctx.hasUI && completionUi !== ctx.ui) {
         completionUi = ctx.ui;
         ctx.ui.addAutocompleteProvider((current) =>
-          mentionProvider(current, () =>
-            (state?.registry.list() ?? []).map((r) => ({ handle: r.handle, agent: recordEntryLabel(r), status: r.status, clash: fileExists(r.handle) })),
-          ),
+          mentionProvider(current, () => {
+            const manager = state?.manager;
+            if (!manager) return [];
+            return manager
+              .list()
+              .map((r) => ({ handle: r.handle, agent: recordEntryLabel(r), status: r.status, clash: fileExists(r.handle), path: manager.recordPath(r) }));
+          }),
         );
       }
     });

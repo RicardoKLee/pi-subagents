@@ -33,6 +33,14 @@ describe("mentionItems", () => {
     expect(mentionItems("@reviewer again", candidates)).toBeUndefined();
     expect(mentionItems("@nothing", candidates)).toBeUndefined();
   });
+
+  it("shows the nesting path in the description", () => {
+    const nested: MentionCandidate[] = [{ handle: "scout", agent: "scout", status: "running", clash: false, path: "reviewer/scout" }];
+    expect(mentionItems("@sc", nested)).toEqual({
+      prefix: "@sc",
+      items: [{ value: "@scout", label: "@scout", description: "scout · running · reviewer/scout" }],
+    });
+  });
 });
 
 function baseProvider(items: { value: string; label: string }[] | null): AutocompleteProvider {
