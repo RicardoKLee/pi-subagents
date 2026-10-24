@@ -10,6 +10,8 @@ const SYMBOLS: Record<string, DeliveryMode> = { "?": "private", "!": "auto", "~"
 const MENTION = /^@(sub:)?([^\s?!~]*)([?!~])?(?=\s|$)([\s\S]*)$/;
 /** Handles are slugs (see handles.ts); bare mentions accept any casing, @sub: requires the slug form. */
 const BARE_HANDLE = /^[a-z0-9][a-z0-9-]*$/i;
+/** `parent/child` paths address a subagent inside the tree; every segment is a handle. */
+const BARE_PATH = /^[a-z0-9][a-z0-9-]*(?:\/[a-z0-9][a-z0-9-]*)+$/i;
 const NS_HANDLE = /^[a-z0-9][a-z0-9-]*$/;
 
 export interface Mention {
@@ -29,7 +31,8 @@ export function parseMention(text: string): Mention | { error: string } | undefi
   if (!match) return text.startsWith("@sub:") ? { error: "invalid @sub: reference; use @sub:<handle> <message>" } : undefined;
   const [, ns, raw = "", symbol, rest = ""] = match;
   const form = ns ? "ns" : "bare";
-  if (!(form === "ns" ? NS_HANDLE : BARE_HANDLE).test(raw)) {
+  const bareOk = BARE_HANDLE.test(raw) || BARE_PATH.test(raw);
+  if (form === "ns" ? !NS_HANDLE.test(raw) : !bareOk) {
     return form === "ns" ? { error: `invalid @sub: reference "@sub:${raw}"; handles use a-z, 0-9 and -` } : undefined;
   }
   return {
@@ -74,7 +77,8 @@ export function routeMention(text: string, ctx: RouteContext): Route {
 
   const record = ctx.resolve(handle);
   if (!record) {
-    if (form === "bare") return { action: "pass" };
+    // A path (`parent/child`) is as explicit as the `@sub:` form: an unknown one is an error, not a file mention.
+    if (form === "bare" && !handle.includes("/")) return { action: "pass" };
     const known = ctx.known().map((h) => `@${h}`).join(", ") || "(none)";
     return { action: "error", message: `no subagent @${handle}. Known: ${known}` };
   }

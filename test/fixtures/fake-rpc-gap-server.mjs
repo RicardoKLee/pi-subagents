@@ -6,8 +6,9 @@
 //   turns:       [{ messages: [...], aborted?: boolean }, ...]          message_end payloads emitted per prompt
 //   strayOnStats: [n, ...]               before answering the n-th (0-based) get_session_stats, emit a stray assistant message
 //   recordFile:  path                    write { argv, cwd, env } here at start
+//   logFile:     path                    append { type, message } for every command received (deliver/proxy tests)
 // Extra argv (e.g. a "--gap-tag <id>" pair) is ignored; it only makes the process findable in /proc.
-import { writeFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 
 const config = JSON.parse(process.env.GAP_CONFIG ?? "{}");
 const write = (o) => process.stdout.write(`${JSON.stringify(o)}\n`);
@@ -29,6 +30,7 @@ if (config.startExit) {
   let statsCalls = 0;
   let turn = 0;
   const handle = (cmd) => {
+    if (config.logFile) appendFileSync(config.logFile, `${JSON.stringify({ type: cmd.type, message: cmd.message })}\n`);
     if ((config.hang ?? []).includes(cmd.type)) return;
     switch (cmd.type) {
       case "get_state":

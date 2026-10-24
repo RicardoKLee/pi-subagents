@@ -6,6 +6,8 @@ export const usage = (cost = 0.01): Usage => ({ input: 10, output: 5, cacheRead:
 export class FakeSession implements ChildSession {
   readonly prompts: string[] = [];
   readonly steers: { text: string; mode: string }[] = [];
+  /** Results injected through deliver(), in call order (M6 nesting). */
+  readonly delivered: { text: string; mode: "start" | "queue" }[] = [];
   aborted = 0;
   disposed = false;
   /** Tests set this to simulate the child session's current leaf entry. */
@@ -58,6 +60,10 @@ export class FakeSession implements ChildSession {
 
   async steer(text: string, mode: "steer" | "followUp"): Promise<void> {
     this.steers.push({ text, mode });
+  }
+
+  async deliver(text: string, mode: "start" | "queue"): Promise<void> {
+    this.delivered.push({ text, mode });
   }
 
   /** Mirrors pi: an aborted prompt resolves with stopReason "aborted". */

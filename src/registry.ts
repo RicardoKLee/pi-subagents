@@ -17,6 +17,16 @@ export interface Usage {
 
 export const ZERO_USAGE: Usage = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
 
+/** A finished child's result that could not be delivered yet (its parent was paused). */
+export interface PendingResult {
+  fromId: string;
+  handle: string;
+  summary: string;
+  sessionFile: string;
+  filePath?: string;
+  at: number;
+}
+
 export interface SubagentRecord {
   id: string;
   handle: string;
@@ -44,6 +54,10 @@ export interface SubagentRecord {
   usage: Usage;
   lastSummary?: string;
   error?: string;
+  /** Results from direct children waiting for this parent to resume. */
+  pending?: PendingResult[];
+  /** When the current pending batch was last reported to the user (reminder dedupe). */
+  pendingNotifiedAt?: number;
 }
 
 /** The entry an existing record was started from: `skill:<name>` / `command:<name>` for skill and command entries, the base agent name otherwise. */
@@ -69,10 +83,15 @@ export interface NewRecord {
   stepIndex?: number;
   /** "queued" while the run waits for a slot and a child session; defaults to "running". */
   status?: "queued" | "running";
+  /** Child results that are already waiting when the record is created (rare; used by rebuild/restore paths). */
+  pending?: PendingResult[];
 }
 
 export type RecordPatch = Partial<
-  Pick<SubagentRecord, "status" | "runId" | "lastSummary" | "error" | "delivery" | "task" | "entry" | "sessionFile" | "childLeafId" | "cwd" | "chainId" | "stepIndex">
+  Pick<
+    SubagentRecord,
+    "status" | "runId" | "lastSummary" | "error" | "delivery" | "task" | "entry" | "sessionFile" | "childLeafId" | "cwd" | "chainId" | "stepIndex" | "pending" | "pendingNotifiedAt"
+  >
 >;
 
 function isRecord(value: unknown): value is SubagentRecord {
@@ -128,6 +147,7 @@ export class Registry {
       ...(input.entry ? { entry: { ...input.entry } } : {}),
       ...(input.cwd ? { cwd: input.cwd } : {}),
       ...(input.chainId ? { chainId: input.chainId, stepIndex: input.stepIndex ?? 0 } : {}),
+      ...(input.pending ? { pending: input.pending.map((p) => ({ ...p })) } : {}),
       createdAt: t,
       updatedAt: t,
       usage: { ...ZERO_USAGE },

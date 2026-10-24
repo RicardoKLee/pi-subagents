@@ -4,6 +4,8 @@ export interface MentionCandidate {
   handle: string;
   agent: string;
   status: string;
+  /** `父/子` path of a nested handle; absent for a root record (the description stays as before). */
+  path?: string;
   /** A file or directory with this name exists in the cwd, so only `@sub:<handle>` reaches the subagent. */
   clash: boolean;
 }
@@ -21,7 +23,7 @@ export function mentionItems(textBeforeCursor: string, candidates: readonly Ment
     .filter((c) => c.handle.startsWith(query))
     .map((c) => {
       const value = ns || c.clash ? `@sub:${c.handle}` : `@${c.handle}`;
-      return { value, label: value, description: `${c.agent} · ${c.status}` };
+      return { value, label: value, description: `${c.agent} · ${c.status}${c.path ? ` · ${c.path}` : ""}` };
     });
   return items.length ? { items, prefix: textBeforeCursor } : undefined;
 }

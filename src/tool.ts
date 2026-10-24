@@ -11,22 +11,18 @@ const BatchItem = Type.Object({
   cwd: Type.Optional(Type.String({ description: "Working directory (defaults to the main session's)" })),
 });
 
+/**
+ * Every action the `subagents` tool accepts. The schema union, the delegating session's gate and the dispatcher all
+ * read this one list, so adding an action cannot silently miss one of them (REVIEW-040).
+ */
+export const SUBAGENT_ACTIONS = ["run", "parallel", "chain", "resume", "continue", "steer", "interrupt", "stop", "drain", "drop", "list"] as const;
+
 // TODO(delivery): background results from the main agent are always delivered with "auto". Add a `delivery`
 // parameter back if a use case appears (plan section 6.5 item 4).
 export const SubagentsParams = Type.Object({
   action: Type.Union(
-    [
-      Type.Literal("run"),
-      Type.Literal("parallel"),
-      Type.Literal("chain"),
-      Type.Literal("resume"),
-      Type.Literal("continue"),
-      Type.Literal("steer"),
-      Type.Literal("interrupt"),
-      Type.Literal("stop"),
-      Type.Literal("list"),
-    ],
-    { description: "run = new subagent; parallel = many at once; chain = sequential with {previous}; resume = continue a finished/paused one by handle; continue = resume the step that stopped a chain and finish it" },
+    SUBAGENT_ACTIONS.map((action) => Type.Literal(action)),
+    { description: "run = new subagent; parallel = many at once; chain = sequential with {previous}; resume = continue a finished/paused one by handle; continue = resume the step that stopped a chain and finish it; drain = hand a paused parent's waiting child results to the caller; drop = discard them" },
   ),
   agent: Type.Optional(Type.String({ description: "Agent name (run); give exactly one of agent, skill or command" })),
   skill: Type.Optional(Type.String({ description: "Skill name (run), run as /skill:<name> in the child" })),
@@ -42,8 +38,66 @@ export const SubagentsParams = Type.Object({
 });
 
 export type SubagentsInput = {
-  action: "run" | "parallel" | "chain" | "resume" | "continue" | "steer" | "interrupt" | "stop" | "list";
+  action: (typeof SUBAGENT_ACTIONS)[number];
 } & Partial<Omit<Static<typeof SubagentsParams>, "action">>;
+
+/**
+ * Internal delegation scope, threaded only by the child-session path (the `delegate()` host of M6).
+ * `SubagentsParams` deliberately knows nothing about it, so the model-visible tool schema never exposes a parent;
+ * `toolCallInput()` also drops a stray copy from raw model arguments, keeping the main-session path at requester
+ * `undefined` (depth 0, no whitelist).
+ */
+export interface DelegationScope {
+  /** Record id of the subagent that asked for this action; the manager derives the child's depth from that record. */
+  parentId?: string;
+  /** Informational only: the manager always derives depth from `parentId`, so a caller's claim is ignored. */
+  depth?: number;
+  /**
+   * Set only by the delegation path for a background action: run/resume return the queued handle without waiting for a
+   * scheduler slot (LATENT-046-BG). The model-visible tool never sets it; `delegate()` derives it from `background`.
+   */
+  detach?: boolean;
+}
+
+/** A dispatch request: the model-visible input plus the internal delegation scope. */
+export type DispatchInput = SubagentsInput & DelegationScope;
+
+/**
+ * Strips the internal delegation fields from a tool call. Extra JSON properties are not part of `SubagentsParams`,
+ * but a model could still send one; it must never reach the manager as if it came from the internal delegation path.
+ * The top-level `parentId`, the internal `detach` flag and any `parentId` inside `tasks[]` / `chain[]` items are dropped
+ * (the model-visible schema declares none of them).
+ */
+export function toolCallInput(params: SubagentsInput): SubagentsInput {
+  const candidate = params as SubagentsInput & { parentId?: unknown; detach?: unknown };
+  const tasks = stripItemParents(candidate.tasks);
+  const chain = stripItemParents(candidate.chain);
+  const internal = candidate.parentId !== undefined || candidate.detach !== undefined;
+  if (!internal && tasks === candidate.tasks && chain === candidate.chain) return params;
+  // `parentId` re-attributes a run and `detach` would make it fire-and-forget; dropping both keeps the main session
+  // at depth 0 with its normal blocking semantics (LATENT-046-BG).
+  const { parentId: _parent, detach: _detach, ...rest } = candidate;
+  return {
+    ...rest,
+    ...(tasks !== candidate.tasks ? { tasks } : {}),
+    ...(chain !== candidate.chain ? { chain } : {}),
+  };
+}
+
+/** Drops a stray `parentId` from every batch item; returns the original array when there is nothing to strip. */
+function stripItemParents<T>(items: readonly T[] | undefined): T[] | undefined {
+  if (!Array.isArray(items)) return undefined;
+  let changed = false;
+  const out = items.map((item) => {
+    if (!item || typeof item !== "object") return item;
+    const record = item as Record<string, unknown>;
+    if (record.parentId === undefined) return item;
+    const { parentId: _internal, ...rest } = record;
+    changed = true;
+    return rest as T;
+  });
+  return changed ? out : (items as T[]);
+}
 
 function need<T>(value: T | undefined, name: string, action: string): T {
   if (value === undefined || value === "") throw new Error(`action "${action}" requires "${name}"`);
@@ -86,11 +140,16 @@ function batchResult(out: BatchOutcome, action: string): { text: string; details
 
 export async function executeAction(
   manager: SubagentManager,
-  input: SubagentsInput,
+  input: DispatchInput,
   signal?: AbortSignal,
+  /**
+   * What an aborted tool call means for live children. The main session (the default) pauses every running
+   * subagent so Esc / session switch makes the call return. The delegation path overrides it: a child's own
+   * interrupt must not cascade (plan 6.9 decision 8), so it passes a scoped no-op.
+   */
+  onAbort: () => void = () => void manager.interruptAll(),
 ): Promise<{ text: string; details: Record<string, unknown> }> {
   // Esc / session switch aborts the tool call; pause the children so the call can return.
-  const onAbort = () => void manager.interruptAll();
   if (signal?.aborted) onAbort();
   else signal?.addEventListener("abort", onAbort, { once: true });
   try {
@@ -102,15 +161,19 @@ export async function executeAction(
 
 async function dispatch(
   manager: SubagentManager,
-  input: SubagentsInput,
+  input: DispatchInput,
   signal?: AbortSignal,
 ): Promise<{ text: string; details: Record<string, unknown> }> {
   // `signal` is only added when present so callers without one see the same arguments as before.
   // Background work started by the main agent always comes back with "auto": it started the work to use the result.
   const extra = {
     ...(input.background ? { background: true, delivery: "auto" as const } : {}),
+    ...(input.detach ? { detach: true } : {}),
     ...(signal ? { signal } : {}),
   };
+  // Internal only: the parent record the delegation path attributes runs to. The main agent's tool call never
+  // carries it, so `run`/`parallel`/`chain` keep the depth-0 requester (no whitelist) for the main session.
+  const parentId = input.parentId;
   switch (input.action) {
     case "run": {
       const entry = entryFields(input);
@@ -119,8 +182,10 @@ async function dispatch(
       parseEntryRequest(entry, "run");
       const { record, payload } = await manager.run({
         ...entry,
+        ...(parentId ? { parentId } : {}),
         ...(input.cwd ? { cwd: input.cwd } : {}),
         ...(input.background ? { background: true } : {}),
+        ...(input.detach ? { detach: true } : {}),
         ...(signal ? { signal } : {}),
       });
       const body = payload ? payload.text : "Started in the background; the result will be delivered when it finishes.";
@@ -129,6 +194,7 @@ async function dispatch(
     case "parallel": {
       const out = await manager.runParallel({
         items: needList(input.tasks, "tasks", "parallel"),
+        ...(parentId ? { parentId } : {}),
         background: input.background ?? false,
         ...(signal ? { signal } : {}),
       });
@@ -137,6 +203,7 @@ async function dispatch(
     case "chain": {
       const out = await manager.runChain({
         steps: needList(input.chain, "chain", "chain"),
+        ...(parentId ? { parentId } : {}),
         background: input.background ?? false,
         ...(signal ? { signal } : {}),
       });
@@ -167,9 +234,22 @@ async function dispatch(
     case "stop":
       await manager.stop(need(input.handle, "handle", "stop"));
       return { text: `${input.handle} stopped; it cannot be resumed.`, details: {} };
+    case "drain": {
+      // Hand a paused parent's waiting child results to the caller instead of resuming the parent.
+      const out = await manager.drainPending(need(input.handle, "handle", "drain"));
+      return { text: out.text, details: { count: out.count } };
+    }
+    case "drop": {
+      const dropped = manager.dropPending(need(input.handle, "handle", "drop"));
+      return { text: `dropped ${dropped} waiting child result(s)`, details: { count: dropped } };
+    }
     case "list": {
       const records = manager.list();
       return { text: renderTree(records, "list", manager.listChains()), details: { count: records.length } };
     }
+    default:
+      // Every `SubagentsParams` action has a branch above; this is unreachable through the tool schema. It turns a
+      // future action added only to the schema into a clear error instead of a silent `undefined` result (REVIEW-040).
+      throw new Error("unsupported subagents action");
   }
 }

@@ -31,6 +31,15 @@ export class Scheduler {
     return this.getLimit() === 0;
   }
 
+  /**
+   * Whether a slot is free right now. A fire-and-forget background run checks this before waiting: if no slot is
+   * available it returns its handle at once and waits in a detached task instead of blocking its own parent
+   * (LATENT-046-BG). The check and the following `acquire` are synchronous back to back, so no other run can slip in.
+   */
+  hasCapacity(): boolean {
+    return limitAllows(this.getLimit(), this.active);
+  }
+
   acquire(signal?: AbortSignal): Promise<() => void> {
     if (this.getLimit() === 0) return Promise.reject(new SubagentsDisabledError());
     if (signal?.aborted) return Promise.reject(new Error("aborted while waiting for a slot"));

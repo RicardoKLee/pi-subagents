@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
-import { buildRpcArgs, LEAF_PIN_ENTRY_TYPE, piCliPath, pinLeaf, RpcRunner } from "../src/runner/rpc.ts";
+import { buildRpcArgs, buildRpcEnv, LEAF_PIN_ENTRY_TYPE, piCliPath, pinLeaf, RpcRunner } from "../src/runner/rpc.ts";
 import type { ChildSession, ChildSpec } from "../src/runner/types.ts";
 import { echoAgent } from "./harness.ts";
 import { cleanupTempDirs, tempDir } from "./tmp.ts";
@@ -12,6 +12,7 @@ import { cleanupTempDirs, tempDir } from "./tmp.ts";
 afterAll(cleanupTempDirs);
 
 const SERVER = fileURLToPath(new URL("./fixtures/fake-rpc-server.mjs", import.meta.url));
+const GAP_SERVER = fileURLToPath(new URL("./fixtures/fake-rpc-gap-server.mjs", import.meta.url));
 const base: ChildSpec = { agent: echoAgent, cwd: "/w", sessionDir: "/s", appendSystemPrompt: ["Be brief.", "End with <summary>."] };
 
 describe("buildRpcArgs", () => {
@@ -141,5 +142,60 @@ describe("RpcRunner with a fake child", () => {
   it("cannot resolve a model", async () => {
     const r = new RpcRunner({ resolveModel: () => undefined, cliPath: SERVER });
     await expect(r.open(base)).rejects.toThrow(/cannot resolve model/);
+  });
+});
+
+describe("delegation plumbing", () => {
+  it("adds -e and the child env when the spec carries delegation", () => {
+    const spec: ChildSpec = { ...base, delegation: { recordId: "rec-1", depth: 1, canDelegate: true, mailboxDir: "/tmp/m" } };
+    const args = buildRpcArgs(spec, "p/m", {});
+    expect(args).toContain("-e");
+    expect(args[args.indexOf("-e") + 1]).toMatch(/src[\\/]index\.ts$/);
+    expect(buildRpcEnv(spec)).toMatchObject({
+      PI_SUBAGENTS_CHILD: "rec-1",
+      PI_SUBAGENTS_DEPTH: "1",
+      PI_SUBAGENTS_DELEGATE: "1",
+      PI_SUBAGENTS_MAILBOX: "/tmp/m",
+    });
+    expect(buildRpcEnv({ ...base })).toEqual({});
+  });
+
+  it("places -e right after -ne and omits it without delegation", () => {
+    const spec: ChildSpec = { ...base, delegation: { recordId: "rec-1", depth: 2, canDelegate: false, mailboxDir: "/tmp/m" } };
+    const args = buildRpcArgs(spec, "p/m", {});
+    expect(args[args.indexOf("-ne") + 1]).toBe("-e");
+    expect(args[args.indexOf("-e") + 1]).toMatch(/src[\\/]index\.ts$/);
+    expect(buildRpcArgs(base, "p/m", {})).not.toContain("-e");
+  });
+
+  it("reports canDelegate=false and no mailbox when the child may not spawn", () => {
+    const spec: ChildSpec = { ...base, delegation: { recordId: "rec-2", depth: 2, canDelegate: false } };
+    expect(buildRpcEnv(spec)).toEqual({ PI_SUBAGENTS_CHILD: "rec-2", PI_SUBAGENTS_DEPTH: "2", PI_SUBAGENTS_DELEGATE: "0" });
+  });
+
+  it("delivers with prompt when idle and follow_up when busy", async () => {
+    const dir = tempDir("deliver-");
+    const log = join(dir, "commands.jsonl");
+    const runner = new RpcRunner({
+      resolveModel: () => ({ provider: "p", id: "m" }),
+      cliPath: GAP_SERVER,
+      env: { GAP_CONFIG: JSON.stringify({ logFile: log, state: { sessionFile: join(dir, "child.jsonl") } }) },
+    });
+    const session = await runner.open({
+      ...base,
+      cwd: process.cwd(),
+      sessionDir: dir,
+      delegation: { recordId: "rec-1", depth: 1, canDelegate: true, mailboxDir: join(dir, "mbox") },
+    });
+    try {
+      await session.deliver("first", "start");
+      await session.deliver("second", "queue");
+    } finally {
+      await session.dispose();
+    }
+    const commands = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { type: string; message?: string });
+    expect(commands.map((c) => c.type)).toEqual(["get_state", "prompt", "follow_up"]);
+    expect(commands[1]!.message).toBe("first");
+    expect(commands[2]!.message).toBe("second");
   });
 });

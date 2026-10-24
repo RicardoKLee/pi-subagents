@@ -53,37 +53,69 @@ function usageCells(u: Usage): string[] {
   return [`in ${u.input}`, `out ${u.output}`, `cache r${u.cacheRead} w${u.cacheWrite}`, money(u.cost)];
 }
 
-function cells(node: Node, view: TreeView): string[] {
-  const r = node.record;
-  if (view === "cost") return [`@${r.handle}`, ...usageCells(r.usage)];
-  const cost = node.children.length ? `${money(r.usage.cost)} (subtree ${money(subtree(node).cost)})` : money(r.usage.cost);
-  const error = r.error ? r.error.split("\n")[0]!.slice(0, 60) : "";
-  return [`@${r.handle}`, recordEntryLabel(r), `run ${r.runId}`, cost, error, `[${r.status}]`];
+/** `12m` under an hour, `1h05m` from an hour on. */
+function waitDuration(minutes: number): string {
+  const hours = Math.floor(minutes / 60);
+  return hours > 0 ? `${hours}h${String(minutes % 60).padStart(2, "0")}m` : `${minutes}m`;
 }
 
-function chainCells(group: { chain: ChainRecord; index: number; steps: readonly SubagentRecord[] }, view: TreeView): string[] {
-  const { chain, index, steps } = group;
-  const total = steps.reduce((acc, r) => sum(acc, r.usage), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
+/** The `(N results waiting · 12m)` hint for a record with undelivered child results; empty when none wait. */
+function waitCell(record: SubagentRecord, now: number): string {
+  const pending = record.pending ?? [];
+  if (!pending.length) return "";
+  const oldest = Math.min(...pending.map((p) => p.at));
+  return `(${pending.length} results waiting · ${waitDuration(Math.max(0, Math.floor((now - oldest) / 60_000)))})`;
+}
+
+function cells(node: Node, view: TreeView, now: number): string[] {
+  const r = node.record;
+  const waiting = waitCell(r, now);
+  if (view === "cost") {
+    // A parent row carries the summed cost of everything beneath it; a leaf has nothing to add.
+    const subtreeCell = node.children.length ? `subtree ${money(subtree(node).cost)}` : "";
+    return [`@${r.handle}`, ...usageCells(r.usage), subtreeCell, waiting];
+  }
+  const cost = node.children.length ? `${money(r.usage.cost)} (subtree ${money(subtree(node).cost)})` : money(r.usage.cost);
+  const error = r.error ? r.error.split("\n")[0]!.slice(0, 60) : "";
+  return [`@${r.handle}`, recordEntryLabel(r), `run ${r.runId}`, cost, error, `[${r.status}]`, waiting];
+}
+
+function chainCells(group: { chain: ChainRecord; index: number; nodes: readonly Node[] }, view: TreeView): string[] {
+  const { chain, index, nodes } = group;
+  // The header total covers every step subtree, so a nested child of a step is counted exactly once.
+  const total = nodes.reduce((acc, node) => sum(acc, subtree(node)), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
   const label = `chain ${index + 1}`;
   if (view === "cost") return [label, ...usageCells(total)];
-  const error = steps.find((r) => r.error)?.error?.split("\n")[0]!.slice(0, 60) ?? "";
+  const error = nodes.map((n) => n.record).find((r) => r.error)?.error?.split("\n")[0]!.slice(0, 60) ?? "";
   const progress = `step ${Math.min(chain.currentStep + 1, chain.steps.length)}/${chain.steps.length}`;
   return [label, `${chain.steps.length} steps`, progress, money(total.cost), error, `[${chain.status}]`];
 }
 
 /** pstree-style tree of subagents under the main session; chain steps are grouped under their chain header. */
-export function renderTree(records: readonly SubagentRecord[], view: TreeView, chains: readonly ChainRecord[] = []): string {
+export function renderTree(records: readonly SubagentRecord[], view: TreeView, chains: readonly ChainRecord[] = [], now: number = Date.now()): string {
   if (!records.length && !chains.length) return "No subagents yet.";
   const rows: { prefix: string; cells: string[] }[] = [];
 
   function pushNode(node: Node, indent: string, last: boolean): void {
-    rows.push({ prefix: `${indent}${last ? "└─ " : "├─ "}`, cells: cells(node, view) });
+    rows.push({ prefix: `${indent}${last ? "└─ " : "├─ "}`, cells: cells(node, view, now) });
     walkForest(node.children, `${indent}${last ? "   " : "│  "}`);
   }
 
   function walkForest(nodes: readonly Node[], indent: string): void {
     nodes.forEach((node, i) => pushNode(node, indent, i === nodes.length - 1));
   }
+
+  // Build the whole forest first so a chain step's own children resolve; the chain groups then render each step
+  // together with its subtree instead of leaving those nested records behind as stray roots.
+  const fullForest = forest(records);
+  const nodeById = new Map<string, Node>();
+  const indexNodes = (nodes: readonly Node[]): void => {
+    for (const node of nodes) {
+      nodeById.set(node.record.id, node);
+      indexNodes(node.children);
+    }
+  };
+  indexNodes(fullForest);
 
   // Steps of chains on this branch sit under their chain header; everything else keeps the parent/child forest.
   // The number in `chain N` follows creation time, whatever order the caller lists the chains in.
@@ -92,20 +124,33 @@ export function renderTree(records: readonly SubagentRecord[], view: TreeView, c
     .map((chain, index) => ({
       chain,
       index,
-      steps: records.filter((r) => r.chainId === chain.id).sort((a, b) => (a.stepIndex ?? 0) - (b.stepIndex ?? 0)),
+      nodes: records
+        .filter((r) => r.chainId === chain.id)
+        .sort((a, b) => (a.stepIndex ?? 0) - (b.stepIndex ?? 0))
+        .map((r) => nodeById.get(r.id))
+        .filter((n): n is Node => n !== undefined),
     }));
-  const grouped = new Set(groups.flatMap((g) => g.steps.map((r) => r.id)));
+  const insideChain = new Set<string>();
+  for (const group of groups) {
+    for (const node of group.nodes) {
+      const mark = (current: Node): void => {
+        insideChain.add(current.record.id);
+        for (const child of current.children) mark(child);
+      };
+      mark(node);
+    }
+  }
   // A step whose chain is not on this branch (e.g. after /tree) stays visible as an ordinary root.
-  const loose = records.filter((r) => !grouped.has(r.id));
+  const loose = fullForest.filter((node) => !insideChain.has(node.record.id));
 
   const entries = [
-    ...forest(loose).map((node) => ({ at: node.record.createdAt, push: (last: boolean) => pushNode(node, "", last) })),
+    ...loose.map((node) => ({ at: node.record.createdAt, push: (last: boolean) => pushNode(node, "", last) })),
     ...groups.map((group) => ({
       at: group.chain.createdAt,
       push: (last: boolean) => {
         rows.push({ prefix: `${last ? "└─ " : "├─ "}`, cells: chainCells(group, view) });
         const inner = last ? "   " : "│  ";
-        group.steps.forEach((step, i) => pushNode({ record: step, children: [] }, inner, i === group.steps.length - 1));
+        group.nodes.forEach((node, i) => pushNode(node, inner, i === group.nodes.length - 1));
       },
     })),
   ].sort((a, b) => a.at - b.at);
@@ -130,4 +175,15 @@ export function renderTree(records: readonly SubagentRecord[], view: TreeView, c
       .join("  "),
   );
   return ["main", ...lines].join("\n");
+}
+
+/** Reminder shown when a stopped parent's child results have been waiting for too long. */
+export function pendingReminderText(
+  record: Pick<SubagentRecord, "handle" | "status">,
+  count: number,
+  minutes: number,
+  path: string,
+): string {
+  const where = path || record.handle;
+  return `@${where} is ${record.status} with ${count} child result(s) waiting (${minutes}m). Resume it with "@${record.handle} …", hand them over with subagents action=drain handle=${record.handle}, or discard them with action=drop handle=${record.handle}.`;
 }

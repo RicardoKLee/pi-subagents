@@ -9,6 +9,8 @@ import type { ChildResult, ChildSession, ChildSpec, Runner } from "./types.ts";
 
 export const LEAF_PIN_ENTRY_TYPE = "pi-subagents/leaf-pin";
 const CLI_SUFFIX = join("@earendil-works", "pi-coding-agent", "dist", "cli.js");
+/** This extension's entry point, loaded by a nested child with `-ne -e <entry>` (plan 6.9 item 12). `rpc.ts` lives in `src/runner/`, so the entry is one directory up. */
+const EXTENSION_ENTRY = fileURLToPath(new URL("../index.ts", import.meta.url));
 
 /** pi's CLI entry point for child processes (prefer the pi that is running this extension). */
 export function piCliPath(): string {
@@ -37,12 +39,39 @@ export function piCliPath(): string {
 
 /** CLI arguments for one RPC child (see 6.6 item 4). */
 export function buildRpcArgs(spec: ChildSpec, model: string, opts: { trusted?: boolean; extraArgs?: string[] }): string[] {
-  const args = ["--mode", "rpc", ...(spec.resumeFile ? ["--session", spec.resumeFile] : ["--session-dir", spec.sessionDir]), "-ne", "--model", model];
+  const args = [
+    "--mode",
+    "rpc",
+    ...(spec.resumeFile ? ["--session", spec.resumeFile] : ["--session-dir", spec.sessionDir]),
+    "-ne",
+    // `-ne` disables automatic discovery; an explicit `-e` still loads (docs/cli.md:196), which is how a nested
+    // child gets the proxy tool without the parent's other extensions.
+    // REVIEW-024 (deferred): `-e` could be limited to `spec.delegation?.canDelegate`, but a non-delegating nested
+    // child still gets it today and test/rpc-runner.test.ts pins `-e` right after `-ne` for that case; revisit when
+    // that expectation changes.
+    ...(spec.delegation ? ["-e", EXTENSION_ENTRY] : []),
+    "--model",
+    model,
+  ];
   if (spec.agent.thinking) args.push("--thinking", spec.agent.thinking);
   if (spec.agent.tools) args.push(...(spec.agent.tools.length ? ["--tools", spec.agent.tools.join(",")] : ["--no-tools"]));
   for (const text of spec.appendSystemPrompt) args.push("--append-system-prompt", text);
   if (opts.trusted !== undefined) args.push(opts.trusted ? "-a" : "-na");
   return [...args, ...(opts.extraArgs ?? [])];
+}
+
+/**
+ * The environment a nested RPC child needs to know who it is: its record id, depth, whether it may spawn, and the
+ * parent session's mailbox. Empty for a child that cannot delegate, so an ordinary child keeps the parent's env.
+ */
+export function buildRpcEnv(spec: ChildSpec): Record<string, string> {
+  if (!spec.delegation) return {};
+  return {
+    PI_SUBAGENTS_CHILD: spec.delegation.recordId,
+    PI_SUBAGENTS_DEPTH: String(spec.delegation.depth),
+    PI_SUBAGENTS_DELEGATE: spec.delegation.canDelegate ? "1" : "0",
+    ...(spec.delegation.mailboxDir ? { PI_SUBAGENTS_MAILBOX: spec.delegation.mailboxDir } : {}),
+  };
 }
 
 /**
@@ -115,6 +144,13 @@ class RpcChildSession implements ChildSession {
     } finally {
       unsubscribe();
     }
+  }
+
+  async deliver(text: string, mode: "start" | "queue"): Promise<void> {
+    // The parent direction never uses the mailbox: pi's own RPC commands inject the result (plan 6.9 item 1).
+    // An idle parent starts a turn with `prompt`; a running one queues the message with `follow_up`.
+    if (mode === "start") await this.proc.request({ type: "prompt", message: text });
+    else await this.proc.request({ type: "follow_up", message: text });
   }
 
   async steer(text: string, mode: "steer" | "followUp"): Promise<void> {
@@ -195,7 +231,7 @@ export class RpcRunner implements Runner {
       cliPath: this.opts.cliPath ?? piCliPath(),
       args: buildRpcArgs(spec, `${model.provider}/${model.id}`, { ...(trusted !== undefined ? { trusted } : {}), ...(this.opts.extraArgs ? { extraArgs: this.opts.extraArgs } : {}) }),
       cwd: spec.cwd,
-      env: { ...this.opts.env, ...(this.opts.agentDir ? { PI_CODING_AGENT_DIR: this.opts.agentDir } : {}) },
+      env: { ...this.opts.env, ...(this.opts.agentDir ? { PI_CODING_AGENT_DIR: this.opts.agentDir } : {}), ...buildRpcEnv(spec) },
       ...(this.opts.commandTimeoutMs ? { commandTimeoutMs: this.opts.commandTimeoutMs } : {}),
     });
     try {
