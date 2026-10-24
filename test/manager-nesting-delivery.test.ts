@@ -236,6 +236,35 @@ describe("pending edge cases", () => {
     await manager.whenIdle();
   });
 
+  it("still reports the failure when queueing the result throws (F3)", async () => {
+    const { manager, runner, registry, errors } = setup({ hold: true, scripts: [[ok("lead")], [ok("child")]] });
+    const { record: parent } = await manager.run({ agent: "lead", task: "plan", background: true });
+    const child = manager.run(nested(parent, { agent: "worker", task: "x", background: true }) as never);
+    await expect.poll(() => runner.sessions.length).toBe(2);
+    // The parent is live; make the injection fail.
+    runner.sessions[0]!.deliver = async () => {
+      throw new Error("inject failed");
+    };
+    // Make only the queue write fail, so the failure notification is the only path left (the child's own
+    // status updates and the error record must still be written through).
+    const original = registry.update.bind(registry);
+    const update = vi.spyOn(registry, "update").mockImplementation((id, patch) => {
+      if (patch && typeof patch === "object" && "pending" in patch) throw new Error("persist failed");
+      return original(id, patch);
+    });
+    try {
+      runner.sessions[1]!.finish();
+      await child;
+      // The parent stays held (live), so wait for the failure report rather than for idle.
+      await expect.poll(() => errors.length).toBe(1);
+    } finally {
+      update.mockRestore();
+    }
+    expect(errors).toEqual([{ handle: parent.handle, message: expect.stringContaining("child result not delivered: inject failed") }]);
+    await manager.shutdown();
+    await manager.whenIdle();
+  });
+
   it("does not remind before the timeout", async () => {
     clockMinutes = 100;
     const { manager, runner, reminders } = setup({ hold: true, settings: { pendingResultTimeoutMinutes: 30 }, scripts: [[ok("lead")], [ok("a")]] });
@@ -257,6 +286,33 @@ describe("pending edge cases", () => {
     const { record: parent } = await manager.run({ agent: "lead", task: "plan" });
     expect(await manager.drainPending(parent.handle)).toEqual({ text: "no child results are waiting", count: 0 });
     expect(manager.dropPending(parent.handle)).toBe(0);
+  });
+
+  it("leaves the parent's status unchanged when its waiting results are drained or dropped", async () => {
+    const { manager, runner, registry } = setup({ hold: true, scripts: [[ok("lead")], [ok("a")], [ok("b")]] });
+    const { record: parent } = await manager.run({ agent: "lead", task: "plan", background: true });
+    await manager.interrupt(parent.handle);
+    await manager.whenIdle();
+    const a = manager.run(nested(parent, { agent: "worker", task: "a", background: true }) as never);
+    await expect.poll(() => runner.sessions.length).toBe(2);
+    runner.sessions[1]!.finish();
+    await a;
+    await manager.whenIdle();
+    expect(registry.get(parent.id)!.status).toBe("paused");
+
+    // drain only clears the queue: it must not resume (or otherwise settle) the paused parent.
+    expect((await manager.drainPending(parent.handle)).count).toBe(1);
+    expect(registry.get(parent.id)!.status).toBe("paused");
+
+    // A second waiting result, dropped rather than drained, leaves the status untouched as well.
+    const b = manager.run(nested(parent, { agent: "worker", task: "b", background: true }) as never);
+    await expect.poll(() => runner.sessions.length).toBe(3);
+    runner.sessions[2]!.finish();
+    await b;
+    await manager.whenIdle();
+    expect(registry.get(parent.id)!.status).toBe("paused");
+    expect(manager.dropPending(parent.handle)).toBe(1);
+    expect(registry.get(parent.id)!.status).toBe("paused");
   });
 
   it("sizes a child result by the parent agent's own window", async () => {

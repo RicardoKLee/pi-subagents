@@ -413,6 +413,43 @@ describe("nesting addressing and cascade stop", () => {
     expect(runner.sessions).toHaveLength(2);
   });
 
+  it("never opens a queued descendant when stopping the parent that holds its slot (CR-5-1)", async () => {
+    // Only one slot exists and the parent holds it, so its child waits in the queue with no session.
+    const { manager, runner, registry } = setup({ limit: 1, hold: true, settings: { maxDepth: 3 }, scripts: [[ok("root")], [ok("child")]] });
+    const { record: root } = await manager.run({ agent: "top", task: "root", background: true });
+    const { record: child } = await manager.run(nested(root, { agent: "mid", task: "child", background: true, detach: true }) as never);
+    expect(child.status).toBe("queued");
+    expect(runner.sessions).toHaveLength(1);
+
+    await manager.stop(root.handle);
+    await manager.whenIdle();
+
+    // Stopping the parent releases the slot mid-cascade; the child was cancelled synchronously first, so no
+    // session was ever opened for it.
+    expect(registry.get(child.id)!.status).toBe("stopped");
+    expect(runner.sessions).toHaveLength(1);
+  });
+
+  it("stops every descendant even when an abort throws (CR-5-2)", async () => {
+    const { manager, runner, registry } = setup({ limit: 2, hold: true, settings: { maxDepth: 3 }, scripts: [[ok("root")], [ok("child")]] });
+    const { record: root } = await manager.run({ agent: "top", task: "root", background: true });
+    const { record: child } = await manager.run(nested(root, { agent: "mid", task: "child", background: true }) as never);
+    expect(runner.sessions).toHaveLength(2);
+    runner.sessions[0]!.abort = async () => {
+      throw new Error("abort failed");
+    };
+
+    // The first failure still rejects the stop, but must not cut the cascade short.
+    await expect(manager.stop(root.handle)).rejects.toThrow("abort failed");
+    // Let the root's own run unwind now that its abort failed, so the test can wait for idle.
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+
+    expect(registry.get(root.id)!.status).toBe("stopped");
+    expect(registry.get(child.id)!.status).toBe("stopped");
+    expect(runner.sessions[1]!.disposed).toBe(true);
+  });
+
   it("stops paused and completed descendants in the same cascade", async () => {
     const { manager, runner, registry } = setup({ limit: 2, hold: true, settings: { maxDepth: 3 }, scripts: [[ok("root")], [ok("child")], [ok("grand")]] });
     const { record: root } = await manager.run({ agent: "top", task: "root", background: true });

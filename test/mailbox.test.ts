@@ -144,6 +144,22 @@ describe("callViaMailbox", () => {
     expect(readdirSync(paths.responses)).toHaveLength(0);
   });
 
+  it("clamps a zero poll interval to at least 1ms (REVIEW-041)", async () => {
+    const dir = tempDir("mbox-");
+    ensureMailbox(dir);
+    const timer = vi.spyOn(globalThis, "setTimeout");
+    let pollDelays: number[] = [];
+    try {
+      await expect(callViaMailbox(dir, request("clamp"), { timeoutMs: 30, pollMs: 0 })).rejects.toThrow(/timed out/);
+      // The polling sleeps are the only sub-second timers this call schedules: none may ask for 0ms (a busy loop).
+      pollDelays = timer.mock.calls.map((call) => call[1]).filter((ms): ms is number => typeof ms === "number" && ms < 1_000);
+    } finally {
+      timer.mockRestore();
+    }
+    expect(pollDelays.length).toBeGreaterThan(0);
+    expect(Math.min(...pollDelays)).toBeGreaterThanOrEqual(1);
+  });
+
   it("fails fast when the signal is already aborted and leaves no files behind", async () => {
     const dir = tempDir("mbox-");
     const paths = ensureMailbox(dir);

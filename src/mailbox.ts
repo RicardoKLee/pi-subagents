@@ -120,7 +120,8 @@ export async function callViaMailbox(dir: string, req: MailboxRequest, opts: Mai
   const requestFile = join(paths.requests, `${req.id}.json`);
   const responseFile = join(paths.responses, `${req.id}.json`);
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const pollMs = opts.pollMs ?? DEFAULT_CLIENT_POLL_MS;
+  // A non-positive poll would spin on the event loop (setTimeout(0)) instead of waiting; clamp it (REVIEW-041).
+  const pollMs = Math.max(1, opts.pollMs ?? DEFAULT_CLIENT_POLL_MS);
   writeFileSync(requestFile, JSON.stringify(req), { mode: 0o600 });
   const deadline = Date.now() + timeoutMs;
   try {

@@ -81,6 +81,18 @@ describe("renderTree list", () => {
     expect(renderTree([], "list")).toBe("No subagents yet.");
   });
 
+  it("shows how many child results are waiting and how long the oldest waited", () => {
+    const pending = (at: number) => ({ fromId: "c", handle: "scout", summary: "done", sessionFile: "/s", at });
+    const text = renderTree([rec({ handle: "doc", createdAt: 1, pending: [pending(0), pending(60_000)] })], "list", [], 12 * 60_000 + 5_000);
+    expect(text.split("\n")[1]).toMatch(/\(2 results waiting · 12m\)$/);
+  });
+
+  it("formats a wait of an hour or more as hours and zero-padded minutes", () => {
+    const pending = { fromId: "c", handle: "scout", summary: "done", sessionFile: "/s", at: 0 };
+    const text = renderTree([rec({ handle: "doc", createdAt: 1, pending: [pending] })], "list", [], 65 * 60_000);
+    expect(text.split("\n")[1]).toMatch(/\(1 results waiting · 1h05m\)$/);
+  });
+
   it("shows records whose parents form a cycle as roots instead of dropping them", () => {
     const text = renderTree(
       [
@@ -296,5 +308,25 @@ describe("renderTree cost", () => {
     const lines = text.split("\n");
     expect(lines[1]).toMatch(/@a\s+in 100\s+out 20\s+cache r0 w0\s+\$0\.0100/);
     expect(lines.at(-1)).toMatch(/^total\s+in 400\s+out 60\s+cache r0 w0\s+\$0\.0300$/);
+  });
+
+  it("adds the subtree cost to a parent row and leaves a child row without one", () => {
+    const text = renderTree(
+      [
+        rec({ handle: "reviewer", createdAt: 1, usage: usage(0.02) }),
+        rec({ handle: "scout", id: "scout", parentId: "reviewer", depth: 2, createdAt: 2, usage: usage(0.01) }),
+      ],
+      "cost",
+    );
+    const lines = text.split("\n");
+    expect(lines[1]).toMatch(/@reviewer\s+in 0\s+out 0\s+cache r0 w0\s+\$0\.0200\s+subtree \$0\.0300$/);
+    expect(lines[2]).toMatch(/@scout\s+in 0\s+out 0\s+cache r0 w0\s+\$0\.0100\s*$/);
+    expect(lines[2]).not.toContain("subtree");
+  });
+
+  it("shows the waiting child results in the cost view too", () => {
+    const pending = { fromId: "c", handle: "scout", summary: "done", sessionFile: "/s", at: 0 };
+    const text = renderTree([rec({ handle: "doc", createdAt: 1, pending: [pending] })], "cost", [], 30 * 60_000);
+    expect(text.split("\n")[1]).toMatch(/\(1 results waiting · 30m\)$/);
   });
 });

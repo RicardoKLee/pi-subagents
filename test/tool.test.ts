@@ -107,6 +107,27 @@ describe("executeAction", () => {
     expect(actions).toEqual(expect.arrayContaining(["run", "parallel", "chain", "continue", "list"]));
   });
 
+  it("drain hands the waiting child results to the caller", async () => {
+    const m = fakeManager({ drainPending: vi.fn(async () => ({ text: "child result body", count: 2 })) });
+    const out = await executeAction(m, { action: "drain", handle: "@reviewer" });
+    expect(m.drainPending).toHaveBeenCalledWith("@reviewer");
+    expect(out.text).toBe("child result body");
+    expect(out.details).toEqual({ count: 2 });
+  });
+
+  it("drop discards the waiting child results and reports the count", async () => {
+    const m = fakeManager({ dropPending: vi.fn(() => 3) });
+    const out = await executeAction(m, { action: "drop", handle: "reviewer" });
+    expect(m.dropPending).toHaveBeenCalledWith("reviewer");
+    expect(out.text).toBe("dropped 3 waiting child result(s)");
+    expect(out.details).toEqual({ count: 3 });
+  });
+
+  it("drain and drop require a handle", async () => {
+    await expect(executeAction(fakeManager(), { action: "drain" })).rejects.toThrow(/requires "handle"/);
+    await expect(executeAction(fakeManager(), { action: "drop" })).rejects.toThrow(/requires "handle"/);
+  });
+
   it("passes a skill entry through to run", async () => {
     const m = fakeManager();
     await executeAction(m, { action: "run", skill: "pdf-tools", task: "extract" });

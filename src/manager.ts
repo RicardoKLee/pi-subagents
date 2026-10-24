@@ -1242,24 +1242,54 @@ export class SubagentManager {
     // Take the snapshot before anything is marked: the cascade must still reach a descendant whose record the stop of
     // its parent could otherwise make unreachable.
     const descendants = this.descendants(record.id);
-    const persistErrors: unknown[] = [];
+    const errors: unknown[] = [];
     // A failed persist must not stop the cascade: the record is still stopped in memory and the queued/claiming run is
-    // cancelled below by `stopRecord`. The first error is rethrown at the end, so a stop that could not be persisted
-    // still rejects (and a cancelled run never starts, as `cancelQueued` guarantees).
+    // cancelled below by `stopRecord`. Every failure is collected and the first is rethrown at the end, so a stop that
+    // could not be persisted or aborted still rejects, while the rest of the subtree is stopped anyway (CR-5-1/CR-5-2).
     const mark = (id: string): void => {
       try {
         this.markStoppedAndDiscardPending(id);
       } catch (error) {
-        persistErrors.push(error);
+        errors.push(error);
+      }
+    };
+    const halt = async (target: SubagentRecord): Promise<void> => {
+      try {
+        await this.stopRecord(target);
+      } catch (error) {
+        errors.push(error);
       }
     };
     mark(record.id);
-    await this.stopRecord(record);
+    // Synchronously shut every door a descendant could still run through before the first await. Stopping the parent
+    // releases its scheduler slot mid-await, and without this the queued descendant would open a session before the
+    // cascade reaches it; a descendant's pending resume claim is cancelled the same way (CR-5-1/CR-5-2).
+    this.cancelDescendantStarts(descendants);
+    await halt(record);
     for (const descendant of descendants) {
       mark(descendant.id);
-      await this.stopRecord(descendant);
+      await halt(descendant);
     }
-    if (persistErrors.length) throw persistErrors[0];
+    if (errors.length) throw errors[0];
+  }
+
+  /**
+   * Bars every descendant from starting a run while the cascade awaits an abort/dispose: cancels each queued run and
+   * aborts each resume claim with `intent = "stop"`. Purely synchronous, so it runs before the parent's slot is freed.
+   */
+  private cancelDescendantStarts(descendants: readonly SubagentRecord[]): void {
+    for (const descendant of descendants) {
+      const claim = this.claims.get(descendant.id);
+      if (claim) claim.intent = "stop";
+      try {
+        this.cancelQueued(descendant);
+      } catch {
+        // `cancelQueued` already aborted the queued run in its finally block; a persist failure is reported by the
+        // per-record `mark`/`stopRecord` below instead of cutting the synchronous sweep short.
+      }
+      // Abort after cancelQueued so a run that is both queued and claimed cannot start; cancelQueued has no claim.
+      if (claim) claim.controller.abort();
+    }
   }
 
   /** Stops one record's own run; its descendants are the caller's concern (see `stop`). */
@@ -1324,6 +1354,9 @@ export class SubagentManager {
         count++;
       }
     }
+    // Results that were already waiting when this session (re)started still need their reminder watch; the timer is
+    // otherwise only started by `queuePending`, which no rebuild path calls (REVIEW-053).
+    if (this.deps.registry.list().some((r) => (r.pending ?? []).length > 0)) this.ensurePendingWatch();
     return count;
   }
 
@@ -1517,9 +1550,14 @@ export class SubagentManager {
    */
   private routeToParent(parent: SubagentRecord, entry: PendingResult): void {
     if (parent.status === "stopped") return; // discarded with the parent
-    // Delivery failure must not lose the result: it stays queued for a later resume/drain.
+    // Delivery failure must not lose the result: it stays queued for a later resume/drain. A failed queue write
+    // (e.g. a registry persist error) must not skip the notification, so the failure is reported unconditionally (F3).
     const fail = (error: unknown) => {
-      this.queuePending(parent, entry);
+      try {
+        this.queuePending(parent, entry);
+      } catch {
+        // The result could not be kept; the notification below still reports why it was not delivered.
+      }
       this.reportDeliveryError(parent, error);
     };
     if (parent.status === "paused") {

@@ -18,7 +18,7 @@ import { RpcRunner } from "./runner/rpc.ts";
 import { type ModelResolver, SdkRunner, defaultProjectTrust } from "./runner/sdk.ts";
 import type { Runner } from "./runner/types.ts";
 import { Scheduler } from "./scheduler.ts";
-import { loadSettings, type DeliveryMode, type SubagentSettings } from "./settings.ts";
+import { loadSettings, limitAllows, type DeliveryMode, type SubagentSettings } from "./settings.ts";
 import { executeAction, SubagentsParams, toolCallInput, type SubagentsInput } from "./tool.ts";
 import { renderTree, TREE_ENTRY_TYPE, type TreeEntryData, type TreeView } from "./tree.ts";
 
@@ -109,6 +109,8 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
   return (pi: ExtensionAPI): void => {
     const agentDir = opts.agentDir ?? getAgentDir();
     let state: State | undefined;
+    /** The tool and commands are registered once, at load when enabled or on the first enabled `session_start` otherwise. */
+    let capabilitiesRegistered = false;
     /** The UI the autocomplete wrapper was installed on; pi resets wrappers when it rebuilds the extension UI. */
     let completionUi: unknown;
     const fileExists = (raw: string) => {
@@ -207,6 +209,11 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
         // normalized so equivalent spellings of the same directory match without letting a different one through.
         trustForCwd: (cwd) => (resolvePath(cwd) === mainCwd ? (state?.ctx ?? ctx).isProjectTrusted?.() : defaultProjectTrust(cwd, agentDir)),
         onDeliveryError: (record, message) => notify(`result of @${record.handle} was not delivered: ${message}`, "warning"),
+        onPendingReminder: (record, count, minutes) =>
+          notify(
+            `@${record.handle} is paused with ${count} child result(s) waiting (${minutes}m). Resume it with "@${record.handle} …", hand them over with subagents action=drain handle=${record.handle}, or discard them with action=drop handle=${record.handle}.`,
+            "warning",
+          ),
         onRecordCreated: (record) => {
           if (existsSync(join(ctx.cwd, record.handle))) {
             warnOnce(`@${record.handle} has the same name as a file in ${ctx.cwd}; use @sub:${record.handle} to reach the subagent`);
@@ -241,9 +248,18 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
             if (!manager) return [];
             return manager
               .list()
-              .map((r) => ({ handle: r.handle, agent: recordEntryLabel(r), status: r.status, clash: fileExists(r.handle), path: manager.recordPath(r) }));
+              .map((r) => ({ handle: r.handle, agent: recordEntryLabel(r), status: r.status, clash: fileExists(r.handle), path: r.parentId ? manager.recordPath(r) : undefined }));
           }),
         );
+      }
+      // A disabled session (maxDepth 0) must not advertise the tool or the `/sub*` commands: they could only fail.
+      if (!manager.canStartSubagents()) {
+        notify("subagents are disabled (maxDepth is 0)", "warning");
+        return;
+      }
+      if (!capabilitiesRegistered) {
+        capabilitiesRegistered = true;
+        registerSubagentCapabilities();
       }
     });
 
@@ -305,98 +321,112 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
       return box;
     });
 
-    const VIEWS: TreeView[] = ["list", "cost"];
-    pi.registerCommand("subagents", {
-      description: "Show subagents as a tree: /subagents [list|cost]",
-      getArgumentCompletions: (prefix) =>
-        VIEWS.filter((v) => v.startsWith(prefix.trim().toLowerCase())).map((v) => ({ value: v, label: v, description: v === "list" ? "status and cost" : "tokens and cost" })),
-      handler: async (args, ctx) => {
-        if (state) state.ctx = ctx;
-        const raw = args.trim();
-        const view = (raw.toLowerCase() || "list") as TreeView;
-        if (!VIEWS.includes(view)) {
-          // A leading "/" usually means two commands were typed on one line (e.g. "/subagents /debug-agent").
-          const hint = raw.includes("/") ? `${raw} was not run; type it on its own line` : "use /subagents list or /subagents cost";
-          ctx.ui.notify(`pi-subagents: unknown view "${raw}"; ${hint}`, "error");
-          return;
-        }
-        pi.appendEntry<TreeEntryData>(TREE_ENTRY_TYPE, { view, text: renderTree(state?.registry.list() ?? [], view, state?.manager.listChains() ?? []) });
-      },
-    });
-
-    // `/sub` creates a subagent without going through the main model; the symbol in the command name picks the delivery.
-    const SUB_COMMANDS: { name: string; delivery?: DeliveryMode }[] = [
-      { name: "sub" },
-      { name: "sub!", delivery: "auto" },
-      { name: "sub~", delivery: "share" },
-      { name: "sub?", delivery: "private" },
-    ];
-    for (const command of SUB_COMMANDS) {
-      pi.registerCommand(command.name, {
-        description: `Create a subagent (${command.delivery ?? "settings defaultDelivery"}): /${command.name} [--cwd <dir>] <agent> | /skill:<name> | /<template> [args]`,
-        getArgumentCompletions: (prefix) => subCompletions(prefix, state),
-        handler: async (args, ctx) => {
-          const current = state;
-          if (!current) {
-            ctx.ui.notify("pi-subagents: not initialised for this session yet", "error");
-            return;
-          }
-          // Refresh the captured context so a `/model` switch made just before `/sub` reaches the child.
-          current.ctx = ctx;
-          const parsed = parseSubCommand(args);
-          if ("error" in parsed) {
-            ctx.ui.notify(`pi-subagents: ${parsed.error}`, "error");
-            return;
-          }
-          const delivery = command.delivery ?? current.settings.defaultDelivery;
-          try {
-            const request: EntryRequest =
-              parsed.target.kind === "agent"
-                ? { agent: parsed.target.name }
-                : parsed.target.kind === "skill"
-                  ? { skill: parsed.target.name }
-                  : { command: parsed.target.name };
-            if (parsed.rest) request.task = parsed.rest;
-            const entry = parseEntryRequest(request, command.name);
-            const { record } = await current.manager.run({
-              ...request,
-              ...(parsed.cwd ? { cwd: parsed.cwd } : {}),
-              delivery,
-              background: true,
-              ask: entry.prompt,
-            });
-            const label = entry.kind === "agent" ? entry.name : `${entry.kind}:${entry.name}`;
-            ctx.ui.notify(`pi-subagents: 已创建 @${record.handle}（${label} · ${delivery}）；结果会自动送达`, "info");
-          } catch (error) {
-            ctx.ui.notify(`pi-subagents: ${(error as Error).message}`, "error");
-          }
-        },
-      });
-    }
-
     pi.on("session_shutdown", async () => {
       await state?.manager.shutdown();
       await state?.manager.whenIdle();
     });
 
-    pi.registerTool({
-      name: "subagents",
-      label: "Subagents",
-      description:
-        "Delegate work to named, persistent subagents. action=run starts a new one from exactly one entry — agent (needs task), skill or command — and returns its @handle. " +
-        "action=parallel runs many at once; chain runs steps in order, where {previous} is the previous step's output; continue resumes the step that stopped a chain and finishes it. " +
-        "action=resume continues an existing one in its own context (handle + message); prefer it when the user wants the same subagent to revise its work. " +
-        "action=steer guides a running one; interrupt pauses; stop ends it permanently; list shows all.",
-      parameters: SubagentsParams,
-      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-        if (!state) throw new Error("pi-subagents is not initialised for this session yet");
-        state.ctx = ctx;
-        // The model's arguments never carry the internal delegation parent: `toolCallInput` drops a stray copy so
-        // the main session always dispatches as the depth-0 requester with no whitelist.
-        const out = await executeAction(state.manager, toolCallInput(params as SubagentsInput), signal);
-        return { content: [{ type: "text", text: out.text }], details: out.details };
-      },
-    });
+    /**
+     * Registers the `subagents` tool and the `/sub*` commands. Called at load time and, when load-time settings were
+     * disabled, from an enabled `session_start`; a disabled session (`maxDepth: 0`) advertises neither.
+     */
+    function registerSubagentCapabilities(): void {
+      const VIEWS: TreeView[] = ["list", "cost"];
+      pi.registerCommand("subagents", {
+        description: "Show subagents as a tree: /subagents [list|cost]",
+        getArgumentCompletions: (prefix) =>
+          VIEWS.filter((v) => v.startsWith(prefix.trim().toLowerCase())).map((v) => ({ value: v, label: v, description: v === "list" ? "status and cost" : "tokens and cost" })),
+        handler: async (args, ctx) => {
+          if (state) state.ctx = ctx;
+          const raw = args.trim();
+          const view = (raw.toLowerCase() || "list") as TreeView;
+          if (!VIEWS.includes(view)) {
+            // A leading "/" usually means two commands were typed on one line (e.g. "/subagents /debug-agent").
+            const hint = raw.includes("/") ? `${raw} was not run; type it on its own line` : "use /subagents list or /subagents cost";
+            ctx.ui.notify(`pi-subagents: unknown view "${raw}"; ${hint}`, "error");
+            return;
+          }
+          pi.appendEntry<TreeEntryData>(TREE_ENTRY_TYPE, { view, text: renderTree(state?.registry.list() ?? [], view, state?.manager.listChains() ?? []) });
+        },
+      });
+  
+      // `/sub` creates a subagent without going through the main model; the symbol in the command name picks the delivery.
+      const SUB_COMMANDS: { name: string; delivery?: DeliveryMode }[] = [
+        { name: "sub" },
+        { name: "sub!", delivery: "auto" },
+        { name: "sub~", delivery: "share" },
+        { name: "sub?", delivery: "private" },
+      ];
+      for (const command of SUB_COMMANDS) {
+        pi.registerCommand(command.name, {
+          description: `Create a subagent (${command.delivery ?? "settings defaultDelivery"}): /${command.name} [--cwd <dir>] <agent> | /skill:<name> | /<template> [args]`,
+          getArgumentCompletions: (prefix) => subCompletions(prefix, state),
+          handler: async (args, ctx) => {
+            const current = state;
+            if (!current) {
+              ctx.ui.notify("pi-subagents: not initialised for this session yet", "error");
+              return;
+            }
+            // Refresh the captured context so a `/model` switch made just before `/sub` reaches the child.
+            current.ctx = ctx;
+            const parsed = parseSubCommand(args);
+            if ("error" in parsed) {
+              ctx.ui.notify(`pi-subagents: ${parsed.error}`, "error");
+              return;
+            }
+            const delivery = command.delivery ?? current.settings.defaultDelivery;
+            try {
+              const request: EntryRequest =
+                parsed.target.kind === "agent"
+                  ? { agent: parsed.target.name }
+                  : parsed.target.kind === "skill"
+                    ? { skill: parsed.target.name }
+                    : { command: parsed.target.name };
+              if (parsed.rest) request.task = parsed.rest;
+              const entry = parseEntryRequest(request, command.name);
+              const { record } = await current.manager.run({
+                ...request,
+                ...(parsed.cwd ? { cwd: parsed.cwd } : {}),
+                delivery,
+                background: true,
+                ask: entry.prompt,
+              });
+              const label = entry.kind === "agent" ? entry.name : `${entry.kind}:${entry.name}`;
+              ctx.ui.notify(`pi-subagents: 已创建 @${record.handle}（${label} · ${delivery}）；结果会自动送达`, "info");
+            } catch (error) {
+              ctx.ui.notify(`pi-subagents: ${(error as Error).message}`, "error");
+            }
+          },
+        });
+      }
+
+      pi.registerTool({
+        name: "subagents",
+        label: "Subagents",
+        description:
+          "Delegate work to named, persistent subagents. action=run starts a new one from exactly one entry — agent (needs task), skill or command — and returns its @handle. " +
+          "action=parallel runs many at once; chain runs steps in order, where {previous} is the previous step's output; continue resumes the step that stopped a chain and finishes it. " +
+          "action=resume continues an existing one in its own context (handle + message); prefer it when the user wants the same subagent to revise its work. " +
+          "action=steer guides a running one; interrupt pauses; stop ends it permanently; list shows all.",
+        parameters: SubagentsParams,
+        async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+          if (!state) throw new Error("pi-subagents is not initialised for this session yet");
+          state.ctx = ctx;
+          // The model's arguments never carry the internal delegation parent: `toolCallInput` drops a stray copy so
+          // the main session always dispatches as the depth-0 requester with no whitelist.
+          const out = await executeAction(state.manager, toolCallInput(params as SubagentsInput), signal);
+          return { content: [{ type: "text", text: out.text }], details: out.details };
+        },
+      });
+    }
+
+    // Register at load time so a freshly loaded extension is usable without waiting for `session_start`; the settings
+    // file is the same one `session_start` reloads, so `maxDepth: 0` hides the surface from the start. A session that
+    // turns out enabled later (the file was fixed between load and start) registers on `session_start` instead.
+    if (limitAllows(loadSettings(join(agentDir, "subagents.json")).settings.maxDepth, 0)) {
+      capabilitiesRegistered = true;
+      registerSubagentCapabilities();
+    }
   };
 }
 

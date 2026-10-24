@@ -1,6 +1,7 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type ExtensionContext, ProjectTrustStore, SettingsManager } from "@earendil-works/pi-coding-agent";
+import type { AutocompleteProvider } from "@earendil-works/pi-tui";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { PRIVATE_ENTRY_TYPE } from "../src/delivery.ts";
 import { createExtension } from "../src/index.ts";
@@ -86,6 +87,14 @@ describe("extension wiring", () => {
     expect(pi.tools.has("subagents")).toBe(true);
     for (const event of ["session_start", "session_tree", "session_shutdown"]) expect(pi.handlers.get(event)?.length).toBe(1);
     expect(pi.entryRenderers.has(PRIVATE_ENTRY_TYPE)).toBe(true);
+  });
+
+  it("does not register the tool or the /sub commands when maxDepth is 0", async () => {
+    const { pi, notes } = await boot({ settings: { maxDepth: 0 } });
+    expect(pi.tools.has("subagents")).toBe(false);
+    expect(pi.commands.has("subagents")).toBe(false);
+    expect(pi.commands.has("sub")).toBe(false);
+    expect(notes.some((n) => n.type === "warning" && n.message.includes("subagents are disabled (maxDepth is 0)"))).toBe(true);
   });
 
   it("rebuilds the registry from the branch on session_start", async () => {
@@ -211,6 +220,57 @@ describe("extension wiring", () => {
     expect(out.content[0].text).toContain("rpc answer");
     expect(rpcOpened).toHaveLength(1);
     expect(runner.opened).toHaveLength(0);
+  });
+});
+
+// REVIEW-013: the main session reaches the manager through `pi.tools.get("subagents").execute`, which must pass the
+// raw model arguments through `src/index.ts`'s `toolCallInput()` before dispatching. These cases keep a forged
+// `parentId` from re-attributing a run: they assert on the record the entry actually persisted, not on a helper.
+describe("the tool entry strips a forged delegation parent (REVIEW-013)", () => {
+  /** The last persisted registry entry for a handle, exactly as the manager left it on the session branch. */
+  const recordFor = (pi: FakePi, handle: string) =>
+    pi.branch
+      .filter((e: any) => e.customType === "pi-subagents/registry")
+      .map((e: any) => e.data as { id: string; handle: string; parentId?: string; depth: number })
+      .filter((r) => r.handle === handle)
+      .at(-1);
+
+  it("keeps a forged top-level parentId from re-attributing a run through pi.tools", async () => {
+    const { pi, callTool } = await boot({ scripts: [[ok("root")], [ok("forged")]] });
+    await callTool({ action: "run", agent: "reviewer", task: "root" });
+    const parent = recordFor(pi, "reviewer")!;
+
+    // Act: the forged id names a real record, so it would make this run a depth-2 child if it survived.
+    const out = await callTool({ action: "run", agent: "reviewer", task: "forged", parentId: parent.id });
+
+    // Assert: the main session dispatched it as a depth-1 root under the main session, not under the forged parent.
+    const record = recordFor(pi, out.details.handle as string)!;
+    expect(record.parentId).toBeUndefined();
+    expect(record.depth).toBe(1);
+  });
+
+  it("strips a forged parentId inside tasks[] items through pi.tools", async () => {
+    const { pi, callTool } = await boot({ scripts: [[ok("root")], [ok("forged")]] });
+    await callTool({ action: "run", agent: "reviewer", task: "root" });
+    const parent = recordFor(pi, "reviewer")!;
+
+    const out = await callTool({ action: "parallel", tasks: [{ agent: "reviewer", task: "forged", parentId: parent.id }] });
+
+    const record = recordFor(pi, out.details.handles[0] as string)!;
+    expect(record.parentId).toBeUndefined();
+    expect(record.depth).toBe(1);
+  });
+
+  it("strips a forged parentId inside chain[] steps through pi.tools", async () => {
+    const { pi, callTool } = await boot({ scripts: [[ok("root")], [ok("forged")]] });
+    await callTool({ action: "run", agent: "reviewer", task: "root" });
+    const parent = recordFor(pi, "reviewer")!;
+
+    const out = await callTool({ action: "chain", chain: [{ agent: "reviewer", task: "forged", parentId: parent.id }] });
+
+    const record = recordFor(pi, out.details.handles[0] as string)!;
+    expect(record.parentId).toBeUndefined();
+    expect(record.depth).toBe(1);
   });
 });
 
@@ -369,6 +429,37 @@ describe("chain state after a branch reload (REVIEW-001/REVIEW-002)", () => {
   });
 });
 
+describe("pending child result reminders (REVIEW-053)", () => {
+  it("reminds once with the three ways to handle waiting child results", async () => {
+    vi.useFakeTimers();
+    try {
+      // Boot with a branch whose paused parent already has one child result waiting; the wait is one minute old when
+      // the first tick fires. `at` is a real timestamp, never 0, which is the reminder-dedupe sentinel.
+      vi.setSystemTime(1_000_000);
+      const entry = recordEntry({
+        status: "paused",
+        pending: [{ fromId: "c1", handle: "scout", summary: "done", sessionFile: "/s", at: 1_000_000 }],
+      });
+      const { notes } = await boot({ branch: [entry], settings: { pendingResultTimeoutMinutes: 0.5 } });
+
+      // The rebuilt session restarts the reminder watch; the first tick is one minute later.
+      await vi.advanceTimersByTimeAsync(60_000);
+      const reminder = notes.find((n) => n.message.includes("action=drain"));
+      expect(reminder).toBeDefined();
+      expect(reminder!.type).toBe("warning");
+      expect(reminder!.message).toBe(
+        'pi-subagents: @reviewer is paused with 1 child result(s) waiting (1m). Resume it with "@reviewer …", hand them over with subagents action=drain handle=reviewer, or discard them with action=drop handle=reviewer.',
+      );
+
+      // Once per batch: a later tick does not repeat it.
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(notes.filter((n) => n.message.includes("action=drain"))).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 const input = (pi: FakePi, ctx: ExtensionContext, text: string, extra: Record<string, unknown> = {}) =>
   pi.emit("input", { type: "input", text, source: "interactive", ...extra }, ctx).then((r) => r[0]);
 
@@ -502,6 +593,19 @@ describe("@ mentions", () => {
     const { pi, ctx, providers } = await boot();
     await pi.emit("session_start", { type: "session_start" }, ctx);
     expect(providers).toHaveLength(1);
+  });
+
+  it("keeps a root completion description unchanged (CR-5-3)", async () => {
+    const { providers, callTool } = await boot({ scripts: [[ok("first")]] });
+    await callTool({ action: "run", agent: "reviewer", task: "review" });
+    const base: AutocompleteProvider = {
+      getSuggestions: async () => null,
+      applyCompletion: (lines, line, col) => ({ lines, cursorLine: line, cursorCol: col }),
+    };
+    const provider = (providers[0] as (current: AutocompleteProvider) => AutocompleteProvider)(base);
+    const result = await provider.getSuggestions(["@rev"], 0, 4, { signal: new AbortController().signal });
+    // A root record has no path to add: the description must not repeat its own handle as "reviewer · completed · reviewer".
+    expect(result?.items).toEqual([{ value: "@reviewer", label: "@reviewer", description: "reviewer · completed" }]);
   });
 });
 

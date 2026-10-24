@@ -15,14 +15,14 @@ const BatchItem = Type.Object({
  * Every action the `subagents` tool accepts. The schema union, the delegating session's gate and the dispatcher all
  * read this one list, so adding an action cannot silently miss one of them (REVIEW-040).
  */
-export const SUBAGENT_ACTIONS = ["run", "parallel", "chain", "resume", "continue", "steer", "interrupt", "stop", "list"] as const;
+export const SUBAGENT_ACTIONS = ["run", "parallel", "chain", "resume", "continue", "steer", "interrupt", "stop", "drain", "drop", "list"] as const;
 
 // TODO(delivery): background results from the main agent are always delivered with "auto". Add a `delivery`
 // parameter back if a use case appears (plan section 6.5 item 4).
 export const SubagentsParams = Type.Object({
   action: Type.Union(
     SUBAGENT_ACTIONS.map((action) => Type.Literal(action)),
-    { description: "run = new subagent; parallel = many at once; chain = sequential with {previous}; resume = continue a finished/paused one by handle; continue = resume the step that stopped a chain and finish it" },
+    { description: "run = new subagent; parallel = many at once; chain = sequential with {previous}; resume = continue a finished/paused one by handle; continue = resume the step that stopped a chain and finish it; drain = hand a paused parent's waiting child results to the caller; drop = discard them" },
   ),
   agent: Type.Optional(Type.String({ description: "Agent name (run); give exactly one of agent, skill or command" })),
   skill: Type.Optional(Type.String({ description: "Skill name (run), run as /skill:<name> in the child" })),
@@ -234,6 +234,15 @@ async function dispatch(
     case "stop":
       await manager.stop(need(input.handle, "handle", "stop"));
       return { text: `${input.handle} stopped; it cannot be resumed.`, details: {} };
+    case "drain": {
+      // Hand a paused parent's waiting child results to the caller instead of resuming the parent.
+      const out = await manager.drainPending(need(input.handle, "handle", "drain"));
+      return { text: out.text, details: { count: out.count } };
+    }
+    case "drop": {
+      const dropped = manager.dropPending(need(input.handle, "handle", "drop"));
+      return { text: `dropped ${dropped} waiting child result(s)`, details: { count: dropped } };
+    }
     case "list": {
       const records = manager.list();
       return { text: renderTree(records, "list", manager.listChains()), details: { count: records.length } };

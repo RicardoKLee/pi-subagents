@@ -46,6 +46,9 @@ export function buildRpcArgs(spec: ChildSpec, model: string, opts: { trusted?: b
     "-ne",
     // `-ne` disables automatic discovery; an explicit `-e` still loads (docs/cli.md:196), which is how a nested
     // child gets the proxy tool without the parent's other extensions.
+    // REVIEW-024 (deferred): `-e` could be limited to `spec.delegation?.canDelegate`, but a non-delegating nested
+    // child still gets it today and test/rpc-runner.test.ts pins `-e` right after `-ne` for that case; revisit when
+    // that expectation changes.
     ...(spec.delegation ? ["-e", EXTENSION_ENTRY] : []),
     "--model",
     model,
