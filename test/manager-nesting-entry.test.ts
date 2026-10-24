@@ -210,6 +210,19 @@ describe("the main session cannot forge a delegation parent", () => {
     expect(forged).toHaveProperty("parentId", "rec-forged");
   });
 
+  it("strips a model-supplied detach flag in toolCallInput (LATENT-046-BG)", () => {
+    // `detach` is the internal fire-and-forget marker: the model-visible schema declares no such field, so a forged
+    // copy must never turn a main-session run into a non-blocking one.
+    const forged = { action: "run", agent: "worker", task: "x", background: true, detach: true } as unknown as SubagentsInput;
+
+    const stripped = toolCallInput(forged);
+
+    expect("detach" in stripped).toBe(false);
+    expect(stripped).not.toHaveProperty("detach");
+    // The original params object is not mutated.
+    expect(forged).toHaveProperty("detach", true);
+  });
+
   it("dispatches a forged parentId as a depth-1 root through the entry", async () => {
     const { manager, registry } = setup();
     // `lead` whitelists only `worker`; `locked` would be refused if the forged parentId survived the strip.

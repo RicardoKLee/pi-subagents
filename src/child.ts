@@ -41,6 +41,12 @@ export function childExtension(opts: ChildDelegationOptions): ExtensionFactory {
         "Delegate work to subagents that belong to you: results come back into this session, and you can only reach your own subagents (never your parent's or your siblings'). " +
         "action=run starts one; parallel/chain run several; resume/continue/steer/interrupt/stop act on your own subagents; list shows your subtree.",
       parameters: SubagentsParams,
+      // One delegation at a time with the other calls of the assistant message. The tool forwards to the owning
+      // session's manager, which yields the delegating run's scheduler slot while it waits for a child; running two
+      // of these at once used to race that yield/re-acquire and deadlock under maxConcurrent 1 (REVIEW-046). This is
+      // hardening only: the manager coordinates concurrent in-flight delegations itself, so a caller that still runs
+      // them in parallel stays correct.
+      executionMode: "sequential",
       async execute(_toolCallId, params, signal) {
         const out = await opts.host.request(parentRecordId, params as Record<string, unknown>, signal);
         return { content: [{ type: "text" as const, text: out.text }], details: out.details ?? {} };

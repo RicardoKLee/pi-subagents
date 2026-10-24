@@ -52,6 +52,11 @@ export interface DelegationScope {
   parentId?: string;
   /** Informational only: the manager always derives depth from `parentId`, so a caller's claim is ignored. */
   depth?: number;
+  /**
+   * Set only by the delegation path for a background action: run/resume return the queued handle without waiting for a
+   * scheduler slot (LATENT-046-BG). The model-visible tool never sets it; `delegate()` derives it from `background`.
+   */
+  detach?: boolean;
 }
 
 /** A dispatch request: the model-visible input plus the internal delegation scope. */
@@ -60,15 +65,18 @@ export type DispatchInput = SubagentsInput & DelegationScope;
 /**
  * Strips the internal delegation fields from a tool call. Extra JSON properties are not part of `SubagentsParams`,
  * but a model could still send one; it must never reach the manager as if it came from the internal delegation path.
- * The top-level `parentId` and any `parentId` inside `tasks[]` / `chain[]` items are dropped (the model-visible
- * schema declares the field nowhere).
+ * The top-level `parentId`, the internal `detach` flag and any `parentId` inside `tasks[]` / `chain[]` items are dropped
+ * (the model-visible schema declares none of them).
  */
 export function toolCallInput(params: SubagentsInput): SubagentsInput {
-  const candidate = params as SubagentsInput & { parentId?: unknown };
+  const candidate = params as SubagentsInput & { parentId?: unknown; detach?: unknown };
   const tasks = stripItemParents(candidate.tasks);
   const chain = stripItemParents(candidate.chain);
-  if (candidate.parentId === undefined && tasks === candidate.tasks && chain === candidate.chain) return params;
-  const { parentId: _internal, ...rest } = candidate;
+  const internal = candidate.parentId !== undefined || candidate.detach !== undefined;
+  if (!internal && tasks === candidate.tasks && chain === candidate.chain) return params;
+  // `parentId` re-attributes a run and `detach` would make it fire-and-forget; dropping both keeps the main session
+  // at depth 0 with its normal blocking semantics (LATENT-046-BG).
+  const { parentId: _parent, detach: _detach, ...rest } = candidate;
   return {
     ...rest,
     ...(tasks !== candidate.tasks ? { tasks } : {}),
@@ -160,6 +168,7 @@ async function dispatch(
   // Background work started by the main agent always comes back with "auto": it started the work to use the result.
   const extra = {
     ...(input.background ? { background: true, delivery: "auto" as const } : {}),
+    ...(input.detach ? { detach: true } : {}),
     ...(signal ? { signal } : {}),
   };
   // Internal only: the parent record the delegation path attributes runs to. The main agent's tool call never
@@ -176,6 +185,7 @@ async function dispatch(
         ...(parentId ? { parentId } : {}),
         ...(input.cwd ? { cwd: input.cwd } : {}),
         ...(input.background ? { background: true } : {}),
+        ...(input.detach ? { detach: true } : {}),
         ...(signal ? { signal } : {}),
       });
       const body = payload ? payload.text : "Started in the background; the result will be delivered when it finishes.";

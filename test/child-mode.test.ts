@@ -50,6 +50,13 @@ describe("index child-session mode (REVIEW-022)", () => {
     expect(pi.entryRenderers.size).toBe(0);
   });
 
+  it("should_register_the_child_delegation_tool_sequential_when_the_child_may_delegate", async () => {
+    // REVIEW-046 hardening: pi must run the calls of one assistant message one at a time for this tool, so two
+    // delegations cannot race the manager's yield/re-acquire. The manager still coordinates them on its own.
+    const pi = await bootChild({ child: "rec-1", delegate: "1", mailbox: "/tmp/mbox" });
+    expect(pi.tools.get("subagents")!.executionMode).toBe("sequential");
+  });
+
   it("should_register_no_tool_when_the_child_may_not_delegate", async () => {
     const pi = await bootChild({ child: "rec-1", delegate: "0", mailbox: "/tmp/mbox" });
     expect(pi.tools.size).toBe(0);

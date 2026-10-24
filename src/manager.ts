@@ -7,7 +7,7 @@ import { type Ask, deliver, type DeliveryPort, deliverBatch, quoteAsk, renderAsk
 import { BUILTIN_ENTRY_AGENT_DEF, type EntryRequest, parseEntryRequest, type ResolvedEntry, validateEntryTarget } from "./entries.ts";
 import { type MailboxErrorInfo, MailboxServer } from "./mailbox.ts";
 import { estimateTokens, type Payload, preparePayload, SUMMARY_INSTRUCTION, writeOutput } from "./output.ts";
-import { recordEntryLabel, type Registry, type RunStatus, type SubagentRecord, type Usage, ZERO_USAGE } from "./registry.ts";
+import { type PendingResult, recordEntryLabel, type Registry, type RunStatus, type SubagentRecord, type Usage, ZERO_USAGE } from "./registry.ts";
 import type { ChildDelegation, ChildResult, ChildSession, Runner } from "./runner/types.ts";
 import { type Scheduler, SubagentsDisabledError } from "./scheduler.ts";
 import type { DeliveryMode, RunnerKind, SubagentSettings } from "./settings.ts";
@@ -39,6 +39,13 @@ export class SubagentError extends Error {
  */
 const DELEGATION_ACTIONS = new Set<string>(SUBAGENT_ACTIONS);
 
+/**
+ * The delegation actions that wait for a child run and therefore hand the parent's scheduler slot over for the wait
+ * (REVIEW-046). `list`, `steer`, `interrupt` and `stop` only touch records that already exist and return without
+ * starting a run, so they must never release and re-acquire the parent's slot (REVIEW-049).
+ */
+const YIELDING_DELEGATION_ACTIONS = new Set<string>(["run", "resume", "continue", "parallel", "chain"]);
+
 export interface ManagerDeps {
   registry: Registry;
   chainStore: ChainStore;
@@ -64,11 +71,21 @@ export interface ManagerDeps {
   onRecordCreated?: (record: SubagentRecord) => void;
   /** Directory of the file mailbox a nested child uses to delegate (M6). Absent disables nesting. */
   mailboxDir?: string;
+  /** Called once when a pending child-result batch has waited longer than `pendingResultTimeoutMinutes` (M6). */
+  onPendingReminder?: (record: SubagentRecord, count: number, oldestMinutes: number) => void;
+  /** Injectable clock (tests); defaults to Date.now. */
+  now?: () => number;
 }
 
 export interface RunRequest extends EntryRequest {
   delivery?: DeliveryMode;
   background?: boolean;
+  /**
+   * Set only by the delegation path for a background action: return the queued handle without waiting for a scheduler
+   * slot, so a subagent's own tool call never blocks on the slot that subagent holds (LATENT-046-BG). The wait moves
+   * into a detached task, so the child still starts as soon as a slot frees. Honored only when no slot is free now.
+   */
+  detach?: boolean;
   /** The calling tool's signal: aborting it cancels this run while queued, opening, or (foreground) running. */
   signal?: AbortSignal;
   /** Working directory for the child; relative paths resolve against deps.cwd. Defaults to deps.cwd. */
@@ -140,6 +157,8 @@ interface LaunchOptions {
   receiverContextWindow?: number;
   /** User messages to quote with the delivered result. */
   asks?: Ask[];
+  /** Delegation-path background run: return the queued handle and wait for a slot in a detached task (LATENT-046-BG). */
+  detach?: boolean;
 }
 
 interface Live {
@@ -147,6 +166,18 @@ interface Live {
   intent?: "interrupt" | "stop";
   /** User messages sent through `@` for this run, quoted with its result. */
   asks: Ask[];
+  /**
+   * The scheduler grant this run currently holds. `execute` sets it on entry; a foreground delegation swaps it while
+   * the parent waits for a child (REVIEW point 5), so `execute` must release whatever grant is current there.
+   */
+  release?: () => void;
+  /**
+   * How many foreground delegations have given up this run's slot and are still waiting on a child. The first one
+   * releases the slot (0 -> 1) and the last one to finish re-acquires it (1 -> 0); concurrent delegations from one
+   * parent therefore share a single yielded grant instead of each releasing and re-acquiring its own, which deadlocked
+   * two parallel calls under maxConcurrent 1 (REVIEW-046).
+   */
+  yielding?: number;
 }
 
 export class SubagentManager {
@@ -167,10 +198,17 @@ export class SubagentManager {
   /** The file mailbox that serves delegations from RPC children while at least one can ask (M6). */
   private mailbox?: MailboxServer;
   private closed = false;
+  /** Reminder watch for queued child results (M6); started only while something is waiting. */
+  private pendingTimer?: NodeJS.Timeout;
   /** Aborted on shutdown so queued run/resume calls stop waiting for a slot. */
   private readonly lifetime = new AbortController();
 
   constructor(private readonly deps: ManagerDeps) {}
+
+  /** Injectable clock so reminder timing is testable. */
+  private now(): number {
+    return this.deps.now?.() ?? Date.now();
+  }
 
   list(): SubagentRecord[] {
     return this.deps.registry.list();
@@ -343,12 +381,64 @@ export class SubagentManager {
     }
     const parent = this.deps.registry.get(parentRecordId);
     if (!parent) throw new Error(`unknown parent subagent ${parentRecordId}`);
+    // A foreground delegation of a spawning action blocks the parent until its child returns, so the parent gives up
+    // its scheduler slot for the wait: with maxConcurrent 1 the child (or a parallel/chain item) could otherwise never
+    // start, because the only slot would stay with the parent that is waiting for it. A background delegation never
+    // blocks, and so do `list`/`steer`/`interrupt`/`stop`, which return without a child run (REVIEW-049).
+    const live = this.live.get(parent.id);
+    const yields = live !== undefined && payload.background !== true && YIELDING_DELEGATION_ACTIONS.has(action);
+    if (yields && live) {
+      // Concurrent delegations share one yielded grant: only the first releases it (0 -> 1 in flight) and only the
+      // last takes it back (1 -> 0). Each one releasing and re-acquiring its own grant would queue the losers behind
+      // a sibling that only the parent's own `execute` finally can release, deadlocking both (REVIEW-046).
+      if ((live.yielding ?? 0) === 0) {
+        live.release?.();
+        live.release = undefined;
+        this.evictIdle();
+      }
+      live.yielding = (live.yielding ?? 0) + 1;
+    }
+    try {
+      return await this.delegateInner(parent, payload, signal);
+    } finally {
+      if (yields && live) {
+        const remaining = (live.yielding ?? 1) - 1;
+        live.yielding = remaining;
+        // Only the last in-flight delegation re-acquires the shared grant; an earlier one leaves it to the child that
+        // holds it, so it can never queue behind its own sibling.
+        if (remaining === 0) {
+          let again: (() => void) | undefined;
+          try {
+            again = await this.deps.scheduler.acquire(signal);
+          } catch {
+            // The run was aborted or the manager shut down while waiting; `execute` owns the original release and the
+            // scheduler makes releasing an already-released slot a no-op.
+          }
+          if (again) {
+            // The parent may have finished while this delegation was in flight (its own `finally` already released);
+            // never keep the slot we just took for a run that no longer exists.
+            if (this.live.get(parent.id) === live) live.release = again;
+            else again();
+          }
+        }
+      }
+    }
+  }
+
+  /** Dispatches one validated delegation request for `parent`; `delegate` owns the parent's scheduler slot around it. */
+  private async delegateInner(parent: SubagentRecord, payload: Record<string, unknown>, signal?: AbortSignal): Promise<{ text: string; details: Record<string, unknown> }> {
     // `SubagentsParams` never declares the internal delegation fields, so a stray copy must not reach the dispatcher
-    // as if the trusted path had set it: this method applies the real parent itself (see `inheritParent`).
+    // as if the trusted path had set it: these methods apply the real parent themselves (see `inheritParent`).
     const rest: Record<string, unknown> = { ...payload };
     delete rest.parentId;
     delete rest.depth;
+    // A stray `detach` from the mailbox must not be trusted: the flag is derived below from the validated background
+    // field so only the real delegation path can turn a run into fire-and-forget (LATENT-046-BG).
+    delete rest.detach;
     const input = rest as SubagentsInput;
+    // A background action a child asked for is fire-and-forget: mark it so run/resume never block on a scheduler slot
+    // their own parent holds. Derived from the validated `background` field, never taken from the mailbox payload.
+    const detach = payload.background === true;
     if (input.action === "list") {
       // A child sees only its own subtree: never its parent, its siblings, or its parent's other branches.
       const records = this.descendants(parent.id);
@@ -368,9 +458,9 @@ export class SubagentManager {
     if (input.action === "run" || input.action === "parallel" || input.action === "chain") {
       // Only spawning actions create records, so only they need the parent; resume/continue/steer/interrupt/stop act
       // on a record that already exists.
-      return executeAction(this, { ...scoped, parentId: parent.id, depth: parent.depth + 1 }, signal, noCascade);
+      return executeAction(this, { ...scoped, parentId: parent.id, depth: parent.depth + 1, ...(detach ? { detach: true } : {}) }, signal, noCascade);
     }
-    return executeAction(this, scoped, signal, noCascade);
+    return executeAction(this, { ...scoped, ...(detach ? { detach: true } : {}) }, signal, noCascade);
   }
 
   /**
@@ -448,6 +538,7 @@ export class SubagentManager {
     return this.launch(prepared, req.background ?? false, req.signal, {
       ...(req.receiverContextWindow ? { receiverContextWindow: req.receiverContextWindow } : {}),
       ...(req.ask ? { asks: [this.ask("ask", req.ask)] } : {}),
+      ...(req.detach ? { detach: true } : {}),
     });
   }
 
@@ -492,8 +583,25 @@ export class SubagentManager {
     return { record, agent, runner, cwd, trusted, controller, prompt: entry.prompt };
   }
 
-  /** Waits for a slot, opens the child, then runs one turn. */
+  /**
+   * Starts a run: waits for a slot, opens the child, then runs one turn. A background run that a subagent asked for
+   * (options.detach) returns its queued handle at once when no slot is free and finishes starting in a detached task:
+   * the delegating tool call would otherwise block the very slot its parent holds, and with maxConcurrent 1 the child
+   * could never take it (LATENT-046-BG). The parent keeps its slot (plan 6.9 decision 6: a background delegation never
+   * yields); the child simply queues behind it, exactly as decision 6 intends.
+   */
   private async launch(prepared: Prepared, background: boolean, signal: AbortSignal | undefined, options: LaunchOptions = {}): Promise<RunOutcome> {
+    if (background && options.detach && !this.deps.scheduler.hasCapacity()) {
+      // `launchWithSlot` registers its waiter synchronously, so by the time this returns the record is queued and
+      // `scheduler.queued` already reflects it. `track` keeps whenIdle() and shutdown() aware of the detached start.
+      this.track(this.launchWithSlot(prepared, background, signal, options));
+      return { record: prepared.record };
+    }
+    return this.launchWithSlot(prepared, background, signal, options);
+  }
+
+  /** The launch body after the detach decision: waits for a slot, opens the child, then runs one turn. */
+  private async launchWithSlot(prepared: Prepared, background: boolean, signal: AbortSignal | undefined, options: LaunchOptions = {}): Promise<RunOutcome> {
     const { record, agent, runner, cwd, trusted, controller } = prepared;
     const cancel = AbortSignal.any([this.lifetime.signal, controller.signal, ...(signal ? [signal] : [])]);
     let release: () => void;
@@ -501,6 +609,9 @@ export class SubagentManager {
       release = await this.deps.scheduler.acquire(cancel);
     } catch (error) {
       this.queued.delete(record.id);
+      // This run never started a poller of its own, but it was keeping an earlier run's poller alive: with it gone,
+      // the mailbox must stop once nothing else can ask (REVIEW-043).
+      this.maybeStopMailbox();
       throw this.settleQueued(record.id, error, signal);
     }
     let delegation: ChildDelegation | undefined;
@@ -521,12 +632,14 @@ export class SubagentManager {
     } catch (error) {
       this.queued.delete(record.id);
       release();
+      this.maybeStopMailbox();
       throw this.settleQueued(record.id, error, signal);
     }
     this.queued.delete(record.id);
     if (this.closed || controller.signal.aborted || signal?.aborted) {
       // Shutdown, a cancel by handle, or the calling tool's abort happened while the session was opening.
       release();
+      this.maybeStopMailbox();
       await this.close(record.id, session);
       throw this.settleQueued(record.id, this.closed ? shutDownError() : runInterruptedError(), signal);
     }
@@ -828,10 +941,34 @@ export class SubagentManager {
   private sendBatch(kind: "parallel" | "chain", payload: Payload, records: readonly SubagentRecord[], chain?: ChainRecord): void {
     if (this.closed) return;
     if (!records.some((r) => r.status === "completed" || r.status === "failed")) return;
+    // A nested background group belongs to the delegating subagent, never to the main session (plan 6.9 decision 9:
+    // a result only ever goes to the direct parent). Only a group whose records all share one existing parent is
+    // rerouted; a mixed or parentless batch keeps the existing main-session delivery. A batch record never delivers
+    // on its own (`finish` skips batch mode), so this group summary is the single delivery.
+    const parent = this.sharedParent(records);
+    if (parent) {
+      const head = records.find((r) => r.status === "completed") ?? records[0]!;
+      this.routeToParent(parent, {
+        fromId: head.id,
+        handle: head.handle,
+        summary: payload.text,
+        sessionFile: head.sessionFile,
+        ...(payload.filePath ? { filePath: payload.filePath } : {}),
+        at: this.now(),
+      });
+      return;
+    }
     deliverBatch(this.deps.port, {
       text: payload.text,
       details: { kind, ...(chain ? { chainId: chain.id, status: chain.status } : {}), handles: records.map((r) => r.handle) },
     });
+  }
+
+  /** The one parent every record belongs to, or undefined (no parent, mixed parents, or a parent that vanished). */
+  private sharedParent(records: readonly SubagentRecord[]): SubagentRecord | undefined {
+    const parentId = records[0]?.parentId;
+    if (!parentId || !records.every((r) => r.parentId === parentId)) return undefined;
+    return this.deps.registry.get(parentId);
   }
 
   /** Resolves a run's entry, agent, runner and cwd without creating a record, so a whole batch can be validated first. */
@@ -876,10 +1013,13 @@ export class SubagentManager {
 
   async resume(
     handle: string,
-    message: string,
-    opts: { delivery?: DeliveryMode; background?: boolean; signal?: AbortSignal; mention?: boolean; receiverContextWindow?: number; mode?: "single" | "batch" } = {},
+    userMessage: string,
+    opts: { delivery?: DeliveryMode; background?: boolean; signal?: AbortSignal; mention?: boolean; receiverContextWindow?: number; mode?: "single" | "batch"; detach?: boolean } = {},
   ): Promise<RunOutcome> {
     const { record, agent, runner, cwd } = this.preflight(handle);
+    // Child results that arrived while this record was paused are handed to the model before the user's message.
+    const pendingResults = record.pending ?? [];
+    const message = pendingResults.length ? `${this.childResultsText(record, pendingResults)}\n\n${userMessage}` : userMessage;
     const trusted = this.deps.trustForCwd?.(cwd);
     // Snapshot taken before the claim so a failed resume can be rolled back fully.
     const previous: { status: RunStatus; runId: number; delivery: DeliveryMode; error: string | undefined } = {
@@ -913,74 +1053,96 @@ export class SubagentManager {
       this.markStopped(record.id);
       return new SubagentError("stopped", `@${record.handle} was stopped while waiting to resume`);
     };
-    let release: () => void;
-    let delegation: ChildDelegation | undefined;
-    let session: ChildSession;
-    try {
-      release = await this.deps.scheduler.acquire(claim.controller.signal);
+    const proceed = async (): Promise<RunOutcome> => {
+      let release: () => void;
+      let delegation: ChildDelegation | undefined;
+      let session: ChildSession;
       try {
-        // A resumed child that may delegate must get its proxy tool back (REVIEW-021): recompute the delegation for
-        // this record instead of dropping it, exactly as launch() does.
-        delegation = this.delegationSpecFor(record);
-        session =
-          (await this.takeIdle(record)) ??
-          // takeIdle has waited for any close of this record still in flight, so the file has no other writer.
-          (await runner.open({
-            agent,
-            cwd,
-            sessionDir: this.deps.sessionDir,
-            resumeFile: record.sessionFile,
-            ...(record.childLeafId ? { resumeLeafId: record.childLeafId } : {}),
-            ...(trusted !== undefined ? { projectTrusted: trusted } : {}),
-            appendSystemPrompt: [agent.systemPrompt, SUMMARY_INSTRUCTION].filter(Boolean),
-            ...(delegation ? { delegation } : {}),
-          }));
-        if (this.closed) {
-          // Shutdown during open: dispose here; release and rollback run in the handlers below.
-          await this.close(record.id, session);
-          throw shutDownError();
-        }
-        if (signal?.aborted && claim.intent !== "stop") {
-          // The calling tool was aborted while the session was opening; release and rollback run below.
-          await this.close(record.id, session);
-          throw interruptedWhileWaiting();
+        release = await this.deps.scheduler.acquire(claim.controller.signal);
+        try {
+          // A resumed child that may delegate must get its proxy tool back (REVIEW-021): recompute the delegation for
+          // this record instead of dropping it, exactly as launch() does.
+          delegation = this.delegationSpecFor(record);
+          session =
+            (await this.takeIdle(record)) ??
+            // takeIdle has waited for any close of this record still in flight, so the file has no other writer.
+            (await runner.open({
+              agent,
+              cwd,
+              sessionDir: this.deps.sessionDir,
+              resumeFile: record.sessionFile,
+              ...(record.childLeafId ? { resumeLeafId: record.childLeafId } : {}),
+              ...(trusted !== undefined ? { projectTrusted: trusted } : {}),
+              appendSystemPrompt: [agent.systemPrompt, SUMMARY_INSTRUCTION].filter(Boolean),
+              ...(delegation ? { delegation } : {}),
+            }));
+          if (this.closed) {
+            // Shutdown during open: dispose here; release and rollback run in the handlers below.
+            await this.close(record.id, session);
+            throw shutDownError();
+          }
+          if (signal?.aborted && claim.intent !== "stop") {
+            // The calling tool was aborted while the session was opening; release and rollback run below.
+            await this.close(record.id, session);
+            throw interruptedWhileWaiting();
+          }
+        } catch (error) {
+          release();
+          throw error;
         }
       } catch (error) {
-        release();
+        unlinkClaim();
+        this.claims.delete(record.id);
+        // The claim is gone and no session was opened: stop the mailbox if this was the last thing keeping it alive
+        // (REVIEW-043).
+        this.maybeStopMailbox();
+        if (claim.intent === "stop") throw stoppedWhileWaiting();
+        this.deps.registry.update(record.id, previous);
+        if (!this.closed && signal?.aborted) throw interruptedWhileWaiting();
         throw error;
       }
-    } catch (error) {
       unlinkClaim();
       this.claims.delete(record.id);
-      if (claim.intent === "stop") throw stoppedWhileWaiting();
-      this.deps.registry.update(record.id, previous);
-      if (!this.closed && signal?.aborted) throw interruptedWhileWaiting();
-      throw error;
-    }
-    unlinkClaim();
-    this.claims.delete(record.id);
-    if (claim.intent === "stop") {
-      release();
-      await this.close(record.id, session);
-      throw stoppedWhileWaiting();
-    }
-    if (delegation?.canDelegate) {
-      try {
-        this.ensureMailbox();
-      } catch (error) {
-        // As in launch(): a mailbox that cannot be created must release the slot, close the session and roll the
-        // record back to the status it had before this resume, never leaving it stuck running (REVIEW-036).
-        this.maybeStopMailbox();
+      if (claim.intent === "stop") {
         release();
+        this.maybeStopMailbox();
         await this.close(record.id, session);
-        this.deps.registry.update(record.id, previous);
-        throw error;
+        throw stoppedWhileWaiting();
       }
+      if (delegation?.canDelegate) {
+        try {
+          this.ensureMailbox();
+        } catch (error) {
+          // As in launch(): a mailbox that cannot be created must release the slot, close the session and roll the
+          // record back to the status it had before this resume, never leaving it stuck running (REVIEW-036).
+          this.maybeStopMailbox();
+          release();
+          await this.close(record.id, session);
+          this.deps.registry.update(record.id, previous);
+          throw error;
+        }
+      }
+      const outcome = await this.execute(claimed, session, message, release, opts.background ?? false, signal, opts.mention ? [this.ask("ask", message)] : [], {
+        ...(opts.mode ? { mode: opts.mode } : {}),
+        ...(opts.receiverContextWindow ? { receiverContextWindow: opts.receiverContextWindow } : {}),
+      });
+      // The queued results reached the model with this message; drop exactly those entries (a child that finished
+      // while this resume waited for a slot may have queued another one, which must stay).
+      if (pendingResults.length) {
+        const remaining = (this.deps.registry.get(record.id)?.pending ?? []).filter((p) => !pendingResults.includes(p));
+        this.deps.registry.update(record.id, { pending: remaining, pendingNotifiedAt: undefined });
+      }
+      return outcome;
+    };
+    // A background resume a subagent asked for (detach) returns the claimed handle at once when no slot is free: the
+    // delegating tool call would otherwise block the very slot that parent holds (LATENT-046-BG). The synchronous
+    // claim above is already visible, and the detached task waits for a slot, opens the child and settles it exactly
+    // as a normal resume.
+    if (opts.background && opts.detach && !this.deps.scheduler.hasCapacity()) {
+      this.track(proceed());
+      return { record: claimed };
     }
-    return this.execute(claimed, session, message, release, opts.background ?? false, signal, opts.mention ? [this.ask("ask", message)] : [], {
-      ...(opts.mode ? { mode: opts.mode } : {}),
-      ...(opts.receiverContextWindow ? { receiverContextWindow: opts.receiverContextWindow } : {}),
-    });
+    return proceed();
   }
 
   /** The error resume() would reject with right away, if any; lets fire-and-forget callers report it immediately. */
@@ -1064,6 +1226,7 @@ export class SubagentManager {
   async shutdown(): Promise<void> {
     this.closed = true;
     this.lifetime.abort();
+    this.stopPendingWatch();
     for (const claim of this.claims.values()) claim.controller.abort();
     await this.interruptAll();
     for (const id of [...this.idle.keys()]) void this.closeIdle(id);
@@ -1137,7 +1300,7 @@ export class SubagentManager {
     asks: Ask[] = [],
     options: LaunchOptions = {},
   ): Promise<RunOutcome> {
-    const live: Live = { session, asks: options.asks ?? asks };
+    const live: Live = { session, asks: options.asks ?? asks, release };
     this.live.set(record.id, live);
     this.evictIdle();
     const batch = options.mode === "batch";
@@ -1164,7 +1327,9 @@ export class SubagentManager {
           // A broken session simply leaves the previous leaf in place.
         }
         this.live.delete(record.id);
-        release();
+        // A foreground delegation may have swapped the grant while it waited for a child (REVIEW point 5); release
+        // whichever grant the parent currently holds. The scheduler makes a repeated release a no-op.
+        (live.release ?? release)();
         // A child that is not kept has finished closing before the run ends, as in M2.
         await this.park(record.id, session, live);
         // The last live child of a delegating session just ended: stop polling an empty mailbox (review point 4).
@@ -1231,31 +1396,177 @@ export class SubagentManager {
     const shown = live.asks.filter((a) => !a.private);
     if (!background && shown.length) payload = { ...payload, text: `${renderAsks(current.handle, shown)}\n\n${payload.text}` };
     if (background && !batch && status !== "stopped" && status !== "paused") {
-      // Only a private run's own private entry may quote private instructions.
-      const quoted = record.delivery === "private" ? live.asks : shown;
-      try {
-        deliver(this.deps.port, record.delivery, {
-          handle: record.handle,
-          agent: recordEntryLabel(record),
-          status,
-          text: payload.text,
-          sessionFile: record.sessionFile,
-          ...(payload.filePath ? { filePath: payload.filePath } : {}),
-          ...(quoted.length ? { asks: quoted } : {}),
-        });
-      } catch (deliveryError) {
-        // Delivery is a side channel: keep the run's status, record why it was not delivered.
-        // Keep the run's own error (e.g. why it failed) in front of the delivery error.
-        const message = (deliveryError as Error).message;
-        record = registry.update(id, { error: `${error ? `${error}; ` : ""}delivery failed: ${message}` });
+      if (record.parentId) {
+        // A nested run hands its result to its own parent, never to the main session.
+        if (status === "completed") this.routeChildResult(record, payload);
+      } else {
+        // Only a private run's own private entry may quote private instructions.
+        const quoted = record.delivery === "private" ? live.asks : shown;
         try {
-          this.deps.onDeliveryError?.(record, message);
-        } catch {
-          // The notifier must never turn a finished run into a failed one.
+          deliver(this.deps.port, record.delivery, {
+            handle: record.handle,
+            agent: recordEntryLabel(record),
+            status,
+            text: payload.text,
+            sessionFile: record.sessionFile,
+            ...(payload.filePath ? { filePath: payload.filePath } : {}),
+            ...(quoted.length ? { asks: quoted } : {}),
+          });
+        } catch (deliveryError) {
+          // Delivery is a side channel: keep the run's status, record why it was not delivered.
+          // Keep the run's own error (e.g. why it failed) in front of the delivery error.
+          const message = (deliveryError as Error).message;
+          record = registry.update(id, { error: `${error ? `${error}; ` : ""}delivery failed: ${message}` });
+          try {
+            this.deps.onDeliveryError?.(record, message);
+          } catch {
+            // The notifier must never turn a finished run into a failed one.
+          }
         }
       }
     }
     return { record, payload };
+  }
+
+  /** Hands a finished child's result to its parent: continue it, queue into it, or wait for its resume. */
+  private routeChildResult(child: SubagentRecord, payload: Payload): void {
+    const parent = this.deps.registry.get(child.parentId!);
+    if (!parent) return;
+    this.routeToParent(parent, {
+      fromId: child.id,
+      handle: child.handle,
+      summary: payload.summary,
+      sessionFile: child.sessionFile,
+      ...(payload.filePath ? { filePath: payload.filePath } : {}),
+      at: this.now(),
+    });
+  }
+
+  /**
+   * Delivers one pending entry to a parent: inject it if the parent is live, resume an idle one, and otherwise queue
+   * it. Used by both a single finished child and a nested background group summary, so both reach the direct parent
+   * by exactly one path.
+   */
+  private routeToParent(parent: SubagentRecord, entry: PendingResult): void {
+    if (parent.status === "stopped") return; // discarded with the parent
+    // Delivery failure must not lose the result: it stays queued for a later resume/drain.
+    const fail = (error: unknown) => {
+      this.queuePending(parent, entry);
+      this.reportDeliveryError(parent, error);
+    };
+    if (parent.status === "paused") {
+      this.queuePending(parent, entry);
+      return;
+    }
+    const live = this.live.get(parent.id);
+    if (live) {
+      // Tracked so whenIdle()/shutdown() observe the injection: this hand-off is still work even though the run that
+      // produced the result already ended.
+      this.track(live.session.deliver(this.childResultsText(parent, [entry]), "queue"), fail);
+      return;
+    }
+    // An idle parent is one whose session is still resident: continue it in place. A parent whose session was
+    // closed is not silently reopened for a grandchild's result; the result waits for an explicit resume or drain.
+    if (!this.idle.has(parent.id)) {
+      this.queuePending(parent, entry);
+      return;
+    }
+    // Tracked for the same reason: the parent's continued turn must be part of whenIdle(), or a caller that awaits it
+    // could observe the child result before the parent ever receives it.
+    this.track(this.resume(parent.handle, this.childResultsText(parent, [entry]), { background: true, mode: "batch" }), fail);
+  }
+
+  /** Appends one child result to the parent's pending queue and makes sure the reminder watch runs. */
+  private queuePending(parent: SubagentRecord, entry: PendingResult): void {
+    const current = this.deps.registry.get(parent.id) ?? parent;
+    this.deps.registry.update(parent.id, { pending: [...(current.pending ?? []), entry], pendingNotifiedAt: undefined });
+    this.ensurePendingWatch();
+  }
+
+  /** Surfaces a delivery failure through the existing notifier, never throwing from a finished run. */
+  private reportDeliveryError(parent: SubagentRecord, error: unknown): void {
+    const message = (error as Error).message;
+    // Decision 9: the result stays queued *and* the parent records why the hand-off failed, in the same style as a
+    // child record ("delivery failed: ..."). Persisting can fail once the main session is gone, so it is guarded
+    // separately: the notifier must still report the failure.
+    try {
+      const current = this.deps.registry.get(parent.id) ?? parent;
+      this.deps.registry.update(parent.id, { error: `${current.error ? `${current.error}; ` : ""}delivery failed: ${message}` });
+    } catch {
+      // The notifier below still surfaces the failure.
+    }
+    try {
+      this.deps.onDeliveryError?.(parent, `child result not delivered: ${message}`);
+    } catch {
+      // Reporting must not throw.
+    }
+  }
+
+  /** The merged message for pending child results, sized for the parent's model window (30% rule). */
+  childResultsText(parent: SubagentRecord, entries: readonly PendingResult[]): string {
+    const sections = entries.map((e) => `### [@${e.handle}] completed\n${e.summary}\nSession: ${e.sessionFile}${e.filePath ? `\nFull output: ${e.filePath}` : ""}`);
+    const text = sections.join("\n\n");
+    const agent = this.deps.agents().get(parent.agent);
+    const receiverContextWindow = (agent ? this.deps.receiverContextWindowFor?.(agent) : undefined) ?? this.deps.receiverContextWindow();
+    return preparePayload({
+      text,
+      receiverContextWindow,
+      ratio: this.deps.settings().contextRatio,
+      outputDir: this.deps.outputDir,
+      label: `${parent.handle}-child-results`,
+    }).text;
+  }
+
+  /** Starts the 60s reminder watch (only while something is queued). */
+  private ensurePendingWatch(): void {
+    if (this.pendingTimer) return;
+    this.pendingTimer = setInterval(() => void this.checkPendingReminders(), 60_000);
+    this.pendingTimer.unref?.();
+  }
+
+  private stopPendingWatch(): void {
+    if (this.pendingTimer) clearInterval(this.pendingTimer);
+    this.pendingTimer = undefined;
+  }
+
+  /** One reminder pass; returns how many parents were reported. Testable without timers. */
+  checkPendingReminders(): number {
+    const timeoutMs = this.deps.settings().pendingResultTimeoutMinutes * 60_000;
+    let reported = 0;
+    for (const record of this.deps.registry.list()) {
+      const pending = record.pending ?? [];
+      if (!pending.length) continue;
+      const oldest = Math.min(...pending.map((p) => p.at));
+      if (this.now() - oldest < timeoutMs) continue;
+      if ((record.pendingNotifiedAt ?? 0) >= oldest) continue;
+      this.deps.registry.update(record.id, { pendingNotifiedAt: this.now() });
+      try {
+        this.deps.onPendingReminder?.(record, pending.length, Math.round((this.now() - oldest) / 60_000));
+      } catch {
+        // Notification must not throw.
+      }
+      reported++;
+    }
+    if (!reported && !this.deps.registry.list().some((r) => (r.pending ?? []).length)) this.stopPendingWatch();
+    return reported;
+  }
+
+  /** Hands the queued child results to the caller (the main session) and clears them. */
+  async drainPending(handle: string): Promise<{ text: string; count: number }> {
+    const record = this.requireRecord(handle);
+    const pending = record.pending ?? [];
+    if (!pending.length) return { text: "no child results are waiting", count: 0 };
+    const text = this.childResultsText(record, pending);
+    this.deps.registry.update(record.id, { pending: [], pendingNotifiedAt: undefined });
+    return { text, count: pending.length };
+  }
+
+  /** Drops the queued child results and returns how many were discarded. */
+  dropPending(handle: string): number {
+    const record = this.requireRecord(handle);
+    const count = (record.pending ?? []).length;
+    if (count) this.deps.registry.update(record.id, { pending: [], pendingNotifiedAt: undefined });
+    return count;
   }
 
   /** After a turn: keep the child for the next resume, or close it (stopped, shut down, dead, or maxResident 0). */
