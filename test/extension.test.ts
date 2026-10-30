@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { type ExtensionContext, ProjectTrustStore, SettingsManager } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteProvider } from "@earendil-works/pi-tui";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
-import { PRIVATE_ENTRY_TYPE } from "../src/delivery.ts";
+import { PRIVATE_ENTRY_TYPE, SETTLED_EVENT } from "../src/delivery.ts";
 import { createExtension } from "../src/index.ts";
 import type { ChildResult, ChildSpec, Runner } from "../src/runner/types.ts";
 import { FakePi, fakeCtx } from "./fake-pi.ts";
@@ -696,6 +696,42 @@ describe("/sub command", () => {
     await pi.commands.get("sub").handler("reviewer 任务", ctx);
     await vi.waitFor(() => expect(sent).toHaveLength(1));
     expect(sent[0]!.options).toEqual({ triggerTurn: false });
+  });
+
+  it("notifies and emits settled for a shared result", async () => {
+    const { pi, ctx, notes } = await boot({ scripts: [[ok("shared\n<summary>brief</summary>")]] });
+    await pi.commands.get("sub~").handler("reviewer review", ctx);
+    await vi.waitFor(() => expect(pi.sent).toHaveLength(1));
+    expect(notes.some((n) => n.type === "info" && n.message.includes("@reviewer completed") && n.message.includes("brief"))).toBe(true);
+    expect(pi.events).toContainEqual({
+      channel: SETTLED_EVENT,
+      data: expect.objectContaining({ handle: "reviewer", agent: "reviewer", status: "completed", delivery: "share", summary: "brief" }),
+    });
+  });
+
+  it("notifies and emits settled for a private result", async () => {
+    const { pi, ctx, notes } = await boot({ scripts: [[ok("hidden\n<summary>brief</summary>")]] });
+    await pi.commands.get("sub?").handler("reviewer review", ctx);
+    await vi.waitFor(() => expect(pi.branch.some((e: any) => e.customType === PRIVATE_ENTRY_TYPE)).toBe(true));
+    expect(pi.events.map((e) => e.channel)).toEqual([SETTLED_EVENT]);
+    expect((pi.events[0]!.data as { delivery?: string }).delivery).toBe("private");
+    expect(notes.some((n) => n.message.includes("@reviewer completed"))).toBe(true);
+  });
+
+  it("stays silent for auto, whose follow-up turn already signals completion", async () => {
+    const { pi, ctx, notes } = await boot({ scripts: [[ok("done")]] });
+    await pi.commands.get("sub!").handler("reviewer review", ctx);
+    await vi.waitFor(() => expect(pi.sent).toHaveLength(1));
+    expect(pi.events).toEqual([]);
+    expect(notes.some((n) => n.message.includes("@reviewer completed"))).toBe(false);
+  });
+
+  it("reports a failed result as an error", async () => {
+    const { pi, ctx, notes } = await boot({ scripts: [[{ text: "", stopReason: "error", errorMessage: "boom", usage: usage(0) }]] });
+    await pi.commands.get("sub~").handler("reviewer review", ctx);
+    await vi.waitFor(() => expect(pi.sent).toHaveLength(1));
+    expect(notes.some((n) => n.type === "error" && n.message.includes("@reviewer failed"))).toBe(true);
+    expect((pi.events[0]!.data as { status?: string }).status).toBe("failed");
   });
 
   it("passes --cwd to the child", async () => {

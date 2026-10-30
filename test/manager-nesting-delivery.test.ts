@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentDef } from "../src/agents.ts";
 import { ChainStore } from "../src/chain.ts";
-import { SubagentManager } from "../src/manager.ts";
+import { SubagentManager, type SettledInfo } from "../src/manager.ts";
 import { type PendingResult, Registry, type SubagentRecord } from "../src/registry.ts";
 import type { ChildResult } from "../src/runner/types.ts";
 import { Scheduler } from "../src/scheduler.ts";
@@ -45,6 +45,7 @@ function setup(
   const scheduler = new Scheduler(() => opts.limit ?? 4);
   const reminders: { handle: string; count: number; minutes: number }[] = [];
   const errors: { handle: string; message: string }[] = [];
+  const settled: SettledInfo[] = [];
   /** Everything delivered to the *main* session port; a nested group must never show up here. */
   const sent: { message: { customType: string; content: string }; options?: unknown }[] = [];
   const manager = new SubagentManager({
@@ -69,9 +70,10 @@ function setup(
     outputDir: join(root, "out"),
     onPendingReminder: (r, count, minutes) => reminders.push({ handle: r.handle, count, minutes }),
     onDeliveryError: (r, message) => errors.push({ handle: r.handle, message }),
+    onSettled: (info) => settled.push(info),
     now: () => clockMinutes * 60_000,
   });
-  return { manager, runner, registry, scheduler, reminders, errors, sent, root };
+  return { manager, runner, registry, scheduler, reminders, errors, settled, sent, root };
 }
 
 /** A nested run: the parent record id and depth are passed the way the delegation path does it. */
@@ -92,6 +94,17 @@ describe("child result delivery", () => {
     expect(resumed).toBeDefined();
     expect(resumed!.prompts[0]).toContain("child done");
     expect(resumed!.prompts[0]).toMatch(/@worker/);
+    await manager.shutdown();
+    await manager.whenIdle();
+  });
+
+  it("never reports a nested child result to the main session", async () => {
+    // maxResident keeps the parent resident, so the child result is injected into the parent instead of the main port.
+    const { manager, settled } = setup({ settings: { maxResident: 2 }, scripts: [[ok("lead done")], [ok("child done")]] });
+    const { record: parent } = await manager.run({ agent: "lead", task: "plan" });
+    await manager.run(nested(parent, { agent: "worker", task: "x", background: true, delivery: "share" }) as never);
+    await manager.whenIdle();
+    expect(settled).toEqual([]);
     await manager.shutdown();
     await manager.whenIdle();
   });

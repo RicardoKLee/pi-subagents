@@ -81,9 +81,25 @@ Children are asked to end with a `<summary>` tag; without one (or with an empty 
 
 ## Delivery modes (background results)
 
-- `private`: stored as a custom session entry and shown only in the TUI. It never enters the model context, including compaction and branch summaries.
+- `private`: stored as a custom session entry and shown only in the TUI. It never enters the model context, including compaction and branch summaries. The entry shows the conclusion open and keeps the full result (process, quoted question, paths) collapsed; expand it to read everything. Entries written before the conclusion was stored separately keep their full text visible.
 - `share`: written into the main session without starting a turn. The full output goes to a file; the message contains the summary, the output file path and the child session path.
 - `auto` (default for @ messages; always used for background runs started by the main agent): same content as `share`, then triggers a follow-up turn.
+
+## Completion notifications
+
+A `share` or `private` result starts no turn, so nothing else would tell the user it finished. For those two modes the
+extension shows a notification (`ctx.ui.notify`; RPC forwards it as an `extension_ui_request`, print/JSON fall back to
+stderr) and emits `pi-subagents:settled` on `pi.events` with
+`{ handle, agent, status, delivery, summary, sessionFile, filePath? }` for other extensions:
+
+```ts
+pi.events.on("pi-subagents:settled", (info) => {
+  // info.status is completed or failed; info.delivery is share or private
+});
+```
+
+`auto` stays silent here because its follow-up turn already ends in `agent_settled`. Foreground results and nested
+child results (which go to their parent) do not notify either.
 
 ## Mentions (TUI only)
 

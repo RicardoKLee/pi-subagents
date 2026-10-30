@@ -46,6 +46,17 @@ const DELEGATION_ACTIONS = new Set<string>(SUBAGENT_ACTIONS);
  */
 const YIELDING_DELEGATION_ACTIONS = new Set<string>(["run", "resume", "continue", "parallel", "chain"]);
 
+export interface SettledInfo {
+  handle: string;
+  agent: string;
+  status: RunStatus;
+  /** `share` or `private`: the two modes that start no turn when the result arrives. */
+  delivery: DeliveryMode;
+  summary: string;
+  sessionFile: string;
+  filePath?: string;
+}
+
 export interface ManagerDeps {
   registry: Registry;
   chainStore: ChainStore;
@@ -67,6 +78,11 @@ export interface ManagerDeps {
   trustForCwd?: (cwd: string) => boolean | undefined;
   /** Called when a background result could not be delivered (the error is also recorded on the record). */
   onDeliveryError?: (record: SubagentRecord, message: string) => void;
+  /**
+   * Called after a root background result was delivered with `share` or `private`. Those modes start no turn, so
+   * nothing else signals the completion; `auto` already starts a follow-up turn.
+   */
+  onSettled?: (info: SettledInfo) => void;
   /** Called once a new record exists (queued); used to warn about handles that clash with files. */
   onRecordCreated?: (record: SubagentRecord) => void;
   /** Directory of the file mailbox a nested child uses to delegate (M6). Absent disables nesting. */
@@ -1528,10 +1544,28 @@ export class SubagentManager {
             agent: recordEntryLabel(record),
             status,
             text: payload.text,
+            summary: payload.summary,
             sessionFile: record.sessionFile,
             ...(payload.filePath ? { filePath: payload.filePath } : {}),
             ...(quoted.length ? { asks: quoted } : {}),
           });
+          if (record.delivery !== "auto") {
+            // No turn starts for share/private, so this is the only signal the user gets. A callback failure must
+            // never turn an already delivered run into a failed one.
+            try {
+              this.deps.onSettled?.({
+                handle: record.handle,
+                agent: recordEntryLabel(record),
+                status,
+                delivery: record.delivery,
+                summary: payload.summary,
+                sessionFile: record.sessionFile,
+                ...(payload.filePath ? { filePath: payload.filePath } : {}),
+              });
+            } catch {
+              // Notification is a side channel.
+            }
+          }
         } catch (deliveryError) {
           // Delivery is a side channel: keep the run's status, record why it was not delivered.
           // Keep the run's own error (e.g. why it failed) in front of the delivery error.
