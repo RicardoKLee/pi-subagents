@@ -4,7 +4,7 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import type { AgentDef } from "../src/agents.ts";
 import type { DeliveryPort } from "../src/delivery.ts";
 import { ChainStore } from "../src/chain.ts";
-import { SubagentError, SubagentManager } from "../src/manager.ts";
+import { SubagentError, type SettledInfo, SubagentManager } from "../src/manager.ts";
 import { REGISTRY_ENTRY_TYPE, Registry, type SubagentRecord } from "../src/registry.ts";
 import type { ChildResult } from "../src/runner/types.ts";
 import { Scheduler } from "../src/scheduler.ts";
@@ -48,6 +48,7 @@ function setup(
   });
   const sent: Parameters<DeliveryPort["sendMessage"]>[] = [];
   const entries: Parameters<DeliveryPort["appendEntry"]>[] = [];
+  const settled: SettledInfo[] = [];
   const manager = new SubagentManager({
     registry: opts.registry ?? new Registry(() => {}),
     chainStore: new ChainStore(() => {}),
@@ -63,8 +64,9 @@ function setup(
     outputDir: opts.outputDir ?? join(root, "out"),
     ...(opts.trustForCwd ? { trustForCwd: opts.trustForCwd } : {}),
     ...(opts.agentWindow ? { receiverContextWindowFor: opts.agentWindow } : {}),
+    onSettled: (info) => settled.push(info),
   });
-  return { manager, runner, sent, entries, root };
+  return { manager, runner, sent, entries, settled, root };
 }
 
 const ok = (text: string): ChildResult => ({ text, stopReason: "stop", usage: usage() });
@@ -204,6 +206,56 @@ describe("steer / interrupt / stop / background", () => {
     expect(entries).toHaveLength(1);
     expect(entries[0]![0]).toBe("pi-subagents/private");
     expect((entries[0]![1] as { text: string }).text).toContain("done!");
+  });
+
+  it("background private entries carry the conclusion beside the full result", async () => {
+    const { manager, entries } = setup({ scripts: [[ok("FULLTEXT\n<summary>brief</summary>")]] });
+    await manager.run({ agent: "reviewer", task: "x", background: true, delivery: "private" });
+    await manager.whenIdle();
+    expect(entries[0]![1]).toMatchObject({ summary: "brief" });
+    expect((entries[0]![1] as { text: string }).text).toContain("FULLTEXT");
+  });
+});
+
+describe("non-auto completion signal", () => {
+  it("reports a background share result once with its conclusion and paths", async () => {
+    const { manager, settled } = setup({ scripts: [[ok("FULLTEXT\n<summary>brief</summary>")]] });
+    await manager.run({ agent: "reviewer", task: "x", background: true, delivery: "share" });
+    await manager.whenIdle();
+    expect(settled).toHaveLength(1);
+    expect(settled[0]).toMatchObject({ handle: "reviewer", agent: "reviewer", status: "completed", delivery: "share", summary: "brief" });
+    expect(settled[0]!.filePath).toBeDefined();
+    expect(settled[0]!.sessionFile).toContain("child-");
+  });
+
+  it("reports a background private result", async () => {
+    const { manager, settled } = setup({ scripts: [[ok("done!\n<summary>brief</summary>")]] });
+    await manager.run({ agent: "reviewer", task: "x", background: true, delivery: "private" });
+    await manager.whenIdle();
+    expect(settled).toHaveLength(1);
+    expect(settled[0]).toMatchObject({ status: "completed", delivery: "private", summary: "brief" });
+  });
+
+  it("reports a failed background result", async () => {
+    const { manager, settled } = setup({ scripts: [[{ text: "", stopReason: "error", errorMessage: "rate limited", usage: usage(0) }]] });
+    await manager.run({ agent: "reviewer", task: "x", background: true, delivery: "share" });
+    await manager.whenIdle();
+    expect(settled).toHaveLength(1);
+    expect(settled[0]).toMatchObject({ status: "failed", delivery: "share" });
+    expect(settled[0]!.summary).toContain("rate limited");
+  });
+
+  it("stays silent for auto, which already starts a turn", async () => {
+    const { manager, settled } = setup({ scripts: [[ok("done!")]] });
+    await manager.run({ agent: "reviewer", task: "x", background: true });
+    await manager.whenIdle();
+    expect(settled).toEqual([]);
+  });
+
+  it("stays silent for a foreground result", async () => {
+    const { manager, settled } = setup({ scripts: [[ok("done!")]] });
+    await manager.run({ agent: "reviewer", task: "x", delivery: "share" });
+    expect(settled).toEqual([]);
   });
 });
 

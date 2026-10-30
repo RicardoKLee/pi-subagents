@@ -9,6 +9,8 @@ export class FakePi {
   readonly commands = new Map<string, any>();
   readonly entryRenderers = new Map<string, any>();
   readonly sent: { message: any; options: any }[] = [];
+  /** Every `pi.events.emit()` call, in order. */
+  readonly events: { channel: string; data: unknown }[] = [];
   readonly branch: unknown[] = [];
   /** When set, sendMessage throws this error (simulates a failing delivery port). */
   failSend?: Error;
@@ -24,6 +26,10 @@ export class FakePi {
       registerTool: (tool: any) => void this.tools.set(tool.name, tool),
       registerCommand: (name: string, options: any) => void this.commands.set(name, { name, ...options }),
       registerEntryRenderer: (type: string, renderer: any) => void this.entryRenderers.set(type, renderer),
+      events: {
+        emit: (channel: string, data: unknown) => void this.events.push({ channel, data }),
+        on: () => () => {},
+      },
       appendEntry: (customType: string, data: unknown) => void this.branch.push({ type: "custom", customType, data }),
       sendMessage: (message: any, options: any) => {
         if (this.failSend) throw this.failSend;

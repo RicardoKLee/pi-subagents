@@ -8,11 +8,12 @@ import { type AgentDef, loadAgents } from "./agents.ts";
 import { CHAIN_ENTRY_TYPE, ChainStore } from "./chain.ts";
 import { childExtension, childRecordId, type DelegationHost, mailboxHost } from "./child.ts";
 import { mentionProvider } from "./complete.ts";
-import { PRIVATE_ENTRY_TYPE, type PrivateEntryData } from "./delivery.ts";
+import { PRIVATE_ENTRY_TYPE, SETTLED_EVENT, type PrivateEntryData } from "./delivery.ts";
 import { createNameCache, parseEntryRequest, parseSubCommand, SUB_USAGE, skillNames, templateNames, type EntryRequest } from "./entries.ts";
 import { handleRoute } from "./input.ts";
 import { SubagentManager } from "./manager.ts";
 import { routeMention } from "./mention.ts";
+import { renderPrivateEntry } from "./private.ts";
 import { recordEntryLabel, REGISTRY_ENTRY_TYPE, Registry, writeSnapshot } from "./registry.ts";
 import { RpcRunner } from "./runner/rpc.ts";
 import { type ModelResolver, SdkRunner, defaultProjectTrust } from "./runner/sdk.ts";
@@ -21,8 +22,6 @@ import { Scheduler } from "./scheduler.ts";
 import { loadSettings, limitAllows, type DeliveryMode, type SubagentSettings } from "./settings.ts";
 import { executeAction, SubagentsParams, toolCallInput, type SubagentsInput } from "./tool.ts";
 import { pendingReminderText, renderTree, TREE_ENTRY_TYPE, type TreeEntryData, type TreeView } from "./tree.ts";
-
-const PRIVATE_PREVIEW_LINES = 20;
 
 interface State {
   manager: SubagentManager;
@@ -209,6 +208,13 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
         // normalized so equivalent spellings of the same directory match without letting a different one through.
         trustForCwd: (cwd) => (resolvePath(cwd) === mainCwd ? (state?.ctx ?? ctx).isProjectTrusted?.() : defaultProjectTrust(cwd, agentDir)),
         onDeliveryError: (record, message) => notify(`result of @${record.handle} was not delivered: ${message}`, "warning"),
+        onSettled: (info) => {
+          // share/private start no turn, so neither agent_settled nor a visible transcript change would tell the user.
+          const firstLine = info.summary.split("\n").map((line) => line.trim()).find(Boolean) ?? "";
+          const brief = firstLine.length > 200 ? `${firstLine.slice(0, 197)}...` : firstLine;
+          notify(`@${info.handle} ${info.status}${brief ? ` — ${brief}` : ""}`, info.status === "failed" ? "error" : "info");
+          pi.events.emit(SETTLED_EVENT, info);
+        },
         onPendingReminder: (record, count, minutes) =>
           notify(pendingReminderText(record, count, minutes, state?.manager.recordPath(record) ?? record.handle), "warning"),
         onRecordCreated: (record) => {
@@ -298,14 +304,7 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
     // Private results are custom entries: shown in the TUI only, never part of the LLM context.
     pi.registerEntryRenderer<PrivateEntryData>(PRIVATE_ENTRY_TYPE, (entry, { expanded }, theme) => {
       const data = entry.data;
-      if (!data) return undefined;
-      const lines = data.text.split("\n");
-      const shown = expanded || lines.length <= PRIVATE_PREVIEW_LINES ? lines : lines.slice(0, PRIVATE_PREVIEW_LINES);
-      const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
-      box.addChild(new Text(`${theme.fg("accent", "[subagent private]")} @${data.handle} ${data.status}`, 0, 0));
-      box.addChild(new Text(shown.join("\n"), 0, 0));
-      if (shown.length < lines.length) box.addChild(new Text(theme.fg("dim", `… ${lines.length - shown.length} more lines (expand to show)`), 0, 0));
-      return box;
+      return data ? renderPrivateEntry(data, expanded, theme) : undefined;
     });
 
     // /subagents list|cost: a display-only tree entry; custom entries never enter the LLM context.

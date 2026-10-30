@@ -14,7 +14,7 @@ function port() {
   };
 }
 
-const env = { handle: "reviewer", agent: "reviewer", status: "completed" as const, text: "Looks good.", sessionFile: "/s/child.jsonl" };
+const env = { handle: "reviewer", agent: "reviewer", status: "completed" as const, summary: "Looks good.", text: "Looks good.", sessionFile: "/s/child.jsonl" };
 
 describe("deliver", () => {
   it("share writes a visible result without starting a turn", () => {
@@ -41,7 +41,7 @@ describe("deliver", () => {
     expect(entries).toHaveLength(1);
     expect(entries[0]!.customType).toBe(PRIVATE_ENTRY_TYPE);
     expect(PRIVATE_ENTRY_TYPE).toBe("pi-subagents/private");
-    expect(entries[0]!.data).toMatchObject({ handle: "reviewer", agent: "reviewer", status: "completed", sessionFile: "/s/child.jsonl" });
+    expect(entries[0]!.data).toMatchObject({ handle: "reviewer", agent: "reviewer", status: "completed", summary: "Looks good.", sessionFile: "/s/child.jsonl" });
     expect((entries[0]!.data as { text: string }).text).toContain("Looks good.");
     expect(calls).toHaveLength(0);
   });
@@ -64,6 +64,12 @@ describe("deliver", () => {
     const { entries, port: p } = port();
     deliver(p, "private", { ...env, asks: [{ kind: "ask", text: "what is RAII?" }] });
     expect((entries[0]!.data as { text: string }).text).toContain("what is RAII?");
+  });
+
+  it("private entries carry the conclusion separately so the renderer can collapse the full result", () => {
+    const { entries, port: p } = port();
+    deliver(p, "private", { ...env, summary: "Two bugs.", text: "FULL BODY\n<summary>Two bugs.</summary>" });
+    expect((entries[0]!.data as { summary?: string }).summary).toBe("Two bugs.");
   });
 });
 

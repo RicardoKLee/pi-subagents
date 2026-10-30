@@ -6,6 +6,8 @@ export const RESULT_MESSAGE_TYPE = "pi-subagents/result";
 export const BATCH_MESSAGE_TYPE = "pi-subagents/batch";
 /** Private results are stored as custom entries, which never enter the LLM context (incl. compaction and branch summaries). */
 export const PRIVATE_ENTRY_TYPE = "pi-subagents/private";
+/** Event channel for a background result delivered with `share` or `private`: no turn starts, so other extensions need a signal. */
+export const SETTLED_EVENT = "pi-subagents:settled";
 
 export interface DeliveryPort {
   sendMessage(
@@ -20,6 +22,8 @@ export interface PrivateEntryData {
   handle: string;
   agent: string;
   status: RunStatus;
+  /** The conclusion shown while the full result stays collapsed; absent on entries written before it existed. */
+  summary?: string;
   text: string;
   sessionFile: string;
   filePath?: string;
@@ -52,6 +56,8 @@ export interface ResultEnvelope {
   status: RunStatus;
   /** Already sized by preparePayload. */
   text: string;
+  /** The conclusion, also stored on a private entry so it can stay visible while the full result is collapsed. */
+  summary: string;
   /** Child session file, so the full transcript stays reachable from the main session. */
   sessionFile: string;
   filePath?: string;
@@ -67,7 +73,7 @@ function render(env: ResultEnvelope): string {
 export function deliver(port: DeliveryPort, mode: DeliveryMode, env: ResultEnvelope): void {
   const details = { handle: env.handle, agent: env.agent, status: env.status, sessionFile: env.sessionFile, ...(env.filePath ? { filePath: env.filePath } : {}) };
   if (mode === "private") {
-    const data: PrivateEntryData = { ...details, text: render(env) };
+    const data: PrivateEntryData = { ...details, summary: env.summary, text: render(env) };
     port.appendEntry(PRIVATE_ENTRY_TYPE, data);
     return;
   }
