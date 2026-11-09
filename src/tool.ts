@@ -9,6 +9,8 @@ const BatchItem = Type.Object({
   command: Type.Optional(Type.String({ description: "Prompt template name, run as /<name> in the child" })),
   task: Type.Optional(Type.String({ description: "Task (agent entry) or arguments appended to the skill/template" })),
   cwd: Type.Optional(Type.String({ description: "Working directory (defaults to the main session's)" })),
+  model: Type.Optional(Type.String({ description: "Model for this item, e.g. deeproute/deepseek-v4.1-flash; overrides the agent file and the settings default" })),
+  thinking: Type.Optional(Type.String({ description: "Thinking level for this item (off, minimal, low, medium, high, xhigh, max); overrides the agent file and the settings default" })),
 });
 
 /**
@@ -31,6 +33,18 @@ export const SubagentsParams = Type.Object({
   handle: Type.Optional(Type.String({ description: "Existing subagent handle, e.g. reviewer-2 (resume/steer/interrupt/stop/continue)" })),
   message: Type.Optional(Type.String({ description: "Message for resume, steer or continue" })),
   cwd: Type.Optional(Type.String({ description: "Working directory for a single run (run)" })),
+  model: Type.Optional(
+    Type.String({
+      description:
+        "Model for this run only, e.g. deeproute/deepseek-v4.1-flash (or a bare id of the main provider). It outranks the agent file's model and the settings default, and is kept when the subagent is resumed. Omit it unless the user asked for a specific model.",
+    }),
+  ),
+  thinking: Type.Optional(
+    Type.String({
+      description:
+        "Thinking level for this run only: off, minimal, low, medium, high, xhigh or max. It outranks the agent file's thinking and the settings default. Omit it unless the user asked for a specific level.",
+    }),
+  ),
   tasks: Type.Optional(Type.Array(BatchItem, { description: "parallel: tasks to run at the same time" })),
   chain: Type.Optional(Type.Array(BatchItem, { description: "chain: steps to run in order; {previous} is the previous step's output" })),
   background: Type.Optional(Type.Boolean({ description: "Return immediately; the result arrives later" })),
@@ -184,6 +198,8 @@ async function dispatch(
         ...entry,
         ...(parentId ? { parentId } : {}),
         ...(input.cwd ? { cwd: input.cwd } : {}),
+        ...(input.model ? { model: input.model } : {}),
+        ...(input.thinking ? { thinking: input.thinking } : {}),
         ...(input.background ? { background: true } : {}),
         ...(input.detach ? { detach: true } : {}),
         ...(signal ? { signal } : {}),

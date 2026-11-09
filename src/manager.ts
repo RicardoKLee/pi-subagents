@@ -95,6 +95,12 @@ export interface ManagerDeps {
 
 export interface RunRequest extends EntryRequest {
   delivery?: DeliveryMode;
+  /**
+   * Model and thinking level for this run only; they outrank the agent file and the settings defaults and are pinned
+   * on the record, so a resume keeps them. Unvalidated here: `preflight`/the runner report an unresolvable spec.
+   */
+  model?: string;
+  thinking?: string;
   background?: boolean;
   /**
    * Set only by the delegation path for a background action: return the queued handle without waiting for a scheduler
@@ -127,6 +133,9 @@ export interface RunOutcome {
 
 export interface BatchItem extends EntryRequest {
   cwd?: string;
+  /** Per-item model and thinking level, exactly as on `RunRequest`. */
+  model?: string;
+  thinking?: string;
   /** Set by the delegation path: the subagent that asked for this item becomes its parent. */
   parentId?: string;
   /** Informational only: a record's depth is always derived from its parent (root subagents are depth 1). */
@@ -636,6 +645,8 @@ export class SubagentManager {
       delivery,
       task: entry.prompt,
       cwd,
+      ...(agent.model ? { model: agent.model } : {}),
+      ...(agent.thinking ? { thinking: agent.thinking } : {}),
       status: "queued",
       ...(entry.kind === "agent" ? {} : { entry: { kind: entry.kind, name: entry.name } }),
       ...(req.chainId ? { chainId: req.chainId, stepIndex: req.stepIndex ?? 0 } : {}),
@@ -1039,7 +1050,12 @@ export class SubagentManager {
   }
 
   /** Resolves a run's entry, agent, runner and cwd without creating a record, so a whole batch can be validated first. */
-  private resolveTarget(req: EntryRequest & { cwd?: string }, action: string, requester?: SubagentRecord, reserved = 0): Resolved {
+  private resolveTarget(
+    req: EntryRequest & { cwd?: string; model?: string; thinking?: string },
+    action: string,
+    requester?: SubagentRecord,
+    reserved = 0,
+  ): Resolved {
     const entry = parseEntryRequest(req, action);
     const cwd = this.resolveCwd(req.cwd);
     // The spawn policy is checked before name validation: a whitelist rejection must not depend on whether the target
@@ -1048,9 +1064,26 @@ export class SubagentManager {
     if (entry.kind !== "agent") {
       validateEntryTarget(entry, { cwd, agentDir: this.deps.agentDir, agents: this.deps.agents() });
     }
-    const agent = entry.kind === "agent" ? this.requireAgent(entry.name) : BUILTIN_ENTRY_AGENT_DEF;
-    const runner = this.requireRunner(agent.runner ?? this.deps.settings().defaultRunner);
+    const base = entry.kind === "agent" ? this.requireAgent(entry.name) : BUILTIN_ENTRY_AGENT_DEF;
+    const agent = this.effectiveAgent(base, req.model, req.thinking);
+    const runner = this.requireRunner(base.runner ?? this.deps.settings().defaultRunner);
     return { entry, agent, runner, cwd, trusted: this.deps.trustForCwd?.(cwd) };
+  }
+
+  /**
+   * The agent a child is actually started with: the call's own model/thinking, else the agent file's, else the
+   * settings default (`.pi/subagents.json` over `~/.pi/agent/subagents.json`), else nothing (inherit the main
+   * session's model, and thinking `off`). A skill or command entry has no agent file, so it starts from the default.
+   */
+  private effectiveAgent(base: AgentDef, model?: string, thinking?: string): AgentDef {
+    const settings = this.deps.settings();
+    const resolvedModel = model ?? base.model ?? settings.defaultModel;
+    const resolvedThinking = thinking ?? base.thinking ?? settings.defaultThinking;
+    return {
+      ...base,
+      ...(resolvedModel ? { model: resolvedModel } : {}),
+      ...(resolvedThinking ? { thinking: resolvedThinking } : {}),
+    };
   }
 
   /** Runs a promise in the background and keeps whenIdle()/shutdown() waiting for it. `onError` makes a detached failure visible. */
@@ -1836,7 +1869,10 @@ export class SubagentManager {
     if (!existsSync(record.sessionFile)) {
       throw new SubagentError("missing_session", `session file for @${record.handle} is missing: ${record.sessionFile}`);
     }
-    const agent = record.entry ? BUILTIN_ENTRY_AGENT_DEF : this.requireAgent(record.agent);
+    const base = record.entry ? BUILTIN_ENTRY_AGENT_DEF : this.requireAgent(record.agent);
+    // The model and thinking level stay those the run was created with (pinned on the record), so a resume keeps its
+    // contract even after the agent file or the settings default changed.
+    const agent = this.effectiveAgent(base, record.model, record.thinking);
     const runner = this.requireRunner(record.runner);
     // Resolve last so a missing cwd is reported exactly like resume() does, after the other preflight errors.
     return { record, agent, runner, cwd: this.resolveCwd(record.cwd) };
@@ -1955,13 +1991,19 @@ function runInterruptedError(): SubagentError {
 const noCascade = (): void => {};
 
 /** The entry fields of a batch item or chain step, present only when set (keeps empty strings out of the stored entry). */
-function entryFields(item: EntryRequest & { cwd?: string }): EntryRequest & { cwd?: string } {
+function entryFields(item: EntryRequest & { cwd?: string; model?: string; thinking?: string }): EntryRequest & {
+  cwd?: string;
+  model?: string;
+  thinking?: string;
+} {
   return {
     ...(item.agent ? { agent: item.agent } : {}),
     ...(item.skill ? { skill: item.skill } : {}),
     ...(item.command ? { command: item.command } : {}),
     ...(item.task !== undefined ? { task: item.task } : {}),
     ...(item.cwd ? { cwd: item.cwd } : {}),
+    ...(item.model ? { model: item.model } : {}),
+    ...(item.thinking ? { thinking: item.thinking } : {}),
   };
 }
 

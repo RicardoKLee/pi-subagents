@@ -18,9 +18,9 @@ export const BUILTIN_ENTRY_AGENT_DEF: AgentDef = {
 
 export const SUB_USAGE = [
   "用法：",
-  "  /sub [--cwd <目录>] <agent> <任务>",
-  "  /sub [--cwd <目录>] /skill:<名字> [参数]",
-  "  /sub [--cwd <目录>] /<模板> [参数]",
+  "  /sub [--cwd <目录>] [--model <provider/id>] [--thinking <级别>] <agent> <任务>",
+  "  /sub [--cwd <目录>] [--model <provider/id>] [--thinking <级别>] /skill:<名字> [参数]",
+  "  /sub [--cwd <目录>] [--model <provider/id>] [--thinking <级别>] /<模板> [参数]",
   "投递：/sub! = auto，/sub~ = share，/sub? = private（不带符号用设置 defaultDelivery）",
   "创建后用 @<handle> 续聊，用 /subagents 查看列表。",
 ].join("\n");
@@ -154,20 +154,34 @@ export function validateEntryTarget(entry: ResolvedEntry, ctx: EntryValidationCo
 
 export type SubTarget = { kind: EntryKind; name: string };
 
+/** Optional overrides a `/sub` line may carry; both outrank the agent file and the settings defaults. */
+export interface SubOverrides {
+  model?: string;
+  thinking?: string;
+}
+
 /**
- * `/sub [--cwd <dir>] <agent> <task>`, `/sub [--cwd <dir>] /skill:<name> [args]`, `/sub [--cwd <dir>] /<template> [args]`.
- * The first word picks the kind: `/skill:` → skill, other `/…` → template, anything else → agent name.
+ * `/sub [--cwd <dir>] [--model <spec>] [--thinking <level>] <agent> <task>`, or `/skill:<name>` / `/<template>` instead
+ * of an agent. The first word picks the kind: `/skill:` → skill, other `/…` → template, anything else → agent name.
  */
-export function parseSubCommand(args: string): { cwd?: string; target: SubTarget; rest: string } | { error: string } {
+export function parseSubCommand(args: string): { cwd?: string; model?: string; thinking?: string; target: SubTarget; rest: string } | { error: string } {
   let text = args.trim();
   let cwd: string | undefined;
-  while (text.startsWith("--cwd")) {
-    const afterFlag = text.slice("--cwd".length);
+  let model: string | undefined;
+  let thinking: string | undefined;
+  // Flags may come in any order, but only before the target; the rest of the line is the task.
+  for (;;) {
+    const flag = /^--(cwd|model|thinking)\b/.exec(text);
+    if (!flag) break;
+    const afterFlag = text.slice(flag[0].length);
     const match = /^\s+(\S+)\s*([\s\S]*)$/.exec(afterFlag);
-    if (!match) return { error: `--cwd needs a directory\n\n${SUB_USAGE}` };
-    cwd = match[1]!;
+    if (!match) return { error: `--${flag[1]} needs a value\n\n${SUB_USAGE}` };
+    if (flag[1] === "cwd") cwd = match[1]!;
+    else if (flag[1] === "model") model = match[1]!;
+    else thinking = match[1]!;
     text = match[2]!.trim();
   }
+  const extra: SubOverrides = { ...(model ? { model } : {}), ...(thinking ? { thinking } : {}) };
   const space = text.search(/\s/);
   const first = space === -1 ? text : text.slice(0, space);
   const rest = space === -1 ? "" : text.slice(space + 1).trim();
@@ -175,15 +189,15 @@ export function parseSubCommand(args: string): { cwd?: string; target: SubTarget
   if (first.startsWith("/skill:")) {
     const name = first.slice("/skill:".length);
     if (!name) return { error: `a skill name is required after /skill:\n\n${SUB_USAGE}` };
-    return { ...(cwd ? { cwd } : {}), target: { kind: "skill", name }, rest };
+    return { ...(cwd ? { cwd } : {}), ...extra, target: { kind: "skill", name }, rest };
   }
   if (first.startsWith("/")) {
     const name = first.slice(1);
     if (!name) return { error: `a template name is required after /\n\n${SUB_USAGE}` };
-    return { ...(cwd ? { cwd } : {}), target: { kind: "command", name }, rest };
+    return { ...(cwd ? { cwd } : {}), ...extra, target: { kind: "command", name }, rest };
   }
   if (!rest) return { error: `a task is required for agent "${first}"\n\n${SUB_USAGE}` };
-  return { ...(cwd ? { cwd } : {}), target: { kind: "agent", name: first }, rest };
+  return { ...(cwd ? { cwd } : {}), ...extra, target: { kind: "agent", name: first }, rest };
 }
 
 /**

@@ -46,6 +46,13 @@ export interface SubagentRecord {
   entry?: { kind: "skill" | "command"; name: string };
   /** Working directory of the child process; absent means the main session's cwd (records written before M4). */
   cwd?: string;
+  /**
+   * Model and thinking level this run was created with (already resolved: the call's own choice, else the agent
+   * file's, else the settings default). Absent = inherit, which is also every record written before this field.
+   * Pinned like `runner`, so resuming a subagent keeps the model it was started with.
+   */
+  model?: string;
+  thinking?: string;
   /** Set for chain steps: the chain this run belongs to and its 0-based position. */
   chainId?: string;
   stepIndex?: number;
@@ -78,6 +85,9 @@ export interface NewRecord {
   entry?: { kind: "skill" | "command"; name: string };
   /** Working directory for the child process (already resolved); absent means the main session's cwd. */
   cwd?: string;
+  /** Effective model and thinking level of the run; see `SubagentRecord.model`. */
+  model?: string;
+  thinking?: string;
   /** Set for chain steps: the chain this run belongs to and its 0-based position. */
   chainId?: string;
   stepIndex?: number;
@@ -90,7 +100,7 @@ export interface NewRecord {
 export type RecordPatch = Partial<
   Pick<
     SubagentRecord,
-    "status" | "runId" | "lastSummary" | "error" | "delivery" | "task" | "entry" | "sessionFile" | "childLeafId" | "cwd" | "chainId" | "stepIndex" | "pending" | "pendingNotifiedAt"
+    "status" | "runId" | "lastSummary" | "error" | "delivery" | "task" | "entry" | "sessionFile" | "childLeafId" | "cwd" | "model" | "thinking" | "chainId" | "stepIndex" | "pending" | "pendingNotifiedAt"
   >
 >;
 
@@ -146,6 +156,8 @@ export class Registry {
       task: input.task,
       ...(input.entry ? { entry: { ...input.entry } } : {}),
       ...(input.cwd ? { cwd: input.cwd } : {}),
+      ...(input.model ? { model: input.model } : {}),
+      ...(input.thinking ? { thinking: input.thinking } : {}),
       ...(input.chainId ? { chainId: input.chainId, stepIndex: input.stepIndex ?? 0 } : {}),
       ...(input.pending ? { pending: input.pending.map((p) => ({ ...p })) } : {}),
       createdAt: t,

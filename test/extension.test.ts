@@ -6,76 +6,13 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { PRIVATE_ENTRY_TYPE, SETTLED_EVENT } from "../src/delivery.ts";
 import { createExtension } from "../src/index.ts";
 import type { ChildResult, ChildSpec, Runner } from "../src/runner/types.ts";
-import { FakePi, fakeCtx } from "./fake-pi.ts";
 import { FakeRunner, FakeSession, usage } from "./fakes.ts";
+import { boot, REVIEWER } from "./boot.ts";
+import { FakePi, fakeCtx } from "./fake-pi.ts";
 import { writeSkill, writeTemplate } from "./fixtures/skill-fixtures.ts";
 import { cleanupTempDirs, tempDir } from "./tmp.ts";
 
 afterAll(cleanupTempDirs);
-
-const REVIEWER = "---\nname: reviewer\ndescription: Reviews code\n---\nReview.";
-
-/** Boots the extension against a FakePi with a FakeRunner; one held or scripted child per open. */
-export async function boot(
-  opts: {
-    hold?: boolean;
-    scripts?: ChildResult[][];
-    extraAgents?: Record<string, string>;
-    extraSkills?: Record<string, string>;
-    extraTemplates?: Record<string, string>;
-    hasUI?: boolean;
-    branch?: unknown[];
-    settings?: Record<string, unknown>;
-    rpcRunner?: Runner;
-    /** Main-session model and what `modelRegistry.find` returns; used by the model resolver assertion. */
-    model?: { provider: string; id: string };
-    find?: (provider: string, id: string) => unknown;
-  } = {},
-) {
-  const root = tempDir("ext-");
-  const agentDir = join(root, "agent");
-  mkdirSync(join(agentDir, "agents"), { recursive: true });
-  writeFileSync(join(agentDir, "agents", "reviewer.md"), REVIEWER);
-  writeFileSync(join(agentDir, "subagents.json"), JSON.stringify({ maxResident: 0, ...opts.settings }));
-  for (const [name, content] of Object.entries(opts.extraAgents ?? {})) writeFileSync(join(agentDir, "agents", name), content);
-  for (const [name, body] of Object.entries(opts.extraSkills ?? {})) writeSkill(agentDir, name, body);
-  for (const [name, content] of Object.entries(opts.extraTemplates ?? {})) writeTemplate(agentDir, name, content);
-  const cwd = join(root, "project");
-  const sessionDir = join(root, "sessions");
-  mkdirSync(cwd, { recursive: true });
-  mkdirSync(sessionDir, { recursive: true });
-  const runner = new FakeRunner((spec, n) => {
-    const file = spec.resumeFile ?? join(root, `child-${n}.jsonl`);
-    writeFileSync(file, "", { flag: "a" });
-    return new FakeSession(file, opts.scripts?.[n] ?? [], opts.hold ?? false);
-  });
-  const pi = new FakePi();
-  const rpcResolvers: ((spec: string | undefined) => unknown)[] = [];
-  createExtension({
-    agentDir,
-    createRunner: () => runner,
-    ...(opts.rpcRunner
-      ? {
-          createRpcRunner: (resolveModel: (spec: string | undefined) => unknown) => {
-            rpcResolvers.push(resolveModel);
-            return opts.rpcRunner!;
-          },
-        }
-      : {}),
-  })(pi.asApi());
-  pi.branch.push(...(opts.branch ?? []));
-  const { ctx, notes, providers } = fakeCtx(pi, {
-    cwd,
-    sessionDir,
-    hasUI: opts.hasUI ?? true,
-    ...(opts.model ? { model: opts.model } : {}),
-    ...(opts.find ? { find: opts.find } : {}),
-  });
-  await pi.emit("session_start", { type: "session_start" }, ctx);
-  const tool = pi.tools.get("subagents");
-  const callTool = (params: Record<string, unknown>) => tool.execute("call-1", params, undefined, undefined, ctx);
-  return { pi, ctx, notes, providers, sent: pi.sent, runner, callTool, root, cwd, agentDir, rpcRunner: opts.rpcRunner, rpcResolvers };
-}
 
 const ok = (text: string): ChildResult => ({ text, stopReason: "stop", usage: usage() });
 
@@ -672,12 +609,18 @@ describe("/sub command", () => {
     expect(runner.sessions[0]!.prompts).toEqual(["请审查这一段"]);
   });
 
-  it("runs a skill entry with the slash prompt and records the entry", async () => {
-    const { pi, ctx, runner, callTool } = await boot({ scripts: [[ok("done")]], extraSkills: { "pdf-tools": "BODY" } });
+  it("runs a skill entry with the slash prompt and records the entry", async () => {    const { pi, ctx, runner, callTool } = await boot({ scripts: [[ok("done")]], extraSkills: { "pdf-tools": "BODY" } });
     await pi.commands.get("sub").handler("/skill:pdf-tools extract a.pdf", ctx);
     expect(runner.sessions[0]!.prompts).toEqual(["/skill:pdf-tools extract a.pdf"]);
     const list = await callTool({ action: "list" });
     expect(list.content[0].text).toMatch(/@pdf-tools\s+skill:pdf-tools/);
+  });
+
+  it("starts a /sub run with the model and thinking level from its flags", async () => {
+    const { pi, ctx, runner } = await boot({ scripts: [[ok("done")]] });
+    await pi.commands.get("sub").handler("--model deeproute/deepseek-v4.1-flash --thinking high reviewer go", ctx);
+    expect(runner.opened[0]!.agent).toMatchObject({ model: "deeproute/deepseek-v4.1-flash", thinking: "high" });
+    expect(runner.sessions[0]!.prompts).toEqual(["go"]);
   });
 
   it("maps the symbol variants to their delivery modes and quotes the ask", async () => {

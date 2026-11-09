@@ -240,6 +240,25 @@ describe("parseSubCommand", () => {
     });
   });
 
+  it("carries --model and --thinking in any order before the target", () => {
+    expect(parseSubCommand("--thinking high --model deeproute/x code-agent do it")).toMatchObject({
+      model: "deeproute/x",
+      thinking: "high",
+      target: { kind: "agent", name: "code-agent" },
+      rest: "do it",
+    });
+    expect(parseSubCommand("--model deeproute/x /skill:s a")).toMatchObject({ model: "deeproute/x", target: { kind: "skill", name: "s" }, rest: "a" });
+    expect(parseSubCommand("code-agent do it")).not.toHaveProperty("model");
+  });
+
+  it("reports a missing flag value for every flag", () => {
+    for (const flag of ["--cwd", "--model", "--thinking"]) {
+      expect(parseSubCommand(flag)).toHaveProperty("error");
+    }
+    // A flag after the target is task text, not a flag.
+    expect(parseSubCommand("code-agent --model x")).toMatchObject({ target: { kind: "agent", name: "code-agent" }, rest: "--model x" });
+  });
+
   it.each([["", "用法"], ["--cwd", "用法"], ["/skill:", "用法"], ["--cwd /tmp/x", "用法"]])("reports usage for %j", (args, hint) => {
     expect(parseSubCommand(args)).toMatchObject({ error: expect.stringContaining(hint) });
   });
