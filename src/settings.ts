@@ -3,6 +3,14 @@ import { readFileSync } from "node:fs";
 export type DeliveryMode = "private" | "share" | "auto";
 export type RunnerKind = "sdk" | "rpc";
 
+/** The pi thinking levels a subagent may be started with (`docs/settings.md` in pi: `defaultThinkingLevel`). */
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+
+export function isThinkingLevel(value: unknown): value is ThinkingLevel {
+  return typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value);
+}
+
 export interface SubagentSettings {
   /** Global running-child limit. Positive = limit, 0 = disallowed, -1 = unlimited. */
   maxConcurrent: number;
@@ -25,6 +33,13 @@ export interface SubagentSettings {
   pendingResultTimeoutMinutes: number;
   /** Longest user message quoted with an `@` result; longer messages are truncated with a note. */
   mentionQuoteMaxChars: number;
+  /**
+   * Model for subagents whose agent file names none: `provider/id`, or a bare id resolved against the main session's
+   * provider. Absent means the child inherits the main session's model, which is the only behavior without this file.
+   */
+  defaultModel?: string;
+  /** Thinking level for subagents whose agent file names none. `off` keeps a child from thinking unless something says so. */
+  defaultThinking: ThinkingLevel;
 }
 
 export const DEFAULT_SETTINGS: SubagentSettings = Object.freeze({
@@ -39,6 +54,7 @@ export const DEFAULT_SETTINGS: SubagentSettings = Object.freeze({
   contextRatio: 0.3,
   pendingResultTimeoutMinutes: 30,
   mentionQuoteMaxChars: 2000,
+  defaultThinking: "off",
 });
 
 const LIMIT_KEYS = ["maxConcurrent", "maxChildrenPerParent", "maxDepth", "maxResident", "maxParallelTasks", "maxChainSteps"] as const;
@@ -92,6 +108,18 @@ export function parseSettings(raw: unknown): { settings: SubagentSettings; warni
     else warnings.push(`mentionQuoteMaxChars must be a positive integer; using ${DEFAULT_SETTINGS.mentionQuoteMaxChars}`);
   }
 
+  if (input.defaultModel !== undefined) {
+    const value = input.defaultModel;
+    if (typeof value === "string" && value.trim()) settings.defaultModel = value.trim();
+    else warnings.push("defaultModel must be a non-empty string (provider/id or a bare model id); leaving it unset");
+  }
+
+  if (input.defaultThinking !== undefined) {
+    const value = input.defaultThinking;
+    if (isThinkingLevel(value)) settings.defaultThinking = value;
+    else warnings.push(`defaultThinking must be one of ${THINKING_LEVELS.join(", ")}; using ${DEFAULT_SETTINGS.defaultThinking}`);
+  }
+
   return { settings, warnings };
 }
 
@@ -108,6 +136,44 @@ export function loadSettings(file: string): { settings: SubagentSettings; warnin
   } catch (error) {
     return { settings: { ...DEFAULT_SETTINGS }, warnings: [`invalid JSON in ${file}: ${(error as Error).message}`] };
   }
+}
+
+/** A settings file read without validating it: the raw keys, or nothing when the file is missing or unreadable. */
+function readRawSettings(file: string, warnings: string[]): Record<string, unknown> {
+  let text: string;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") warnings.push(`cannot read ${file}: ${(error as Error).message}`);
+    return {};
+  }
+  try {
+    const raw: unknown = JSON.parse(text);
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+      warnings.push(`subagents settings must be a JSON object: ${file}`);
+      return {};
+    }
+    return raw as Record<string, unknown>;
+  } catch (error) {
+    warnings.push(`invalid JSON in ${file}: ${(error as Error).message}`);
+    return {};
+  }
+}
+
+/**
+ * The layered settings of one session: the user file (`~/.pi/agent/subagents.json`) under the trusted project's
+ * (`.pi/subagents.json`), key by key. Trust gates the project file for the same reason pi gates project settings:
+ * a checked-out repository must not be able to redirect where subagents run or what they cost.
+ */
+export function loadSettingsLayered(opts: { userFile: string; projectFile?: string; projectTrusted?: boolean }): {
+  settings: SubagentSettings;
+  warnings: string[];
+} {
+  const warnings: string[] = [];
+  const user = readRawSettings(opts.userFile, warnings);
+  const project = opts.projectFile && opts.projectTrusted ? readRawSettings(opts.projectFile, warnings) : {};
+  const { settings, warnings: valueWarnings } = parseSettings({ ...user, ...project });
+  return { settings, warnings: [...warnings, ...valueWarnings] };
 }
 
 /** True when one more item may start given `current` already running under `limit`. */

@@ -1,7 +1,7 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { DEFAULT_SETTINGS, limitAllows, loadSettings, parseSettings } from "../src/settings.ts";
+import { DEFAULT_SETTINGS, limitAllows, loadSettings, loadSettingsLayered, parseSettings, THINKING_LEVELS } from "../src/settings.ts";
 import { cleanupTempDirs, tempDir } from "./tmp.ts";
 
 afterAll(cleanupTempDirs);
@@ -83,6 +83,82 @@ describe("parseSettings", () => {
     expect(settings.maxChainSteps).toBe(8);
     expect(warnings.join(" ")).toContain("maxParallelTasks");
     expect(warnings.join(" ")).toContain("maxChainSteps");
+  });
+});
+
+describe("the model and thinking defaults", () => {
+  it("leaves defaultModel unset and thinking off out of the box", () => {
+    const { settings, warnings } = parseSettings({});
+    expect(warnings).toEqual([]);
+    expect(settings.defaultModel).toBeUndefined();
+    expect(settings.defaultThinking).toBe("off");
+  });
+
+  it("accepts a provider/id and a bare model id, trimming surrounding space", () => {
+    expect(parseSettings({ defaultModel: "deeproute/deepseek-v4.1-flash" }).settings.defaultModel).toBe("deeproute/deepseek-v4.1-flash");
+    expect(parseSettings({ defaultModel: "  deepseek-v4.1-flash " }).settings.defaultModel).toBe("deepseek-v4.1-flash");
+  });
+
+  it("rejects an empty or non-string defaultModel with a warning", () => {
+    for (const value of ["", "   ", 42, null]) {
+      const { settings, warnings } = parseSettings({ defaultModel: value });
+      expect(settings.defaultModel).toBeUndefined();
+      expect(warnings.join(" ")).toContain("defaultModel");
+    }
+  });
+
+  it("accepts every pi thinking level and rejects anything else", () => {
+    for (const level of THINKING_LEVELS) expect(parseSettings({ defaultThinking: level }).settings.defaultThinking).toBe(level);
+    const { settings, warnings } = parseSettings({ defaultThinking: "loud" });
+    expect(settings.defaultThinking).toBe("off");
+    expect(warnings[0]).toContain("defaultThinking");
+  });
+});
+
+describe("loadSettingsLayered", () => {
+  const write = (dir: string, name: string, value: unknown) => {
+    const file = join(dir, name);
+    writeFileSync(file, JSON.stringify(value));
+    return file;
+  };
+
+  it("uses the global file when there is no project file", () => {
+    const dir = tempDir("layered-");
+    const userFile = write(dir, "user.json", { defaultModel: "deeproute/global", defaultThinking: "low" });
+    const { settings, warnings } = loadSettingsLayered({ userFile });
+    expect(warnings).toEqual([]);
+    expect(settings.defaultModel).toBe("deeproute/global");
+    expect(settings.defaultThinking).toBe("low");
+  });
+
+  it("lets the project file override the global one per key", () => {
+    const dir = tempDir("layered-");
+    const userFile = write(dir, "user.json", { defaultModel: "deeproute/global", defaultThinking: "low", maxConcurrent: 2 });
+    const projectFile = write(dir, "project.json", { defaultModel: "deeproute/project" });
+    const { settings } = loadSettingsLayered({ userFile, projectFile, projectTrusted: true });
+    expect(settings.defaultModel).toBe("deeproute/project");
+    // Keys the project file does not mention still come from the global file.
+    expect(settings.defaultThinking).toBe("low");
+    expect(settings.maxConcurrent).toBe(2);
+  });
+
+  it("ignores the project file when the project is not trusted", () => {
+    const dir = tempDir("layered-");
+    const userFile = write(dir, "user.json", { defaultModel: "deeproute/global" });
+    const projectFile = write(dir, "project.json", { defaultModel: "deeproute/project" });
+    const { settings, warnings } = loadSettingsLayered({ userFile, projectFile, projectTrusted: false });
+    expect(settings.defaultModel).toBe("deeproute/global");
+    expect(warnings).toEqual([]);
+  });
+
+  it("reports a malformed project file without losing the global values", () => {
+    const dir = tempDir("layered-");
+    const userFile = write(dir, "user.json", { defaultModel: "deeproute/global" });
+    const projectFile = join(dir, "project.json");
+    writeFileSync(projectFile, "{ not json");
+    const { settings, warnings } = loadSettingsLayered({ userFile, projectFile, projectTrusted: true });
+    expect(settings.defaultModel).toBe("deeproute/global");
+    expect(warnings[0]).toContain("project.json");
   });
 });
 

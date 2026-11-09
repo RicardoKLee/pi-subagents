@@ -19,7 +19,7 @@ import { RpcRunner } from "./runner/rpc.ts";
 import { type ModelResolver, SdkRunner, defaultProjectTrust } from "./runner/sdk.ts";
 import type { Runner } from "./runner/types.ts";
 import { Scheduler } from "./scheduler.ts";
-import { loadSettings, limitAllows, type DeliveryMode, type SubagentSettings } from "./settings.ts";
+import { loadSettings, loadSettingsLayered, limitAllows, type DeliveryMode, type SubagentSettings } from "./settings.ts";
 import { executeAction, SubagentsParams, toolCallInput, type SubagentsInput } from "./tool.ts";
 import { pendingReminderText, renderTree, TREE_ENTRY_TYPE, type TreeEntryData, type TreeView } from "./tree.ts";
 
@@ -143,7 +143,15 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
         notify(message, "warning");
       };
 
-      const { settings, warnings } = loadSettings(join(agentDir, "subagents.json"));
+      // Settings are layered: the user file, then the trusted project's `.pi/subagents.json` on top of it. A project
+      // file is only read for a trusted project, the same gate pi puts on project settings.
+      const loaded = loadSettingsLayered({
+        userFile: join(agentDir, "subagents.json"),
+        projectFile: join(ctx.cwd, ".pi", "subagents.json"),
+        ...(ctx.isProjectTrusted?.() ? { projectTrusted: true } : {}),
+      });
+      const warnings = [...loaded.warnings];
+      const settings = { ...loaded.settings };
       const { childDir, outputDir, snapshotFile } = subagentPaths(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
       // A nested child's mailbox lives beside its sibling sessions; without a session dir it follows the temp layout
       // subagentPaths already chose, so a sessionless run still gets an isolated mailbox.
@@ -157,6 +165,12 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
       const mainCwd = resolvePath(ctx.cwd);
       const modelWindow = (spec: string | undefined) => resolveModel(state?.ctx ?? ctx, spec)?.contextWindow;
       const modelResolver: ModelResolver = (spec) => resolveModel(state?.ctx ?? ctx, spec);
+      // A default model that pi cannot resolve would fail every child it applies to; report it once and fall back to
+      // inheriting the main session's model instead.
+      if (settings.defaultModel && !modelResolver(settings.defaultModel)) {
+        warnOnce(`defaultModel "${settings.defaultModel}" is not a known model; subagents inherit the main session's model`);
+        delete settings.defaultModel;
+      }
       // An SDK child runs in this process: its delegation requests go straight to this session's manager. `state` is
       // assigned below, before any child can call; a call that somehow arrives earlier fails loudly instead of
       // silently spawning nothing.
@@ -354,7 +368,7 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
       ];
       for (const command of SUB_COMMANDS) {
         pi.registerCommand(command.name, {
-          description: `Create a subagent (${command.delivery ?? "settings defaultDelivery"}): /${command.name} [--cwd <dir>] <agent> | /skill:<name> | /<template> [args]`,
+          description: `Create a subagent (${command.delivery ?? "settings defaultDelivery"}): /${command.name} [--cwd <dir>] [--model <provider/id>] [--thinking <level>] <agent> | /skill:<name> | /<template> [args]`,
           getArgumentCompletions: (prefix) => subCompletions(prefix, state),
           handler: async (args, ctx) => {
             const current = state;
@@ -382,6 +396,8 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
               const { record } = await current.manager.run({
                 ...request,
                 ...(parsed.cwd ? { cwd: parsed.cwd } : {}),
+                ...(parsed.model ? { model: parsed.model } : {}),
+                ...(parsed.thinking ? { thinking: parsed.thinking } : {}),
                 delivery,
                 background: true,
                 ask: entry.prompt,

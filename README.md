@@ -17,7 +17,9 @@ Agents are Markdown files with frontmatter in `~/.pi/agent/agents/*.md`
 
 ## Settings
 
-Optional file `~/.pi/agent/subagents.json`. Missing file means defaults; invalid values log a warning and fall back to the default.
+Optional file `~/.pi/agent/subagents.json` (user) and `<cwd>/.pi/subagents.json` (project, trusted projects only).
+Missing file means defaults; invalid values log a warning and fall back to the default. The project file is layered on top
+of the user file key by key, and is ignored entirely for an untrusted project.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -32,6 +34,24 @@ Optional file `~/.pi/agent/subagents.json`. Missing file means defaults; invalid
 | `contextRatio` | `0.3` | In `(0, 1]`. A foreground result larger than this share of the main model's context window is written to a file; the tool returns the summary and the file path. |
 | `pendingResultTimeoutMinutes` | `30` | `> 0`. Minutes a queued child result may wait before the user is reminded once, with the resume / `action=drain` / `action=drop` options. |
 | `mentionQuoteMaxChars` | `2000` | Positive integer. Longest user message quoted with an `@` result; longer messages are cut with a note. |
+| `defaultModel` | unset | Model for every subagent whose agent file names none: `provider/id` (e.g. `deeproute/deepseek-v4.1-flash`) or a bare id resolved against the main session's provider. Unset = the child inherits the main session's model. An id pi cannot resolve is reported once at startup and ignored, so children inherit instead of failing. |
+| `defaultThinking` | `"off"` | Thinking level for every subagent whose agent file names none: `off`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`. `off` is the default on purpose — a child only thinks when the agent file, the call or this setting says so. |
+
+### Which model a child runs with
+
+Each layer only fills what the layer above left empty, for `model` and `thinking` independently:
+
+1. the call itself: `model` / `thinking` on the `subagents` tool (`run`, a `parallel` item, a `chain` step) or the
+   `/sub --model <provider/id> --thinking <level>` flags;
+2. the agent file's `model:` / `thinking:` frontmatter;
+3. the project's `.pi/subagents.json` → `defaultModel` / `defaultThinking` (trusted projects only);
+4. `~/.pi/agent/subagents.json` → the same two keys;
+5. nothing: the child inherits the main session's model, and thinking is `off`.
+
+A skill or command entry (`/sub /skill:x`, `/sub /<template>`) has no agent file, so it starts from layer 3.
+
+The resolved model and thinking level are stored on the subagent's record, like its runner and working directory: a
+resumed subagent keeps the model it was created with even after the agent file or a default changes.
 
 ## Runners
 
@@ -40,8 +60,9 @@ child exactly as to a normal pi run. Either way the child session stays resident
 next `resume`.
 
 `rpc` starts one `pi --mode rpc` child process per subagent, with `-ne` so it loads no extensions; a nested child
-also gets an explicit `-e` for this extension, which is how it can delegate. The model, thinking
-level, tool list and appended system prompt come from the agent definition. The child exits when the subagent is
+also gets an explicit `-e` for this extension, which is how it can delegate. The model and thinking level are the
+ones resolved for the run (`--model`, `--thinking`), the tool list and appended system prompt come from the agent
+definition. The child exits when the subagent is
 stopped, when the main session ends (exit, `/new`, `/resume`, fork or `/reload`), or when `maxResident` evicts it.
 
 If an idle RPC child dies, the next resume starts a new one from its session file, so the crash is invisible. If it
@@ -62,9 +83,9 @@ decision, or the user's `defaultProjectTrust`); the main session's trust is neve
 
 | `action` | Parameters | Effect |
 | --- | --- | --- |
-| `run` | exactly one of `agent` \| `skill` \| `command`, optional `task`, `cwd`, `background` | Starts a new subagent and returns its handle. The entry is `agent` (with a required `task`), `skill` (run as `/skill:<name>` in the child) or `command` (a prompt template, run as `/<name>`); for skill and command entries `task` is the arguments appended to the slash command. Foreground waits for the result; background returns at once and delivers the result later (background results always use auto). |
-| `parallel` | `tasks` (`[{ agent\|skill\|command, task?, cwd? }]`), optional `background` | Runs tasks at the same time (the global `maxConcurrent` still caps concurrency). Every task gets its own handle. `task` is required for an agent item and is the appended arguments for a skill or command item. The result is one summary: `Parallel: X/N succeeded` plus a section per task. A failure does not stop the others. |
-| `chain` | `chain` (`[{ agent\|skill\|command, task?, cwd? }]`), optional `background` | Runs steps in order; `{previous}` in a task is replaced with the previous step's output. `task` is required for an agent step and is the appended arguments for a skill or command step. Each step gets its own handle. A failing step stops the chain; its status and the chain progress are kept. |
+| `run` | exactly one of `agent` \| `skill` \| `command`, optional `task`, `cwd`, `model`, `thinking`, `background` | Starts a new subagent and returns its handle. The entry is `agent` (with a required `task`), `skill` (run as `/skill:<name>` in the child) or `command` (a prompt template, run as `/<name>`); for skill and command entries `task` is the arguments appended to the slash command. Foreground waits for the result; background returns at once and delivers the result later (background results always use auto). |
+| `parallel` | `tasks` (`[{ agent\|skill\|command, task?, cwd?, model?, thinking? }]`), optional `background` | Runs tasks at the same time (the global `maxConcurrent` still caps concurrency). Every task gets its own handle. `task` is required for an agent item and is the appended arguments for a skill or command item. The result is one summary: `Parallel: X/N succeeded` plus a section per task. A failure does not stop the others. |
+| `chain` | `chain` (`[{ agent\|skill\|command, task?, cwd?, model?, thinking? }]`), optional `background` | Runs steps in order; `{previous}` in a task is replaced with the previous step's output. `task` is required for an agent step and is the appended arguments for a skill or command step. Each step gets its own handle. A failing step stops the chain; its status and the chain progress are kept. |
 | `continue` | `handle` (the step that stopped the chain), optional `message` | Resumes that step (its own session) and then runs the remaining steps. Works for `failed` and `paused` chains; a `stopped` chain cannot be continued. |
 | `resume` | `handle`, `message`, optional `background` | Continues a finished or paused subagent in its own session (background results always use auto). Unknown, stopped, still-running or session-file-missing handles are rejected. |
 | `steer` | `handle`, `message`, optional `mode` (`steer` or `followUp`) | Sends guidance to a running subagent. |
@@ -141,7 +162,12 @@ The target is an agent, a skill or a prompt template:
 /sub /skill:sil-iterate watch MRSet 91425
 /sub /my-template some arguments
 /sub --cwd /path/to/repo code-agent look at this checkout
+/sub --model deeproute/deepseek-v4-pro --thinking high code-agent dig into this failure
 ```
+
+The optional flags come before the target, in any order: `--cwd <dir>`, `--model <provider/id>` (or a bare model id)
+and `--thinking <level>`. Model and thinking outrank the agent file and the settings defaults (see
+“Which model a child runs with”).
 
 Agent entries need a task; skill and template entries may omit the arguments. Names are validated before anything
 starts: an unknown agent, skill or template is reported with the available names and nothing is created.

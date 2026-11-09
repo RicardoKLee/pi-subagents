@@ -55,6 +55,8 @@ export interface FakeCtxOptions {
   /** Model of the main session; `find` is what `modelRegistry.find` returns. */
   model?: { provider: string; id: string };
   find?: (provider: string, id: string) => unknown;
+  /** Project trust reported to the extension; absent means "not asked" (`isProjectTrusted` is left off). */
+  projectTrusted?: boolean;
 }
 
 /** ExtensionContext stand-in whose session branch is `pi.branch`; notify calls and autocomplete factories are recorded. */
@@ -76,6 +78,7 @@ export function fakeCtx(pi: FakePi, opts: FakeCtxOptions) {
       getSessionDir: () => opts.sessionDir,
       getSessionId: () => opts.sessionId ?? "main-session",
     },
+    ...(opts.projectTrusted === undefined ? {} : { isProjectTrusted: () => opts.projectTrusted }),
   } as unknown as ExtensionContext;
   return { ctx, notes, providers };
 }

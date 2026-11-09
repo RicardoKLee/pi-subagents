@@ -12,6 +12,9 @@ export interface ChainStep {
   command?: string;
   task: string;
   cwd?: string;
+  /** Per-step model and thinking level, so a continued chain replays the steps it was created with. */
+  model?: string;
+  thinking?: string;
 }
 
 export interface ChainRecord {
