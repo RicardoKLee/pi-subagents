@@ -34,6 +34,8 @@ function setup(
     trustForCwd?: (cwd: string) => boolean | undefined;
     /** Context window of a given agent's model; used by chain steps to size `{previous}`. */
     agentWindow?: (agent: AgentDef) => number | undefined;
+    /** Injectable clock for the stall budgets. */
+    now?: () => number;
   } = {},
 ) {
   const root = tempDir("mgr-");
@@ -64,6 +66,7 @@ function setup(
     outputDir: opts.outputDir ?? join(root, "out"),
     ...(opts.trustForCwd ? { trustForCwd: opts.trustForCwd } : {}),
     ...(opts.agentWindow ? { receiverContextWindowFor: opts.agentWindow } : {}),
+    ...(opts.now ? { now: opts.now } : {}),
     onSettled: (info) => settled.push(info),
   });
   return { manager, runner, sent, entries, settled, root };

@@ -231,6 +231,7 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
         },
         onPendingReminder: (record, count, minutes) =>
           notify(pendingReminderText(record, count, minutes, state?.manager.recordPath(record) ?? record.handle), "warning"),
+        onStall: (record, reason) => notify(`@${record.handle} ${reason}; resume it or restart it`, "warning"),
         onRecordCreated: (record) => {
           if (existsSync(join(ctx.cwd, record.handle))) {
             warnOnce(`@${record.handle} has the same name as a file in ${ctx.cwd}; use @sub:${record.handle} to reach the subagent`);

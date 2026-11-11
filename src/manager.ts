@@ -89,6 +89,8 @@ export interface ManagerDeps {
   mailboxDir?: string;
   /** Called once when a pending child-result batch has waited longer than `pendingResultTimeoutMinutes` (M6). */
   onPendingReminder?: (record: SubagentRecord, count: number, oldestMinutes: number) => void;
+  /** Called when a run was paused because it exceeded a stall budget; the run stays resumable (M7). */
+  onStall?: (record: SubagentRecord, reason: string) => void;
   /** Injectable clock (tests); defaults to Date.now. */
   now?: () => number;
 }
@@ -211,6 +213,12 @@ interface Live {
   abandoned?: boolean;
   /** This run's own job, so `abandon` can stop it keeping `whenIdle()`/`shutdown()` alive. */
   job?: Promise<unknown>;
+  /** Why the run was paused by the stall watchdog; survives into `record.error`. */
+  stallReason?: string;
+  /** Set when a pause was already requested, so one run is never stalled twice. */
+  stallRequested?: boolean;
+  /** Resolves once this run has wound down (its own settle), so a grace window never outlives the run it guards. */
+  finished?: Promise<void>;
 }
 
 /**
@@ -250,6 +258,8 @@ export class SubagentManager {
   private closed = false;
   /** Reminder watch for queued child results (M6); started only while something is waiting. */
   private pendingTimer?: NodeJS.Timeout;
+  /** Stall watchdog: only runs while at least one child is live (M7). */
+  private stallTimer?: NodeJS.Timeout;
   /** Aborted on shutdown so queued run/resume calls stop waiting for a slot. */
   private readonly lifetime = new AbortController();
 
@@ -277,6 +287,88 @@ export class SubagentManager {
       out.set(id, { label: phase === "tool" ? (toolName ?? "tool") : phase, since: phaseSince });
     }
     return out;
+  }
+
+  /**
+   * Starts the stall watchdog while at least one child is live. The timer is unref'd, so it never keeps the process
+   * alive on its own, and `checkStalls()` works without it.
+   */
+  private ensureStallWatch(): void {
+    if (this.stallTimer || !this.live.size) return;
+    this.stallTimer = setInterval(() => this.checkStalls(), 30_000);
+    this.stallTimer.unref?.();
+  }
+
+  private stopStallWatch(): void {
+    if (this.stallTimer) clearInterval(this.stallTimer);
+    this.stallTimer = undefined;
+  }
+
+  /**
+   * One stall pass, testable without any timer. A tool call is judged by its own last progress (parallel calls never
+   * refresh each other), and the turn budget counts from the start of the turn and is never refreshed. Only an
+   * interrupt is requested here: whether to stop is the caller's decision.
+   */
+  checkStalls(): number {
+    const settings = this.deps.settings();
+    const toolBudget = settings.toolIdleTimeoutMinutes * 60_000;
+    const hardBudget = settings.turnHardTimeoutMinutes * 60_000;
+    if (toolBudget <= 0 && hardBudget <= 0) return 0;
+    let fired = 0;
+    for (const [id, live] of this.live) {
+      // A run that is already stopping keeps its stop intent, and a stall is requested at most once per run.
+      if (live.intent === "stop" || live.stallRequested) continue;
+      const record = this.deps.registry.get(id);
+      if (!record) continue;
+      const now = this.now();
+      let reason: string | undefined;
+      if (toolBudget > 0) {
+        // The earliest deadline wins: one stuck call is enough, however busy the other calls are.
+        let worst: { name: string; toolCallId: string; lastProgressAt: number } | undefined;
+        for (const [toolCallId, call] of live.activity.tools) {
+          if (!worst || call.lastProgressAt < worst.lastProgressAt) worst = { name: call.name, toolCallId, lastProgressAt: call.lastProgressAt };
+        }
+        if (worst && now - worst.lastProgressAt >= toolBudget) {
+          reason = `stalled: ${worst.name} produced no progress for ${Math.round((now - worst.lastProgressAt) / 60_000)}m (tool call ${worst.toolCallId})`;
+        }
+      }
+      if (!reason && hardBudget > 0 && now - live.activity.turnStartedAt >= hardBudget) {
+        reason = `stalled: the turn exceeded ${settings.turnHardTimeoutMinutes}m`;
+      }
+      if (!reason) continue;
+      this.stall(record, live, reason);
+      fired++;
+    }
+    return fired;
+  }
+
+  /** Requests a pause (never a stop): the run settles as `paused` and can be resumed or restarted. */
+  private stall(record: SubagentRecord, live: Live, reason: string): void {
+    live.stallRequested = true;
+    live.stallReason = reason;
+    live.intent = "interrupt";
+    void live.session.abort().catch(() => {});
+    this.track(this.grace(record, live, reason));
+    try {
+      this.deps.onStall?.(record, reason);
+    } catch {
+      // Notification is a side channel.
+    }
+  }
+
+  /**
+   * After the grace window without a settle, the run is abandoned so the awaiting call returns. The window ends early
+   * when the run settles on its own, so a normal pause never holds `whenIdle()` for the whole grace period.
+   */
+  private async grace(record: SubagentRecord, live: Live, reason: string): Promise<void> {
+    const ms = this.deps.settings().interruptGraceSeconds * 1_000;
+    const deadline = new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, ms);
+      timer.unref?.();
+    });
+    await Promise.race([deadline, live.finished ?? deadline]);
+    if (this.live.get(record.id) !== live || live.abandoned) return;
+    this.abandon(record, live, reason);
   }
 
   /**
@@ -1493,6 +1585,7 @@ export class SubagentManager {
     this.closed = true;
     this.lifetime.abort();
     this.stopPendingWatch();
+    this.stopStallWatch();
     for (const claim of this.claims.values()) claim.controller.abort();
     await this.interruptAll();
     for (const id of [...this.idle.keys()]) void this.closeIdle(id);
@@ -1577,6 +1670,7 @@ export class SubagentManager {
       activity: { phase: "model", phaseSince: now, turnStartedAt: now, tools: new Map() },
     };
     this.live.set(record.id, live);
+    this.ensureStallWatch();
     this.evictIdle();
     // Phase bookkeeping for the stall budgets and `/subagents`; a runner without `onActivity` simply never reports.
     const unwatch = session.onActivity?.((activity) => {
@@ -1611,6 +1705,9 @@ export class SubagentManager {
     let settle: ((outcome: RunOutcome) => void) | undefined;
     const abandoned = new Promise<RunOutcome>((resolve) => (settle = resolve));
     live.settle = settle;
+    // The grace window of a stall ends as soon as the run itself winds down.
+    let markFinished: (() => void) | undefined;
+    live.finished = new Promise<void>((resolve) => (markFinished = resolve));
     const job = (async (): Promise<RunOutcome> => {
       let result: ChildResult;
       let leafId: string | undefined;
@@ -1629,6 +1726,9 @@ export class SubagentManager {
           // A broken session simply leaves the previous leaf in place.
         }
         this.live.delete(record.id);
+        markFinished?.();
+        // Nothing is left to watch: the interval must not outlive the last live child.
+        if (!this.live.size) this.stopStallWatch();
         // A foreground delegation may have swapped the grant while it waited for a child (REVIEW point 5); release
         // whichever grant the parent currently holds. The scheduler makes a repeated release a no-op.
         (live.release ?? release)();
@@ -1671,7 +1771,7 @@ export class SubagentManager {
     let status: RunStatus;
     let error: string | undefined;
     if (live.intent === "stop") status = "stopped";
-    else if (live.intent === "interrupt" || result.stopReason === "aborted") status = "paused";
+    else if (live.intent === "interrupt" || result.stopReason === "aborted") (status = "paused"), (error = live.stallReason);
     else if (result.stopReason === "error") (status = "failed"), (error = result.errorMessage ?? "child reported an error");
     else if (!result.text.trim()) (status = "failed"), (error = "child returned an empty answer");
     else status = "completed";
@@ -1999,6 +2099,8 @@ export class SubagentManager {
     }
     if (live.job) this.work.delete(live.job);
     this.live.delete(record.id);
+    // The job of an abandoned run may never settle, so its `finally` never runs: stop the watchdog here instead.
+    if (!this.live.size) this.stopStallWatch();
     void this.close(record.id, live.session);
     this.maybeStopMailbox();
   }
