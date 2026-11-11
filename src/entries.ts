@@ -23,6 +23,7 @@ export const SUB_USAGE = [
   "  /sub [--cwd <目录>] [--model <provider/id>] [--thinking <级别>] /<模板> [参数]",
   "投递：/sub! = auto，/sub~ = share，/sub? = private（不带符号用设置 defaultDelivery）",
   "创建后用 @<handle> 续聊，用 /subagents 查看列表。",
+  "停止/重来：/subagents stop|interrupt|restart @<handle>，全体用 /subagents stop-all|interrupt-all",
 ].join("\n");
 
 export type EntryKind = "agent" | "skill" | "command";
