@@ -49,6 +49,13 @@ function handle(cmd) {
       if (mode === "handled") return respond(cmd, { disposition: "handled" });
       respond(cmd, { disposition: "started" });
       leaf = `leaf-${n + 1}`;
+      if (mode === "activity") {
+        // The tool-event stream a real child emits: one start, real progress, bash's empty start update, then end.
+        write({ type: "tool_execution_start", toolCallId: "call_1", toolName: "bash", args: { command: "sleep 1" } });
+        write({ type: "tool_execution_update", toolCallId: "call_1", toolName: "bash", args: {}, partialResult: { content: [{ type: "text", text: "building" }] } });
+        write({ type: "tool_execution_update", toolCallId: "call_1", toolName: "bash", args: {}, partialResult: { content: [] } });
+        write({ type: "tool_execution_end", toolCallId: "call_1", toolName: "bash", result: { content: [] }, isError: false });
+      }
       write({ type: "message_end", message: { role: "user", content: cmd.message } });
       write({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: `echo: ${cmd.message}` }], stopReason: "stop" } });
       return write({ type: "agent_settled", aborted: false });

@@ -37,6 +37,16 @@ export interface ChildSpec {
   delegation?: ChildDelegation;
 }
 
+/**
+ * A phase change of one child turn: `model` while a model request or the turn itself is in flight, `tool` while a
+ * tool call runs, `idle` once the turn settled. `progress` is false when the tool reported nothing new (bash's
+ * start-only empty update), so a caller never mistakes a start announcement for real output.
+ */
+export type ChildActivity =
+  | { phase: "model" }
+  | { phase: "idle" }
+  | { phase: "tool"; toolCallId: string; toolName: string; progress: boolean };
+
 export interface ChildResult {
   text: string;
   stopReason: StopReason;
@@ -56,6 +66,8 @@ export interface ChildSession {
    * The owner still calls dispose() after an exit to release whatever is left (listeners, pipes, a process to reap).
    */
   onExit(listener: (reason: string) => void): () => void;
+  /** Optional: reports phase changes and tool progress. Returns an unsubscribe function. */
+  onActivity?(listener: (activity: ChildActivity) => void): () => void;
   /** Resolves when the child is idle after handling `text`. */
   prompt(text: string): Promise<ChildResult>;
   /**
