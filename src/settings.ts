@@ -46,6 +46,11 @@ export interface SubagentSettings {
   defaultModel?: string;
   /** Thinking level for subagents whose agent file names none. `off` keeps a child from thinking unless something says so. */
   defaultThinking: ThinkingLevel;
+  /**
+   * Show a result in full instead of the collapsed preview: the `subagents` tool card and the full text of a `private`
+   * entry. `false` keeps pi's default (a 10-line preview until `Ctrl+O`).
+   */
+  expandResults: boolean;
 }
 
 export const DEFAULT_SETTINGS: SubagentSettings = Object.freeze({
@@ -64,6 +69,7 @@ export const DEFAULT_SETTINGS: SubagentSettings = Object.freeze({
   interruptGraceSeconds: 20,
   mentionQuoteMaxChars: 2000,
   defaultThinking: "off",
+  expandResults: false,
 });
 
 const LIMIT_KEYS = ["maxConcurrent", "maxChildrenPerParent", "maxDepth", "maxResident", "maxParallelTasks", "maxChainSteps"] as const;
@@ -140,6 +146,12 @@ export function parseSettings(raw: unknown): { settings: SubagentSettings; warni
     const value = input.defaultThinking;
     if (isThinkingLevel(value)) settings.defaultThinking = value;
     else warnings.push(`defaultThinking must be one of ${THINKING_LEVELS.join(", ")}; using ${DEFAULT_SETTINGS.defaultThinking}`);
+  }
+
+  if (input.expandResults !== undefined) {
+    const value = input.expandResults;
+    if (typeof value === "boolean") settings.expandResults = value;
+    else warnings.push(`expandResults must be a boolean; using ${DEFAULT_SETTINGS.expandResults}`);
   }
 
   return { settings, warnings };

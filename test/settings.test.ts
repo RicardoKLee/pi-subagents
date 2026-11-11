@@ -53,6 +53,18 @@ describe("parseSettings", () => {
     expect(parseSettings({ mentionQuoteMaxChars: 500 }).settings.mentionQuoteMaxChars).toBe(500);
   });
 
+  it("defaults expandResults to false and accepts a boolean", () => {
+    expect(DEFAULT_SETTINGS.expandResults).toBe(false);
+    expect(parseSettings({ expandResults: true }).settings.expandResults).toBe(true);
+    expect(parseSettings({}).settings.expandResults).toBe(false);
+  });
+
+  it("rejects a non-boolean expandResults with a warning", () => {
+    const { settings, warnings } = parseSettings({ expandResults: "yes" });
+    expect(settings.expandResults).toBe(false);
+    expect(warnings[0]).toContain("expandResults");
+  });
+
   it("warns when the root is not an object", () => {
     const { settings, warnings } = parseSettings([1, 2]);
     expect(settings).toEqual(DEFAULT_SETTINGS);

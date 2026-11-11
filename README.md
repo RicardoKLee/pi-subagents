@@ -39,6 +39,7 @@ of the user file key by key, and is ignored entirely for an untrusted project.
 | `mentionQuoteMaxChars` | `2000` | Positive integer. Longest user message quoted with an `@` result; longer messages are cut with a note. |
 | `defaultModel` | unset | Model for every subagent whose agent file names none: `provider/id` (e.g. `deeproute/deepseek-v4.1-flash`) or a bare id resolved against the main session's provider. Unset = the child inherits the main session's model. An id pi cannot resolve is reported once at startup and ignored, so children inherit instead of failing. |
 | `defaultThinking` | `"off"` | Thinking level for every subagent whose agent file names none: `off`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`. `off` is the default on purpose — a child only thinks when the agent file, the call or this setting says so. |
+| `expandResults` | `false` | `true` shows a result in full instead of the collapsed preview: the `subagents` tool card and the full text of a `private` entry. With it on, those two surfaces ignore `Ctrl+O`; set it back to `false` to get the preview back. |
 
 ### Which model a child runs with
 
@@ -117,7 +118,7 @@ Children are asked to end with a `<summary>` tag; without one (or with an empty 
 
 ## Delivery modes (background results)
 
-- `private`: stored as a custom session entry and shown only in the TUI. It never enters the model context, including compaction and branch summaries. The entry shows the conclusion open and keeps the full result (process, quoted question, paths) collapsed; expand it to read everything. Entries written before the conclusion was stored separately keep their full text visible.
+- `private`: stored as a custom session entry and shown only in the TUI. It never enters the model context, including compaction and branch summaries. The entry shows the conclusion open and keeps the full result (process, quoted question, paths) collapsed; expand it to read everything (or set `expandResults` to have it open from the start). Entries written before the conclusion was stored separately keep their full text visible.
 - `share`: written into the main session without starting a turn. The full output goes to a file; the message contains the summary, the output file path and the child session path.
 - `auto` (default for @ messages; always used for background runs started by the main agent): same content as `share`, then triggers a follow-up turn.
 

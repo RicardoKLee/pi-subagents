@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve as resolvePath } from "node:path";
-import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext, getAgentDir, rawKeyHint } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { type AgentDef, loadAgents } from "./agents.ts";
@@ -96,6 +96,9 @@ function writeSnapshotSafely(file: string | undefined, registry: Registry): void
 
 /** Set when this process was started as a subagent: it then loads only the proxy tool (plan 6.9 item 1). */
 const CHILD_RECORD = childRecordId();
+
+/** Lines pi's own tool-output fallback shows before it asks for `Ctrl+O`; kept in sync with that fallback. */
+const RESULT_PREVIEW_LINES = 10;
 
 export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI) => void {
   if (CHILD_RECORD) {
@@ -320,7 +323,8 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
     // Private results are custom entries: shown in the TUI only, never part of the LLM context.
     pi.registerEntryRenderer<PrivateEntryData>(PRIVATE_ENTRY_TYPE, (entry, { expanded }, theme) => {
       const data = entry.data;
-      return data ? renderPrivateEntry(data, expanded, theme) : undefined;
+      const full = expanded || (state?.settings.expandResults ?? false);
+      return data ? renderPrivateEntry(data, full, theme) : undefined;
     });
 
     // /subagents list|cost: a display-only tree entry; custom entries never enter the LLM context.
@@ -512,6 +516,20 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
           // the main session always dispatches as the depth-0 requester with no whitelist.
           const out = await executeAction(state.manager, toolCallInput(params as SubagentsInput), signal);
           return { content: [{ type: "text", text: out.text }], details: out.details };
+        },
+        // pi's fallback preview stops after 10 lines; the same shape is repeated here so `expandResults` can show the
+        // whole answer at once. A renderer cannot fall back to the default one per render, so both states live here.
+        // `rawKeyHint` rather than the render context's `keyHint`: the latter arrives in pi 1.5, and this extension
+        // supports 1.2 (a literal `ctrl+o` is what the fallback hint shows with the default keybindings).
+        renderResult(result, { expanded }, theme) {
+          const text = result.content.map((part) => (part.type === "text" ? part.text : "")).join("\n");
+          const lines = text.split("\n");
+          const shown = expanded || (state?.settings.expandResults ?? false) ? lines : lines.slice(0, RESULT_PREVIEW_LINES);
+          let body = shown.map((line) => theme.fg("toolOutput", line)).join("\n");
+          if (shown.length < lines.length) {
+            body += `${theme.fg("muted", `\n... (${lines.length - shown.length} more lines,`)} ${rawKeyHint("ctrl+o", "to expand")}${theme.fg("muted", ")")}`;
+          }
+          return new Text(body, 0, 0);
         },
       });
     }
