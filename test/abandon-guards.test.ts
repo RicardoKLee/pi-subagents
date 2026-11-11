@@ -258,3 +258,72 @@ describe("REVIEW-005: an abandonment tells the caller what to do next", () => {
     await manager.whenIdle();
   });
 });
+describe("REVIEW-004: a manual interrupt/stop arms the same abandonment window", () => {
+  /** A live run whose child never answers the abort (an in-process SDK child that cannot be killed). */
+  async function wedged(opts: { settings?: Partial<SubagentSettings> } = {}) {
+    const ctx = setup({ hold: true, settings: { interruptGraceSeconds: 1, ...opts.settings } });
+    const run = await ctx.manager.run({ agent: "reviewer", task: "t", background: true });
+    await vi.waitFor(() => expect(liveMap(ctx.manager).size).toBe(1));
+    ctx.runner.sessions[0]!.abortNeverSettles = true;
+    return { ...ctx, record: ctx.registry.get(run.record.id)! };
+  }
+
+  it("ends a stop as stopped, releases the caller and lets shutdown finish", async () => {
+    const { manager, registry, record } = await wedged();
+    const started = Date.now();
+    await manager.stop(record.handle);
+    expect(Date.now() - started).toBeLessThan(5_000);
+    // `stop` marks the record at once; the abandonment window only adds the reason once it expires.
+    await vi.waitFor(() => expect(registry.get(record.id)!.error ?? "").toMatch(/did not settle after abort/), { timeout: 5_000 });
+    const after = registry.get(record.id)!;
+    expect(after.status).toBe("stopped");
+    expect(liveMap(manager).size).toBe(0);
+    await manager.whenIdle();
+    await manager.shutdown();
+  });
+
+  it("drops pending child results when an abandoned stop ends the record", async () => {
+    const { manager, registry, record } = await wedged();
+    registry.update(record.id, { pending: [{ fromId: "x", handle: "kid", summary: "s", sessionFile: "/x", at: 1 }] });
+    await manager.stop(record.handle);
+    expect(registry.get(record.id)!.pending ?? []).toHaveLength(0);
+  });
+
+  it("ends an interrupt as paused and keeps it resumable", async () => {
+    const { manager, registry, record } = await wedged();
+    const started = Date.now();
+    await expect(manager.interrupt(record.handle)).resolves.toBe("paused");
+    expect(Date.now() - started).toBeLessThan(5_000);
+    await vi.waitFor(() => expect(registry.get(record.id)!.status).toBe("paused"), { timeout: 5_000 });
+    expect(registry.get(record.id)!.sessionFile).toBeTruthy();
+  });
+
+  it("bounds interruptAll instead of waiting on a child that ignores abort", async () => {
+    const { manager, registry, record } = await wedged();
+    const started = Date.now();
+    await expect(manager.interruptAll()).resolves.toBe(1);
+    expect(Date.now() - started).toBeLessThan(5_000);
+    await vi.waitFor(() => expect(registry.get(record.id)!.status).toBe("paused"), { timeout: 5_000 });
+  });
+
+  it("never downgrades a stop that ran before an interrupt", async () => {
+    const { manager, registry, record } = await wedged();
+    await manager.stop(record.handle);
+    await manager.interruptAll();
+    await vi.waitFor(() => expect(registry.get(record.id)!.status).toBe("stopped"), { timeout: 5_000 });
+    expect(registry.get(record.id)!.status).toBe("stopped");
+  });
+
+  it("does not wait the grace window when the child does settle", async () => {
+    const { manager, registry, runner } = setup({ hold: true, settings: { interruptGraceSeconds: 30 } });
+    const run = await manager.run({ agent: "reviewer", task: "t", background: true });
+    await vi.waitFor(() => expect(liveMap(manager).size).toBe(1));
+    expect(runner.sessions[0]!.abortNeverSettles).toBe(false);
+    const started = Date.now();
+    await manager.stop(run.record.handle);
+    expect(Date.now() - started).toBeLessThan(1_000);
+    const after = registry.get(run.record.id)!;
+    expect(after.status).toBe("stopped");
+    expect(after.error ?? "").not.toMatch(/did not settle/);
+  });
+});

@@ -372,6 +372,27 @@ export class SubagentManager {
    * After the grace window without a settle, the run is abandoned so the awaiting call returns. The window ends early
    * when the run settles on its own, so a normal pause never holds `whenIdle()` for the whole grace period.
    */
+  /**
+   * Requests an abort and always releases the caller: when the child does not settle inside the grace window the run is
+   * abandoned (spec §3.5). Manual interrupt/stop go through here too, so a child that ignores the signal can never hang
+   * the tool call, `whenIdle()` or session shutdown. `abandon` keeps the intent: `stop` ends as `stopped`, `interrupt`
+   * as `paused`.
+   */
+  private async abortWithinGrace(record: SubagentRecord, live: Live, intent: "interrupt" | "stop", reason: string): Promise<void> {
+    // An interrupt must never downgrade a stop that is already in flight.
+    if (live.intent !== "stop") live.intent = intent;
+    let abortError: unknown;
+    const aborted = live.session.abort().catch((error: unknown) => {
+      abortError = error;
+    });
+    const guarded = this.grace(record, live, reason);
+    this.track(guarded);
+    await Promise.race([aborted, guarded]);
+    // An abort that failed still surfaces (a caller must not think the child stopped), unless the run was abandoned —
+    // then the record status is the answer and the wedged child is no longer the caller's problem.
+    if (abortError !== undefined && !live.abandoned) throw abortError;
+  }
+
   private async grace(record: SubagentRecord, live: Live, reason: string): Promise<void> {
     const ms = this.deps.settings().interruptGraceSeconds * 1_000;
     const deadline = new Promise<void>((resolve) => {
@@ -1635,8 +1656,8 @@ export class SubagentManager {
     if (this.cancelQueued(record)) return "cancelled";
     const live = this.live.get(record.id);
     if (!live) throw new SubagentError("not_running", `@${record.handle} is ${record.status}`);
-    live.intent = "interrupt";
-    await live.session.abort();
+    // Bounded: a child that ignores the abort is abandoned at the end of the grace window instead of hanging the call.
+    await this.abortWithinGrace(record, live, "interrupt", "interrupted by the main agent");
     return "paused";
   }
 
@@ -1756,8 +1777,8 @@ export class SubagentManager {
       }
       const live = this.live.get(record.id);
       if (live) {
-        live.intent = intent;
-        await live.session.abort();
+        // Bounded as well: a stop on a child that ignores its abort still ends as `stopped` (see `abandon`).
+        await this.abortWithinGrace(record, live, intent, intent === "stop" ? "stopped by the main agent" : "interrupted");
       }
     } finally {
       await closingIdle;
@@ -1774,14 +1795,19 @@ export class SubagentManager {
    * stopping keeps its `stop` intent: pausing it would turn a terminal stop into a resumable pause (F13).
    */
   async interruptAll(): Promise<number> {
-    const live = [...this.live.values()].filter((entry) => entry.intent !== "stop");
+    const targets = [...this.live.entries()].filter(([, entry]) => entry.intent !== "stop");
     await Promise.all(
-      live.map((entry) => {
-        entry.intent = "interrupt";
-        return entry.session.abort().catch(() => {});
+      targets.map(([id, entry]) => {
+        const record = this.deps.registry.get(id);
+        // No record left to write a status on: still request the abort.
+        if (!record) {
+          entry.intent = "interrupt";
+          return entry.session.abort().catch(() => {});
+        }
+        return this.abortWithinGrace(record, entry, "interrupt", "interrupted by the main session");
       }),
     );
-    return live.length;
+    return targets.length;
   }
 
   /** Main session is going away: cancel queued/opening run and resume calls, then interrupt live children. */
@@ -2318,17 +2344,24 @@ export class SubagentManager {
   private abandon(record: SubagentRecord, live: Live, reason: string): void {
     if (live.abandoned) return;
     live.abandoned = true;
+    const stopping = live.intent === "stop";
     // The stored error says both why the run was given up and that it may still be burning CPU: the status is `paused`
-    // but nothing guarantees the child stopped (an SDK child cannot be killed).
+    // (resumable) or `stopped` (final), and nothing guarantees the child stopped (an SDK child cannot be killed).
     const message = `${reason}; did not settle after abort, the child may still be running`;
     let settled = record;
     try {
-      settled = this.deps.registry.update(record.id, { status: "paused", error: message });
+      // An abandoned stop stays final and drops its pending child results exactly like a normal stop; an abandoned
+      // interrupt stays resumable. Downgrading one into the other is the F13 failure mode.
+      if (stopping) this.deps.registry.update(record.id, { status: "stopped", error: message, pending: [], pendingNotifiedAt: undefined });
+      else this.deps.registry.update(record.id, { status: "paused", error: message });
+      settled = this.deps.registry.get(record.id) ?? record;
     } catch {
-      // The record stays paused in memory even when persisting fails.
+      // The record keeps its in-memory status even when persisting fails.
     }
-    // The waiting caller gets an actionable line: the record is paused, and rerunning it is `restart` (spec §3.5).
-    const note = `@${settled.handle} paused: did not settle after abort; use restart (the child may still be running)`;
+    // The waiting caller gets an actionable line: `restart` reruns a paused record in a fresh session.
+    const note = stopping
+      ? `@${settled.handle} stopped: did not settle after abort (the child may still be running)`
+      : `@${settled.handle} paused: did not settle after abort; use restart (the child may still be running)`;
     try {
       live.settle?.({ record: settled, payload: { text: note, summary: note } });
     } catch {
