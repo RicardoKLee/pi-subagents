@@ -125,6 +125,11 @@ export interface RunRequest extends EntryRequest {
   parentId?: string;
   /** Informational only: a record's depth is always derived from its parent (root subagents are depth 1). */
   depth?: number;
+  /**
+   * Foreground only: how long this call may wait before the child is paused (and the call returns). Ignored for a
+   * background run; the record stays resumable either way.
+   */
+  waitMinutes?: number;
 }
 
 export interface RunOutcome {
@@ -186,6 +191,8 @@ interface LaunchOptions {
   asks?: Ask[];
   /** Delegation-path background run: return the queued handle and wait for a slot in a detached task (LATENT-046-BG). */
   detach?: boolean;
+  /** The caller's own waiting budget in minutes: at the deadline the run is paused and the call returns. */
+  waitMinutes?: number;
 }
 
 interface Live {
@@ -765,6 +772,8 @@ export class SubagentManager {
       ...(req.receiverContextWindow ? { receiverContextWindow: req.receiverContextWindow } : {}),
       ...(req.ask ? { asks: [this.ask("ask", req.ask)] } : {}),
       ...(req.detach ? { detach: true } : {}),
+      // A background run has nobody waiting on it, so a wait budget would only cost it time.
+      ...(req.waitMinutes && !req.background ? { waitMinutes: req.waitMinutes } : {}),
     });
   }
 
@@ -889,7 +898,7 @@ export class SubagentManager {
   }
 
   /** Starts every task at once (the scheduler still caps concurrency) and summarizes the group afterwards. */
-  async runParallel(req: { items: readonly BatchItem[]; parentId?: string; background?: boolean; signal?: AbortSignal }): Promise<BatchOutcome> {
+  async runParallel(req: { items: readonly BatchItem[]; parentId?: string; background?: boolean; signal?: AbortSignal; waitMinutes?: number }): Promise<BatchOutcome> {
     if (this.closed) throw shutDownError();
     // A nested batch names its parent once at the top; each item inherits it unless it names one itself.
     const items = this.inheritParent(req.items, req.parentId);
@@ -912,7 +921,11 @@ export class SubagentManager {
     });
     const prepared = items.map((item, i) => this.prepare(targets[i]!, { ...(item.parentId ? { parentId: item.parentId } : {}) }));
     // One item failing to start (runner.open, a cancel while queued/opening, shutdown) must not drop the others' results.
-    const settled = Promise.allSettled(prepared.map((p) => this.launch(p, true, req.signal, { mode: "batch" })));
+    // The wait budget belongs to the calling tool call, not to the batch: every item gets its own deadline.
+    const waitMinutes = req.background ? undefined : req.waitMinutes;
+    const settled = Promise.allSettled(
+      prepared.map((p) => this.launch(p, true, req.signal, { mode: "batch", ...(waitMinutes ? { waitMinutes } : {}) })),
+    );
     const outcomes = settled.then((results) => results.map((result, i) => (result.status === "fulfilled" ? result.value : this.failureOutcome(prepared[i]!.record))));
     if (!req.background) {
       const done = await outcomes;
@@ -927,7 +940,7 @@ export class SubagentManager {
   }
 
   /** Runs the steps one after another; a failing, interrupted or stopped step stops the chain and can be continued later. */
-  async runChain(req: { steps: readonly BatchItem[]; parentId?: string; background?: boolean; signal?: AbortSignal }): Promise<BatchOutcome> {
+  async runChain(req: { steps: readonly BatchItem[]; parentId?: string; background?: boolean; signal?: AbortSignal; waitMinutes?: number }): Promise<BatchOutcome> {
     if (this.closed) throw shutDownError();
     // A nested chain names its parent once at the top; each step inherits it unless it names one itself.
     const steps = this.inheritParent(req.steps, req.parentId);
@@ -954,9 +967,10 @@ export class SubagentManager {
     // `chainStore` does not persist `parentId`, so the original `steps` array is the only source here; a continued
     // chain falls back to the resumed record's parent instead (see `continueChainLoop`).
     const parentOf = (index: number): string | undefined => steps[index]?.parentId;
-    if (!req.background) return this.runChainLoop(chain, 0, "", req.signal, [], parentOf);
+    const waitMinutes = req.background ? undefined : req.waitMinutes;
+    if (!req.background) return this.runChainLoop(chain, 0, "", req.signal, [], parentOf, waitMinutes);
     this.track(
-      this.runChainLoop(chain, 0, "", req.signal, [], parentOf).then((outcome) => {
+      this.runChainLoop(chain, 0, "", req.signal, [], parentOf, waitMinutes).then((outcome) => {
         this.sendBatch("chain", outcome.payload!, outcome.records, outcome.chain);
       }),
       (error) => this.reportBatchError(this.firstChainRecord(chain.id), error),
@@ -965,7 +979,7 @@ export class SubagentManager {
   }
 
   /** Continues the chain that stopped at the step behind `handle`: resumes that step, then runs the remaining ones. */
-  async continueChain(handle: string, message?: string, opts: { background?: boolean; signal?: AbortSignal } = {}): Promise<BatchOutcome> {
+  async continueChain(handle: string, message?: string, opts: { background?: boolean; signal?: AbortSignal; waitMinutes?: number } = {}): Promise<BatchOutcome> {
     if (this.closed) throw shutDownError();
     const record = this.requireRecord(handle);
     const chain = record.chainId ? this.deps.chainStore.get(record.chainId) : undefined;
@@ -986,9 +1000,10 @@ export class SubagentManager {
     for (let i = index + 1; i < chain.steps.length; i++) {
       this.resolveTarget(chain.steps[i]!, "chain", this.requesterFor(record.parentId));
     }
-    if (!opts.background) return this.continueChainLoop(chain, record, index, message, opts.signal, record.parentId);
+    const waitMinutes = opts.background ? undefined : opts.waitMinutes;
+    if (!opts.background) return this.continueChainLoop(chain, record, index, message, opts.signal, record.parentId, waitMinutes);
     this.track(
-      this.continueChainLoop(chain, record, index, message, opts.signal, record.parentId).then((outcome) => {
+      this.continueChainLoop(chain, record, index, message, opts.signal, record.parentId, waitMinutes).then((outcome) => {
         this.sendBatch("chain", outcome.payload!, outcome.records, outcome.chain);
       }),
       (error) => this.reportBatchError(this.firstChainRecord(chain.id), error),
@@ -1010,11 +1025,12 @@ export class SubagentManager {
     message: string | undefined,
     signal: AbortSignal | undefined,
     parentId?: string,
+    waitMinutes?: number,
   ): Promise<BatchOutcome> {
     // The process can die between a step finishing and the chain advancing: that step must not run a second time.
     if (record.status === "completed") {
       const current = this.deps.chainStore.update(chain.id, { status: "running", usage: this.chainUsage(chain) });
-      const rest = await this.runChainLoop(current, index + 1, record.lastSummary ?? "", signal, [{ record }], () => parentId);
+      const rest = await this.runChainLoop(current, index + 1, record.lastSummary ?? "", signal, [{ record }], () => parentId, waitMinutes);
       return { records: rest.records, payload: rest.payload, chain: rest.chain };
     }
     // Resume the step that stopped the chain so it keeps its own session, then run the remaining steps.
@@ -1024,6 +1040,8 @@ export class SubagentManager {
       ...(signal ? { signal } : {}),
       mode: "batch",
       ...(receiver ? { receiverContextWindow: receiver } : {}),
+      // The step is part of a foreground call, so the caller's budget applies to its resumed run too.
+      ...(waitMinutes ? { waitMinutes } : {}),
     });
     if (resumed.record.status !== "completed") {
       const stopped = this.deps.chainStore.update(chain.id, { status: chainStatusOf(resumed.record.status), usage: this.chainUsage(chain) });
@@ -1031,7 +1049,7 @@ export class SubagentManager {
     }
     // The resumed step keeps its record id, so the chain usage stays the sum of every started step's record.
     const current = this.deps.chainStore.update(chain.id, { status: "running", usage: this.chainUsage(chain) });
-    const rest = await this.runChainLoop(current, index + 1, resumed.payload?.text ?? "", signal, [resumed], () => parentId);
+    const rest = await this.runChainLoop(current, index + 1, resumed.payload?.text ?? "", signal, [resumed], () => parentId, waitMinutes);
     // `runChainLoop` already carries the resumed outcome, so its records and payload span the whole chain.
     return { records: rest.records, payload: rest.payload, chain: rest.chain };
   }
@@ -1043,6 +1061,7 @@ export class SubagentManager {
     signal: AbortSignal | undefined,
     outcomes: RunOutcome[] = [],
     parentOf: (index: number) => string | undefined = () => undefined,
+    waitMinutes?: number,
   ): Promise<BatchOutcome> {
     let current = chain;
     for (let i = from; i < chain.steps.length; i++) {
@@ -1076,7 +1095,11 @@ export class SubagentManager {
       const receiver = this.chainReceiverWindow(chain, i);
       let outcome: RunOutcome;
       try {
-        outcome = await this.launch(prepared, true, signal, { mode: "batch", ...(receiver ? { receiverContextWindow: receiver } : {}) });
+        outcome = await this.launch(prepared, true, signal, {
+          mode: "batch",
+          ...(receiver ? { receiverContextWindow: receiver } : {}),
+          ...(waitMinutes ? { waitMinutes } : {}),
+        });
       } catch (error) {
         // The run was cancelled or its session could not open; the record already says why.
         const failed = this.deps.registry.get(prepared.record.id) ?? prepared.record;
@@ -1264,7 +1287,7 @@ export class SubagentManager {
   async resume(
     handle: string,
     userMessage: string,
-    opts: { delivery?: DeliveryMode; background?: boolean; signal?: AbortSignal; mention?: boolean; receiverContextWindow?: number; mode?: "single" | "batch"; detach?: boolean } = {},
+    opts: { delivery?: DeliveryMode; background?: boolean; signal?: AbortSignal; mention?: boolean; receiverContextWindow?: number; mode?: "single" | "batch"; detach?: boolean; waitMinutes?: number } = {},
   ): Promise<RunOutcome> {
     const { record, agent, runner, cwd } = this.preflight(handle);
     // Child results that arrived while this record was paused are handed to the model before the user's message.
@@ -1375,6 +1398,7 @@ export class SubagentManager {
       const outcome = await this.execute(claimed, session, message, release, opts.background ?? false, signal, opts.mention ? [this.ask("ask", message)] : [], {
         ...(opts.mode ? { mode: opts.mode } : {}),
         ...(opts.receiverContextWindow ? { receiverContextWindow: opts.receiverContextWindow } : {}),
+        ...(opts.waitMinutes && !opts.background ? { waitMinutes: opts.waitMinutes } : {}),
       });
       // The queued results reached the model with this message; drop exactly those entries (a child that finished
       // while this resume waited for a slot may have queued another one, which must stay).
@@ -1873,6 +1897,16 @@ export class SubagentManager {
     const batch = options.mode === "batch";
     // Only a foreground single call is still waiting on its tool signal; a background or batch call runs detached.
     const callSignal = background || batch ? undefined : signal;
+    // The caller's own waiting budget: independent of `batch`, because a foreground batch blocks the same turn. At the
+    // deadline the run is paused exactly like a stall (never stopped, never delivered) and the call returns normally.
+    const waitMs = options.waitMinutes ? options.waitMinutes * 60_000 : undefined;
+    const waitTimer = waitMs
+      ? setTimeout(() => {
+          const current = this.deps.registry.get(record.id);
+          if (current && this.live.get(current.id) === live) this.stall(current, live, `waited ${options.waitMinutes}m for this call`);
+        }, waitMs)
+      : undefined;
+    waitTimer?.unref?.();
     const onCallAbort = () => {
       live.intent = "interrupt";
       void session.abort().catch(() => {});
@@ -1894,6 +1928,7 @@ export class SubagentManager {
         result = { text: "", stopReason: "error", errorMessage: (error as Error).message, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } };
       } finally {
         unwatch?.();
+        if (waitTimer) clearTimeout(waitTimer);
         callSignal?.removeEventListener("abort", onCallAbort);
         try {
           leafId = session.leafId;

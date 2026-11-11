@@ -197,3 +197,30 @@ describe("restart action", () => {
     await expect(executeAction(fakeManager(), { action: "restart" })).rejects.toThrow(/requires "handle"/);
   });
 });
+
+describe("waitMinutes parameter", () => {
+  it("is exposed to the model as an optional number", () => {
+    const property = SubagentsParams.properties.waitMinutes as { type?: string };
+    expect(property.type).toBe("number");
+    expect((SubagentsParams as { required?: string[] }).required ?? []).not.toContain("waitMinutes");
+  });
+
+  it("reaches run, parallel, chain, resume and continue", async () => {
+    const m = fakeManager({
+      runParallel: vi.fn(async () => ({ records: [record], payload: { text: "group", summary: "group" } })),
+      runChain: vi.fn(async () => ({ records: [record], payload: { text: "chain", summary: "chain" } })),
+      continueChain: vi.fn(async () => ({ records: [record], payload: { text: "continued", summary: "continued" } })),
+    });
+    await executeAction(m, { action: "run", agent: "reviewer", task: "x", waitMinutes: 5 });
+    await executeAction(m, { action: "parallel", tasks: [{ agent: "reviewer", task: "x" }], waitMinutes: 5 });
+    await executeAction(m, { action: "chain", chain: [{ agent: "reviewer", task: "x" }], waitMinutes: 5 });
+    await executeAction(m, { action: "resume", handle: "reviewer", message: "y", waitMinutes: 5 });
+    await executeAction(m, { action: "continue", handle: "reviewer", waitMinutes: 5 });
+
+    expect(m.run).toHaveBeenCalledWith(expect.objectContaining({ waitMinutes: 5 }));
+    expect(m.runParallel).toHaveBeenCalledWith(expect.objectContaining({ waitMinutes: 5 }));
+    expect(m.runChain).toHaveBeenCalledWith(expect.objectContaining({ waitMinutes: 5 }));
+    expect(m.resume).toHaveBeenCalledWith("reviewer", "y", expect.objectContaining({ waitMinutes: 5 }));
+    expect(m.continueChain).toHaveBeenCalledWith("reviewer", undefined, expect.objectContaining({ waitMinutes: 5 }));
+  });
+});

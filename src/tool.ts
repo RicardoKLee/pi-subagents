@@ -63,6 +63,12 @@ export const SubagentsParams = Type.Object({
   tasks: Type.Optional(Type.Array(BatchItem, { description: "parallel: tasks to run at the same time" })),
   chain: Type.Optional(Type.Array(BatchItem, { description: "chain: steps to run in order; {previous} is the previous step's output" })),
   background: Type.Optional(Type.Boolean({ description: "Return immediately; the result arrives later" })),
+  waitMinutes: Type.Optional(
+    Type.Number({
+      description:
+        "Foreground only: give up waiting after this many minutes and pause the child (the record stays resumable); background runs ignore it.",
+    }),
+  ),
   mode: Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("followUp")])),
 });
 
@@ -204,6 +210,7 @@ async function dispatch(
     ...(input.background ? { background: true, delivery: "auto" as const } : {}),
     ...(input.detach ? { detach: true } : {}),
     ...(signal ? { signal } : {}),
+    ...(input.waitMinutes ? { waitMinutes: input.waitMinutes } : {}),
   };
   // Internal only: the parent record the delegation path attributes runs to. The main agent's tool call never
   // carries it, so `run`/`parallel`/`chain` keep the depth-0 requester (no whitelist) for the main session.
@@ -222,6 +229,7 @@ async function dispatch(
         ...(input.thinking ? { thinking: input.thinking } : {}),
         ...(input.background ? { background: true } : {}),
         ...(input.detach ? { detach: true } : {}),
+        ...(input.waitMinutes ? { waitMinutes: input.waitMinutes } : {}),
         ...(signal ? { signal } : {}),
       });
       const body = payload ? payload.text : "Started in the background; the result will be delivered when it finishes.";
@@ -232,6 +240,7 @@ async function dispatch(
         items: needList(input.tasks, "tasks", "parallel"),
         ...(parentId ? { parentId } : {}),
         background: input.background ?? false,
+        ...(input.waitMinutes ? { waitMinutes: input.waitMinutes } : {}),
         ...(signal ? { signal } : {}),
       });
       return batchResult(out, "parallel");
@@ -241,6 +250,7 @@ async function dispatch(
         steps: needList(input.chain, "chain", "chain"),
         ...(parentId ? { parentId } : {}),
         background: input.background ?? false,
+        ...(input.waitMinutes ? { waitMinutes: input.waitMinutes } : {}),
         ...(signal ? { signal } : {}),
       });
       return batchResult(out, "chain");
@@ -248,6 +258,7 @@ async function dispatch(
     case "continue": {
       const out = await manager.continueChain(need(input.handle, "handle", "continue"), input.message, {
         background: input.background ?? false,
+        ...(input.waitMinutes ? { waitMinutes: input.waitMinutes } : {}),
         ...(signal ? { signal } : {}),
       });
       return batchResult(out, "continue");
