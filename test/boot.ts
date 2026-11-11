@@ -28,6 +28,8 @@ export async function boot(
     projectSettings?: Record<string, unknown>;
     /** Project trust reported to the extension; absent means the context does not answer the question. */
     projectTrusted?: boolean;
+    /** What `ctx.isIdle()` answers; default true. */
+    idle?: boolean;
   } = {},
 ) {
   const root = tempDir("ext-");
@@ -66,16 +68,17 @@ export async function boot(
       : {}),
   })(pi.asApi());
   pi.branch.push(...(opts.branch ?? []));
-  const { ctx, notes, providers } = fakeCtx(pi, {
+  const { ctx, notes, providers, aborts } = fakeCtx(pi, {
     cwd,
     sessionDir,
     hasUI: opts.hasUI ?? true,
     ...(opts.model ? { model: opts.model } : {}),
     ...(opts.find ? { find: opts.find } : {}),
     ...(opts.projectTrusted === undefined ? {} : { projectTrusted: opts.projectTrusted }),
+    ...(opts.idle === undefined ? {} : { idle: opts.idle }),
   });
   await pi.emit("session_start", { type: "session_start" }, ctx);
   const tool = pi.tools.get("subagents");
   const callTool = (params: Record<string, unknown>) => tool.execute("call-1", params, undefined, undefined, ctx);
-  return { pi, ctx, notes, providers, sent: pi.sent, runner, callTool, root, cwd, agentDir, rpcRunner: opts.rpcRunner, rpcResolvers };
+  return { pi, ctx, notes, providers, aborts, sent: pi.sent, runner, callTool, root, cwd, agentDir, rpcRunner: opts.rpcRunner, rpcResolvers };
 }

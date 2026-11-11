@@ -794,3 +794,101 @@ describe("default SDK runner", () => {
     await pi.emit("session_shutdown", { type: "session_shutdown" }, ctx);
   });
 });
+
+describe("/subagents control verbs", () => {
+  const command = (pi: FakePi) => pi.commands.get("subagents")!;
+  const runCommand = (pi: FakePi, ctx: ExtensionContext, args: string) => command(pi).handler(args, ctx);
+  const listing = async (callTool: (params: Record<string, unknown>) => Promise<{ content: { text: string }[] }>) =>
+    (await callTool({ action: "list" })).content[0].text;
+
+  it("stops one subagent without aborting the blocked main turn", async () => {
+    const { pi, ctx, runner, callTool, aborts, notes } = await boot({ hold: true, idle: false });
+    const tool = pi.tools.get("subagents");
+    // The main agent is blocked in this foreground call; the second subagent is healthy and unrelated.
+    const blocked = tool.execute("call-1", { action: "run", agent: "reviewer", task: "a" }, undefined, undefined, ctx);
+    await vi.waitFor(() => expect(runner.sessions).toHaveLength(1));
+    await callTool({ action: "run", agent: "reviewer", task: "b", background: true });
+    await vi.waitFor(() => expect(runner.sessions).toHaveLength(2));
+
+    await runCommand(pi, ctx, "stop @reviewer");
+
+    // Stopping the blocking run released the tool call by itself: no ctx.abort(), so no cascade over the other one.
+    expect((await blocked).content[0].text).toMatch(/stopped/);
+    expect(aborts).toHaveLength(0);
+    expect(await listing(callTool)).toMatch(/@reviewer\b.*\[stopped\]/);
+    expect(await listing(callTool)).toMatch(/@reviewer-2\b.*\[running\]/);
+    expect(notes.some((n) => n.message.includes("stopped"))).toBe(true);
+  });
+
+  it("stop-all stops every active record and leaves paused ones alone", async () => {
+    const { pi, ctx, runner, callTool } = await boot({ hold: true });
+    const tool = pi.tools.get("subagents");
+    const blocked = tool.execute("call-1", { action: "run", agent: "reviewer", task: "a" }, undefined, undefined, ctx);
+    await vi.waitFor(() => expect(runner.sessions).toHaveLength(1));
+    await callTool({ action: "run", agent: "reviewer", task: "b", background: true });
+    await callTool({ action: "run", agent: "reviewer", task: "c", background: true });
+    await vi.waitFor(() => expect(runner.sessions).toHaveLength(3));
+    await runCommand(pi, ctx, "interrupt @reviewer-3");
+    await vi.waitFor(async () => expect(await listing(callTool)).toMatch(/@reviewer-3\b.*\[paused\]/));
+
+    await runCommand(pi, ctx, "stop-all");
+
+    await blocked;
+    const list = await listing(callTool);
+    expect(list).toMatch(/@reviewer\b.*\[stopped\]/);
+    expect(list).toMatch(/@reviewer-2\b.*\[stopped\]/);
+    expect(list).toMatch(/@reviewer-3\b.*\[paused\]/); // paused stays resumable
+  });
+
+  it("restarts in the background so the command returns at once", async () => {
+    const { pi, ctx, runner, callTool, notes } = await boot({ hold: true });
+    await callTool({ action: "run", agent: "reviewer", task: "a", background: true });
+    await vi.waitFor(() => expect(runner.sessions).toHaveLength(1));
+    await runCommand(pi, ctx, "interrupt @reviewer");
+    await vi.waitFor(async () => expect(await listing(callTool)).toMatch(/\[paused\]/));
+
+    const started = Date.now();
+    await runCommand(pi, ctx, "restart @reviewer 换个思路");
+
+    expect(Date.now() - started).toBeLessThan(1000); // the handler did not wait for the new run
+    expect(await listing(callTool)).toMatch(/@reviewer\b.*run 2\b.*\[running\]/);
+    expect(notes.some((n) => n.message.includes("restarted as run 2"))).toBe(true);
+  });
+
+  it("falls back to ctx.abort() only when the action settled nothing", async () => {
+    const { pi, ctx, aborts } = await boot({ idle: false });
+    await runCommand(pi, ctx, "stop-all");
+    expect(aborts).toHaveLength(1); // the turn is still blocked and this action released no run
+  });
+
+  it("prints the help and completes verbs then handles", async () => {
+    const { pi, ctx, notes, callTool } = await boot({ hold: true });
+    await callTool({ action: "run", agent: "reviewer", task: "a", background: true });
+
+    await runCommand(pi, ctx, "help");
+    const help = notes.at(-1)!.message;
+    for (const verb of ["stop", "stop-all", "interrupt", "interrupt-all", "restart"]) expect(help).toContain(verb);
+
+    expect(command(pi).getArgumentCompletions("st").map((i: { value: string }) => i.value)).toEqual(expect.arrayContaining(["stop", "stop-all"]));
+    expect(command(pi).getArgumentCompletions("stop @").map((i: { value: string }) => i.value)).toEqual(["@reviewer"]);
+  });
+
+  it("reports a bad verb instead of guessing", async () => {
+    const { pi, ctx, notes } = await boot();
+    await runCommand(pi, ctx, "stahp @reviewer");
+    expect(notes.at(-1)).toMatchObject({ type: "error" });
+    expect(notes.at(-1)!.message).toContain("stop-all");
+  });
+
+  it("registers a stop-all shortcut and lists it in the help", async () => {
+    const { pi, ctx, runner, callTool } = await boot({ hold: true });
+    const shortcut = pi.shortcuts.get("ctrl+shift+x");
+    expect(shortcut).toBeDefined();
+    await callTool({ action: "run", agent: "reviewer", task: "a", background: true });
+    await vi.waitFor(() => expect(runner.sessions).toHaveLength(1));
+
+    await shortcut!.handler(ctx);
+
+    expect(await listing(callTool)).toMatch(/@reviewer\b.*\[stopped\]/);
+  });
+});

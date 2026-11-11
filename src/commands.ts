@@ -73,6 +73,11 @@ export function parseSubagentsCommand(raw: string): SubagentCommand {
     return { kind: verb as "stop" | "interrupt", handle };
   }
 
+  if (verb.startsWith("/")) {
+    // A second slash usually means two commands were typed on one line: say so instead of listing every verb.
+    return { kind: "error", message: `${text} was not run; type it on its own line` };
+  }
+
   return { kind: "error", message: `unknown verb "${verb}"; use one of ${SUBAGENT_VERBS.join(", ")}` };
 }
 
@@ -105,3 +110,18 @@ export function subagentsCompletions(prefix: string, known: () => string[]): Sub
     .filter((handle) => handle.toLowerCase().startsWith(partial))
     .map((handle) => ({ value: `@${handle}`, label: `@${handle}`, description: handle }));
 }
+
+/** The `/subagents` help text: the verbs, one example each, and the shortcut. */
+export const SUBAGENTS_HELP = [
+  "用法：/subagents <动词> [@handle] [消息]",
+  "  /subagents list | cost — 列表与成本",
+  "  /subagents stop @x — 永久结束（不能 resume；之后可 restart）",
+  "  /subagents interrupt @x — 暂停（可 resume，也可 restart）",
+  "  /subagents restart @x [消息] — 同一 handle、新会话、按原 task 重跑",
+  "  /subagents stop-all — 结束所有 active；paused 保持可 resume",
+  "  /subagents interrupt-all — 暂停所有运行中的",
+  "  快捷键：ctrl+shift+x = /subagents stop-all",
+].join("\n");
+
+/** The control verbs a `/subagents` invocation can perform (the ones that act on subagents). */
+export type ControlCommand = Extract<SubagentCommand, { kind: "stop" | "interrupt" | "restart" | "stop-all" | "interrupt-all" }>;

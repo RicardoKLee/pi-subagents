@@ -7,6 +7,7 @@ import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { type AgentDef, loadAgents } from "./agents.ts";
 import { CHAIN_ENTRY_TYPE, ChainStore } from "./chain.ts";
 import { childExtension, childRecordId, type DelegationHost, mailboxHost } from "./child.ts";
+import { type ControlCommand, parseSubagentsCommand, SUBAGENTS_HELP, subagentsCompletions } from "./commands.ts";
 import { mentionProvider } from "./complete.ts";
 import { PRIVATE_ENTRY_TYPE, SETTLED_EVENT, type PrivateEntryData } from "./delivery.ts";
 import { createNameCache, parseEntryRequest, parseSubCommand, SUB_USAGE, skillNames, templateNames, type EntryRequest } from "./entries.ts";
@@ -21,7 +22,7 @@ import type { Runner } from "./runner/types.ts";
 import { Scheduler } from "./scheduler.ts";
 import { loadSettings, loadSettingsLayered, limitAllows, type DeliveryMode, type SubagentSettings } from "./settings.ts";
 import { executeAction, SubagentsParams, toolCallInput, type SubagentsInput } from "./tool.ts";
-import { pendingReminderText, renderTree, TREE_ENTRY_TYPE, type TreeEntryData, type TreeView } from "./tree.ts";
+import { pendingReminderText, renderTree, TREE_ENTRY_TYPE, type TreeEntryData } from "./tree.ts";
 
 interface State {
   manager: SubagentManager;
@@ -342,25 +343,103 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
      * disabled, from an enabled `session_start`; a disabled session (`maxDepth: 0`) advertises neither.
      */
     function registerSubagentCapabilities(): void {
-      const VIEWS: TreeView[] = ["list", "cost"];
+      /**
+       * Runs one control verb, then releases a blocked main turn only when the action settled nothing. `ctx.abort()`
+       * cascades into the tool signal's `onAbort` -> `manager.interruptAll()`, which would pause every healthy
+       * subagent, so it is the last resort — an action that made the blocking run settle needs no abort at all.
+       */
+      const runControl = async (parsed: ControlCommand, ctx: ExtensionContext): Promise<void> => {
+        const current = state;
+        if (!current) {
+          ctx.ui.notify("pi-subagents: not initialised for this session yet", "error");
+          return;
+        }
+        const notify = (message: string, type: "info" | "error" = "info") => ctx.ui.notify(`pi-subagents: ${message}`, type);
+        const activeIds = () => new Set(current.manager.activeRecords().map((r) => r.id));
+        const before = activeIds();
+        try {
+          switch (parsed.kind) {
+            case "stop":
+              await current.manager.stop(parsed.handle);
+              notify(`@${parsed.handle} stopped; it cannot be resumed, but /subagents restart @${parsed.handle} runs it again.`);
+              break;
+            case "interrupt": {
+              const outcome = await current.manager.interrupt(parsed.handle);
+              notify(
+                outcome === "cancelled"
+                  ? `${parsed.handle} had not started yet; it is cancelled.`
+                  : `${parsed.handle} paused; the main agent can resume it, or /subagents restart @${parsed.handle} reruns the task in a fresh session.`,
+              );
+              break;
+            }
+            case "stop-all": {
+              const out = await current.manager.stopAll();
+              notify(
+                out.stopped
+                  ? `stopped ${out.stopped} subagent(s)${out.cancelled ? ` (${out.cancelled} were still queued)` : ""}; paused ones were left resumable`
+                  : "no subagent was running",
+              );
+              break;
+            }
+            case "interrupt-all": {
+              const count = await current.manager.interruptAll();
+              notify(count ? `paused ${count} subagent(s); the main agent can resume them` : "no subagent was running");
+              break;
+            }
+            case "restart": {
+              // Background: the command handler must not wait for the new run, or the command itself would hang.
+              const { record } = await current.manager.restart(parsed.handle, {
+                background: true,
+                ...(parsed.message ? { message: parsed.message } : {}),
+              });
+              notify(`@${record.handle} restarted as run ${record.runId} in a fresh session`);
+              break;
+            }
+          }
+        } catch (error) {
+          notify((error as Error).message, "error");
+          return;
+        }
+        // Let the settled run unwind (its status is written a tick after the abort) before judging what is active.
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        const after = activeIds();
+        // A restart halts the previous run before it starts runId+1, so whatever waited on the old run is released even
+        // though the same record id is active again.
+        const settled = parsed.kind === "restart" || [...before].some((id) => !after.has(id));
+        if (!ctx.isIdle() && !settled) ctx.abort();
+      };
+
       pi.registerCommand("subagents", {
-        description: "Show subagents as a tree: /subagents [list|cost]",
-        getArgumentCompletions: (prefix) =>
-          VIEWS.filter((v) => v.startsWith(prefix.trim().toLowerCase())).map((v) => ({ value: v, label: v, description: v === "list" ? "status and cost" : "tokens and cost" })),
+        description: "Subagents: /subagents list|cost|help|stop|stop-all|interrupt|interrupt-all|restart [@handle] [message]",
+        getArgumentCompletions: (prefix) => subagentsCompletions(prefix, () => state?.manager.list().map((r) => r.handle) ?? []),
         handler: async (args, ctx) => {
           if (state) state.ctx = ctx;
-          const raw = args.trim();
-          const view = (raw.toLowerCase() || "list") as TreeView;
-          if (!VIEWS.includes(view)) {
-            // A leading "/" usually means two commands were typed on one line (e.g. "/subagents /debug-agent").
-            const hint = raw.includes("/") ? `${raw} was not run; type it on its own line` : "use /subagents list or /subagents cost";
-            ctx.ui.notify(`pi-subagents: unknown view "${raw}"; ${hint}`, "error");
+          const parsed = parseSubagentsCommand(args);
+          if (parsed.kind === "error") {
+            ctx.ui.notify(`pi-subagents: ${parsed.message}`, "error");
             return;
           }
-          pi.appendEntry<TreeEntryData>(TREE_ENTRY_TYPE, {
-            view,
-            text: renderTree(state?.registry.list() ?? [], view, state?.manager.listChains() ?? [], Date.now(), state?.manager.activitySnapshot()),
-          });
+          if (parsed.kind === "help") {
+            ctx.ui.notify(SUBAGENTS_HELP, "info");
+            return;
+          }
+          if (parsed.kind === "view") {
+            pi.appendEntry<TreeEntryData>(TREE_ENTRY_TYPE, {
+              view: parsed.view,
+              text: renderTree(state?.registry.list() ?? [], parsed.view, state?.manager.listChains() ?? [], Date.now(), state?.manager.activitySnapshot()),
+            });
+            return;
+          }
+          await runControl(parsed, ctx);
+        },
+      });
+      // A shortcut is the only control surface that needs no turn at all: it runs from the editor's key handler, even
+      // while the agent streams (pi's command handlers do too — see the spike note in README).
+      pi.registerShortcut("ctrl+shift+x", {
+        description: "subagents: stop every active subagent",
+        handler: async (ctx) => {
+          if (state) state.ctx = ctx;
+          await runControl({ kind: "stop-all" }, ctx);
         },
       });
       // `/sub` creates a subagent without going through the main model; the symbol in the command name picks the delivery.
