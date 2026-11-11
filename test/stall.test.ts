@@ -35,6 +35,9 @@ function setup(opts: { scripts?: ChildResult[][]; hold?: boolean; limit?: number
   });
   const registry = new Registry(() => {});
   const stalls: { handle: string; reason: string }[] = [];
+  /** Every message the manager handed to the main session, so "an abandoned run is never delivered" is checkable. */
+  const sent: { customType?: string; content?: string }[] = [];
+  const settledNotices: { handle: string; status: string }[] = [];
   const manager = new SubagentManager({
     registry,
     chainStore: new ChainStore(() => {}),
@@ -42,7 +45,8 @@ function setup(opts: { scripts?: ChildResult[][]; hold?: boolean; limit?: number
     runners: { sdk: runner, rpc: undefined },
     agents: () => new Map([["reviewer", reviewer]]),
     settings: () => ({ ...DEFAULT_SETTINGS, maxResident: 0, ...opts.settings }),
-    port: { sendMessage: () => {}, appendEntry: () => {} },
+    port: { sendMessage: (message: { customType?: string; content?: string }) => void sent.push(message), appendEntry: () => {} },
+    onSettled: (notice: { handle: string; status: string }) => void settledNotices.push(notice),
     receiverContextWindow: () => 200000,
     cwd: root,
     agentDir: join(root, "agent"),
@@ -51,7 +55,7 @@ function setup(opts: { scripts?: ChildResult[][]; hold?: boolean; limit?: number
     onStall: (record, reason) => stalls.push({ handle: record.handle, reason }),
     ...(opts.now ? { now: opts.now } : {}),
   });
-  return { manager, registry, runner, root, stalls };
+  return { manager, registry, runner, root, stalls, sent, settledNotices };
 }
 
 const liveMap = (manager: SubagentManager): Map<string, LiveLike> =>
@@ -96,6 +100,57 @@ describe("abandonment (case-01a0c29f)", () => {
     await vi.waitFor(() => expect(registry.list()[0]!.usage.input).toBeGreaterThan(before));
     expect(registry.list()[0]!.status).toBe("paused"); // the status is not rewritten
     expect(session.disposed).toBe(true); // the wedged session was closed
+  });
+});
+
+describe("the watchdog end to end (case-01a0c29f)", () => {
+  it("pauses the wedged call when its budget expires and releases the waiting main agent", async () => {
+    const clock = { t: 1_000_000 };
+    const { manager, registry, runner, stalls } = setup({ hold: true, now: () => clock.t, settings: { toolIdleTimeoutMinutes: 45, interruptGraceSeconds: 1 } });
+    const pending = manager.run({ agent: "reviewer", task: "stuck in bash" });
+    await vi.waitFor(() => expect(manager.activitySnapshot().size).toBe(1));
+    const session = runner.sessions[0]!;
+    // Exactly the case-01a0c29f shape: one bash call, no output, and an abort the tool ignores.
+    session.abortNeverSettles = true;
+    session.emitActivity({ phase: "tool", toolCallId: "call_8699", toolName: "bash", progress: false });
+    clock.t += 22 * 60 * 60_000; // the child sat there for ~22 hours
+    const startedAt = Date.now();
+
+    expect(manager.checkStalls()).toBe(1);
+    // One pause request per run: a second pass neither re-aborts nor rewrites the reason.
+    expect(manager.checkStalls()).toBe(0);
+    expect(session.aborted).toBe(1);
+    expect(stalls).toHaveLength(1);
+    expect(stalls[0]!.reason).toMatch(/bash/);
+
+    // The abandoned run resolves the foreground call instead of blocking the main agent for those 22 hours.
+    const out = await pending;
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    expect(out.record.status).toBe("paused");
+    expect(out.payload?.text).toMatch(/@reviewer paused/);
+    expect(registry.list()[0]!.error).toMatch(/bash produced no progress for \d+m \(tool call call_8699\)/);
+    expect(registry.list()[0]!.error).toMatch(/did not settle after abort/);
+    expect(liveMap(manager).size).toBe(0);
+    await manager.whenIdle();
+    session.finish(); // let the wedged prompt go once the assertions are done
+  });
+
+  it("delivers nothing when an abandoned run settles late, and still counts its usage", async () => {
+    const { manager, registry, runner, sent, settledNotices } = setup({ hold: true, settings: { interruptGraceSeconds: 1 } });
+    const r = await manager.run({ agent: "reviewer", task: "background", background: true });
+    await vi.waitFor(() => expect(runner.sessions).toHaveLength(1));
+    const session = runner.sessions[0]!;
+    session.abortNeverSettles = true;
+    abandon(manager, registry.get(r.record.id)!, onlyLive(manager), "stalled: bash produced no progress for 45m");
+    const before = registry.get(r.record.id)!;
+
+    session.finish(); // the wedged tool finally returns a result that would normally be delivered
+
+    await vi.waitFor(() => expect(registry.get(r.record.id)!.usage.input).toBeGreaterThan(before.usage.input));
+    expect(sent).toHaveLength(0);
+    expect(settledNotices).toHaveLength(0);
+    expect(registry.get(r.record.id)!.status).toBe("paused");
+    await manager.whenIdle();
   });
 });
 

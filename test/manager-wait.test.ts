@@ -68,6 +68,26 @@ describe("waitMinutes (the caller's own waiting budget)", () => {
     expect(registry.list().map((r) => r.error ?? "")).toEqual([expect.stringMatching(/waited/), expect.stringMatching(/waited/)]);
   });
 
+  it("applies to a foreground chain too", async () => {
+    const { manager, registry, runner } = setup({ hold: true, settings: { interruptGraceSeconds: 1 } });
+    const started = Date.now();
+    const out = await manager.runChain({
+      steps: [
+        { agent: "reviewer", task: "one" },
+        { agent: "reviewer", task: "two" },
+      ],
+      waitMinutes: 0.001,
+    });
+    expect(Date.now() - started).toBeLessThan(3_000);
+    expect(out.records.map((r) => r.status)).toEqual(["paused"]);
+    expect(out.chain!.status).toBe("paused");
+    // The chain stopped at the paused step: the next one never started, so it is still continuable.
+    expect(registry.list()).toHaveLength(1);
+    expect(runner.sessions).toHaveLength(1);
+    expect(registry.list()[0]!.error).toMatch(/waited/);
+    await manager.whenIdle();
+  });
+
   it("a background run ignores it", async () => {
     const { manager, registry } = setup({ hold: true, settings: { interruptGraceSeconds: 1 } });
     const out = await manager.run({ agent: "reviewer", task: "b", background: true, waitMinutes: 0.001 });

@@ -174,6 +174,20 @@ describe("executeAction", () => {
     }
     expect(fakeManager().stopAll).not.toHaveBeenCalled();
   });
+
+  it("every single-record action still refuses to run without a handle", async () => {
+    // Regression: the mass actions must never become the fallback for a forgotten handle.
+    const m = fakeManager();
+    for (const action of ["stop", "interrupt", "steer", "restart"] as const) {
+      await expect(executeAction(m, { action })).rejects.toThrow(/requires "handle"/);
+    }
+    expect(m.stop).not.toHaveBeenCalled();
+    expect(m.interrupt).not.toHaveBeenCalled();
+    expect(m.steer).not.toHaveBeenCalled();
+    expect(m.restart).not.toHaveBeenCalled();
+    expect(m.stopAll).not.toHaveBeenCalled();
+    expect(m.interruptAll).not.toHaveBeenCalled();
+  });
 });
 
 describe("restart action", () => {

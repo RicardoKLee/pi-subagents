@@ -120,6 +120,32 @@ describe("SubagentManager.stopAll", () => {
     expect(registry.list().map((r) => r.status)).toEqual(["completed", "stopped"]);
   });
 
+  it("cancels a restart that is still claiming a record, so nothing starts mid-stop", async () => {
+    const { manager, registry, runner } = setup({ hold: true, limit: 1, scripts: [[], [], []] });
+    // One paused record, then a live run that holds the only slot.
+    const earlier = await manager.run({ agent: "reviewer", task: "paused one", background: true });
+    await vi.waitFor(() => expect(runner.sessions).toHaveLength(1));
+    await manager.interrupt(earlier.record.handle);
+    await vi.waitFor(() => expect(statusOf(registry, earlier.record.handle)).toBe("paused"));
+    const holder = await manager.run({ agent: "reviewer", task: "holds the only slot", background: true });
+    await vi.waitFor(() => expect(runner.sessions).toHaveLength(2));
+
+    // No slot is free, so this restart only claims its record: it is "running" without a child session yet.
+    const claiming = await manager.restart(earlier.record.handle, { background: true });
+    expect(claiming.record.status).toBe("running");
+    expect(runner.sessions).toHaveLength(2);
+
+    const out = await manager.stopAll();
+
+    expect(out.stopped).toBe(2); // the claim is a target too, not only the live run
+    expect(statusOf(registry, earlier.record.handle)).toBe("stopped");
+    expect(statusOf(registry, holder.record.handle)).toBe("stopped");
+    // The claim was aborted before it opened anything: no third session, no "running" leak.
+    await manager.whenIdle();
+    expect(runner.sessions).toHaveLength(2);
+    expect(registry.list().map((r) => r.status)).toEqual(["stopped", "stopped"]);
+  });
+
   it("settles a chain whose running step it stopped", async () => {
     const { manager, registry, runner } = setup({ hold: true, scripts: [[], []] });
     const chain = await manager.runChain({ steps: [{ agent: "reviewer", task: "one" }, { agent: "reviewer", task: "two" }], background: true });
