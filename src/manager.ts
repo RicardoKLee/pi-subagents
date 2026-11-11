@@ -2350,10 +2350,12 @@ export class SubagentManager {
   private preflight(handle: string): { record: SubagentRecord; agent: AgentDef; runner: Runner; cwd: string } {
     if (this.closed) throw shutDownError();
     const record = this.requireRecord(handle);
-    if (record.status === "stopped") throw new SubagentError("stopped", `@${record.handle} was stopped and cannot be resumed; start a new subagent instead`);
+    if (record.status === "stopped") {
+      throw new SubagentError("stopped", `@${record.handle} was stopped and cannot be resumed; use action=restart to run it again in a fresh session`);
+    }
     if (record.status === "queued") throw new SubagentError("busy", `@${record.handle} is queued and has not started yet`);
     if (record.status === "running" || this.live.has(record.id)) {
-      throw new SubagentError("busy", `@${record.handle} is still running; use steer to guide it`);
+      throw new SubagentError("busy", `@${record.handle} is still running; use steer to guide it, or interrupt/stop/restart it`);
     }
     if (!record.sessionFile) throw new SubagentError("missing_session", `@${record.handle} never started, so there is no session to resume`);
     if (!existsSync(record.sessionFile)) {

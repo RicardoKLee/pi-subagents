@@ -1,6 +1,12 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { parseSubagentsCommand, SUBAGENT_VERBS, subagentsCompletions } from "../src/commands.ts";
 import { SUBAGENT_ACTIONS } from "../src/tool.ts";
+
+const readme = readFileSync(fileURLToPath(new URL("../README.md", import.meta.url)), "utf8");
+/** The action names of README's tool table, read back so the docs cannot drift from the schema. */
+const documentedActions = [...readme.matchAll(/^\| `([a-z-]+)` \|/gm)].map((match) => match[1]!);
 
 describe("parseSubagentsCommand", () => {
   it("parses verbs with an optional handle", () => {
@@ -69,5 +75,19 @@ describe("parseSubagentsCommand", () => {
       if (verb === "list" || verb === "cost" || verb === "help") continue;
       expect(SUBAGENT_ACTIONS).toContain(verb);
     }
+  });
+});
+
+describe("README stays aligned with the code", () => {
+  it("documents every tool action", () => {
+    for (const action of SUBAGENT_ACTIONS) expect(documentedActions).toContain(action);
+  });
+
+  it("documents every /subagents verb", () => {
+    for (const verb of SUBAGENT_VERBS) expect(readme).toContain(`/subagents ${verb}`);
+  });
+
+  it("documents the stall-control settings and the wait budget", () => {
+    for (const key of ["toolIdleTimeoutMinutes", "turnHardTimeoutMinutes", "interruptGraceSeconds", "waitMinutes"]) expect(readme).toContain(key);
   });
 });

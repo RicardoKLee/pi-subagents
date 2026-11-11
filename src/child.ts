@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { callViaMailbox } from "./mailbox.ts";
-import { SubagentsParams } from "./tool.ts";
+import { ACTION_GUIDANCE, SubagentsParams } from "./tool.ts";
 
 export interface DelegationHost {
   /** Runs one delegation request in the owning session (in-process for SDK children, the mailbox for RPC). */
@@ -39,8 +39,8 @@ export function childExtension(opts: ChildDelegationOptions): ExtensionFactory {
       label: "Subagents",
       description:
         "Delegate work to subagents that belong to you: results come back into this session, and you can only reach your own subagents (never your parent's or your siblings'). " +
-        "action=run starts one; parallel/chain run several; resume/continue/steer/interrupt/stop act on your own subagents; list shows your subtree. " +
-        "stop-all and interrupt-all are not available to you: only the main agent may stop every subagent.",
+        "action=run starts one; parallel/chain run several; resume/continue/restart/steer/interrupt/stop act on your own subagents; list shows your subtree. " +
+        `${ACTION_GUIDANCE} The mass actions are reserved for the main agent: you cannot stop-all or interrupt-all.`,
       parameters: SubagentsParams,
       // One delegation at a time with the other calls of the assistant message. The tool forwards to the owning
       // session's manager, which yields the delegating run's scheduler slot while it waits for a child; running two

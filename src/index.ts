@@ -21,7 +21,7 @@ import { type ModelResolver, SdkRunner, defaultProjectTrust } from "./runner/sdk
 import type { Runner } from "./runner/types.ts";
 import { Scheduler } from "./scheduler.ts";
 import { loadSettings, loadSettingsLayered, limitAllows, type DeliveryMode, type SubagentSettings } from "./settings.ts";
-import { executeAction, SubagentsParams, toolCallInput, type SubagentsInput } from "./tool.ts";
+import { ACTION_GUIDANCE, executeAction, SubagentsParams, toolCallInput, type SubagentsInput } from "./tool.ts";
 import { pendingReminderText, renderTree, TREE_ENTRY_TYPE, type TreeEntryData } from "./tree.ts";
 
 interface State {
@@ -501,8 +501,9 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
           "Delegate work to named, persistent subagents. action=run starts a new one from exactly one entry — agent (needs task), skill or command — and returns its @handle. " +
           "action=parallel runs many at once; chain runs steps in order, where {previous} is the previous step's output; continue resumes the step that stopped a chain and finishes it. " +
           "action=resume continues an existing one in its own context (handle + message); prefer it when the user wants the same subagent to revise its work. " +
-          "action=steer guides a running one; interrupt pauses one; interrupt-all pauses every running one; stop ends it (and every descendant); stop-all ends every active one; list shows all; " +
-          "action=drain hands a paused parent's waiting child results to the caller; action=drop discards them.",
+          "action=steer guides a running one; interrupt pauses one; interrupt-all pauses every running one; restart reruns its task in a fresh session; stop ends it (and every descendant); stop-all ends every active one; list shows all; " +
+          "action=drain hands a paused parent's waiting child results to the caller; action=drop discards them. " +
+          ACTION_GUIDANCE,
         parameters: SubagentsParams,
         async execute(_toolCallId, params, signal, _onUpdate, ctx) {
           if (!state) throw new Error("pi-subagents is not initialised for this session yet");

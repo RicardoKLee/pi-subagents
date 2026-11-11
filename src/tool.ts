@@ -17,6 +17,13 @@ const BatchItem = Type.Object({
  * Every action the `subagents` tool accepts. The schema union, the delegating session's gate and the dispatcher all
  * read this one list, so adding an action cannot silently miss one of them (REVIEW-040).
  */
+/**
+ * The "which action when" guidance the model reads. One constant, reused by the main tool description, the child tool
+ * description and the README, so the advice cannot drift between the three (spec §12.3).
+ */
+export const ACTION_GUIDANCE =
+  "Use interrupt to pause a subagent you may continue (resume) or rerun (restart); use restart when it ran long or went off track and you want a clean context with the same handle; use stop when you are done with it (stopped records can still be restarted, but not resumed); use stop-all or interrupt-all when you cannot tell which subagent is stuck.";
+
 export const SUBAGENT_ACTIONS = [
   "run",
   "parallel",

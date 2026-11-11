@@ -5,6 +5,7 @@ import type { AutocompleteProvider } from "@earendil-works/pi-tui";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { PRIVATE_ENTRY_TYPE, SETTLED_EVENT } from "../src/delivery.ts";
 import { createExtension } from "../src/index.ts";
+import { ACTION_GUIDANCE, SUBAGENT_ACTIONS } from "../src/tool.ts";
 import type { ChildResult, ChildSpec, Runner } from "../src/runner/types.ts";
 import { FakeRunner, FakeSession, usage } from "./fakes.ts";
 import { boot, REVIEWER } from "./boot.ts";
@@ -890,5 +891,46 @@ describe("/subagents control verbs", () => {
     await shortcut!.handler(ctx);
 
     expect(await listing(callTool)).toMatch(/@reviewer\b.*\[stopped\]/);
+  });
+});
+
+describe("the model-facing descriptions (spec §12)", () => {
+  it("names every action and the guidance in the main tool description", async () => {
+    const { pi } = await boot();
+    const description = pi.tools.get("subagents").description as string;
+    for (const action of SUBAGENT_ACTIONS) expect(description).toContain(action);
+    expect(description).toContain("use restart");
+    // The same sentence the child tool gets, so the advice cannot drift between the two prompts.
+    expect(description).toContain(ACTION_GUIDANCE);
+  });
+
+  it("keeps the same guidance in the child tool description and says mass actions are unavailable", async () => {
+    const { runner } = await boot({ scripts: [[ok("done")]] });
+    // The child extension is built by the SDK runner through createChildExtension; assert its text directly.
+    const { childExtension } = await import("../src/child.ts");
+    const registered: { description?: string }[] = [];
+    const fakeApi = {
+      registerTool: (tool: { description?: string }) => void registered.push(tool),
+    } as never;
+    childExtension({ canDelegate: true, recordId: "rec-1", host: { request: async () => ({ text: "" }) } })(fakeApi);
+    const description = registered[0]!.description ?? "";
+    expect(description).toContain("use restart");
+    expect(description).toContain("you cannot stop-all or interrupt-all");
+    expect(runner.sessions).toHaveLength(0);
+  });
+
+  it("points a stopped record at restart", async () => {
+    const { callTool } = await boot({ hold: true });
+    await callTool({ action: "run", agent: "reviewer", task: "a", background: true });
+    await callTool({ action: "stop", handle: "reviewer" });
+    await expect(callTool({ action: "resume", handle: "reviewer", message: "again" })).rejects.toThrow(/restart/);
+  });
+
+  it("suggests interrupt/stop/restart for a running record", async () => {
+    const { callTool, runner } = await boot({ hold: true });
+    await callTool({ action: "run", agent: "reviewer", task: "a", background: true });
+    await vi.waitFor(() => expect(runner.sessions).toHaveLength(1));
+    await expect(callTool({ action: "resume", handle: "reviewer", message: "x" })).rejects.toThrow(/interrupt\/stop\/restart/);
+    await callTool({ action: "stop-all" });
   });
 });

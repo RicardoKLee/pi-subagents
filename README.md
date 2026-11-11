@@ -3,8 +3,8 @@
 pi extension: delegate work to named subagents that keep their own session, can be steered
 while running, and can be resumed by handle after they finish.
 
-Status: milestone 6 (M6). Children run in-process through the pi SDK or as resident
-`pi --mode rpc` child processes, and can nest. See `/sandbox/temp/plans/pi-subagent-extension-plan.md` for the full plan.
+Status: milestone 7 (M7). Children run in-process through the pi SDK or as resident
+`pi --mode rpc` child processes, can nest, and are bounded by stall budgets you can also drive by hand. See `/sandbox/temp/plans/pi-subagent-extension-plan.md` for the full plan.
 
 ## Loading
 
@@ -33,6 +33,9 @@ of the user file key by key, and is ignored entirely for an untrusted project.
 | `defaultRunner` | `"sdk"` | `sdk` (in-process) or `rpc` (a resident `pi --mode rpc` child process per subagent). An agent's `runner:` frontmatter overrides it. Existing records keep the runner they were created with. |
 | `contextRatio` | `0.3` | In `(0, 1]`. A foreground result larger than this share of the main model's context window is written to a file; the tool returns the summary and the file path. |
 | `pendingResultTimeoutMinutes` | `30` | `> 0`. Minutes a queued child result may wait before the user is reminded once, with the resume / `action=drain` / `action=drop` options. |
+| `toolIdleTimeoutMinutes` | `45` | Non-negative integer, `0` = off. Minutes one tool call may show **no progress** before that subagent is paused (never stopped). Progress is counted per `toolCallId`, so parallel calls never refresh each other; only a non-empty tool update counts (bash sends an empty one when it starts). |
+| `turnHardTimeoutMinutes` | `0` (off) | Non-negative integer, `0` = off. Absolute minutes one turn may run before it is paused. It is **never refreshed** by activity, so a loop that keeps producing output is still bounded. |
+| `interruptGraceSeconds` | `20` | Positive integer. How long a run may take to settle after an interrupt/abort before it is abandoned: the record becomes `paused` with `did not settle after abort…` and the waiting tool call returns. |
 | `mentionQuoteMaxChars` | `2000` | Positive integer. Longest user message quoted with an `@` result; longer messages are cut with a note. |
 | `defaultModel` | unset | Model for every subagent whose agent file names none: `provider/id` (e.g. `deeproute/deepseek-v4.1-flash`) or a bare id resolved against the main session's provider. Unset = the child inherits the main session's model. An id pi cannot resolve is reported once at startup and ignored, so children inherit instead of failing. |
 | `defaultThinking` | `"off"` | Thinking level for every subagent whose agent file names none: `off`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`. `off` is the default on purpose — a child only thinks when the agent file, the call or this setting says so. |
@@ -87,16 +90,28 @@ decision, or the user's `defaultProjectTrust`); the main session's trust is neve
 | `parallel` | `tasks` (`[{ agent\|skill\|command, task?, cwd?, model?, thinking? }]`), optional `background` | Runs tasks at the same time (the global `maxConcurrent` still caps concurrency). Every task gets its own handle. `task` is required for an agent item and is the appended arguments for a skill or command item. The result is one summary: `Parallel: X/N succeeded` plus a section per task. A failure does not stop the others. |
 | `chain` | `chain` (`[{ agent\|skill\|command, task?, cwd?, model?, thinking? }]`), optional `background` | Runs steps in order; `{previous}` in a task is replaced with the previous step's output. `task` is required for an agent step and is the appended arguments for a skill or command step. Each step gets its own handle. A failing step stops the chain; its status and the chain progress are kept. |
 | `continue` | `handle` (the step that stopped the chain), optional `message` | Resumes that step (its own session) and then runs the remaining steps. Works for `failed` and `paused` chains; a `stopped` chain cannot be continued. |
-| `resume` | `handle`, `message`, optional `background` | Continues a finished or paused subagent in its own session (background results always use auto). Unknown, stopped, still-running or session-file-missing handles are rejected. |
+| `resume` | `handle`, `message`, optional `background` | Continues a finished or paused subagent in its own session (background results always use auto). Unknown, stopped, still-running or session-file-missing handles are rejected; a stopped record points at `restart`. |
 | `steer` | `handle`, `message`, optional `mode` (`steer` or `followUp`) | Sends guidance to a running subagent. |
-| `interrupt` | `handle` | Pauses a running subagent; it can be resumed. |
-| `stop` | `handle` | Ends a subagent permanently; it can no longer be resumed. |
+| `interrupt` | `handle` | Pauses a running subagent. It can be resumed, or `restart`ed for a clean context. |
+| `stop` | `handle` | Ends a subagent and every descendant permanently. It can no longer be resumed, but `restart` still reruns its task in a fresh session. |
+| `stop-all` | none | Ends every **active** record (`queued`/`running`, nested descendants included). `paused` records are left resumable. Idempotent: a second call stops nothing. Reports how many were stopped and how many were still queued. |
+| `interrupt-all` | none | Pauses every live subagent (what Esc does) and returns how many. A run that is already stopping keeps its stop intent. |
+| `restart` | `handle`, optional `message`, optional `background` | Runs the record's task again in a **brand-new** child session while keeping the handle: `runId + 1`, `sessionFile` cleared, the old session file kept for review, pending child results left queued. A live run is halted first (bounded by `interruptGraceSeconds`), so two runs of a record never overlap. Works for `paused`, `completed`, `failed` and `stopped`; `queued` records and chain steps are refused. |
 | `drain` | `handle` | Hands the child results waiting for a paused subagent to the caller and clears them. |
 | `drop` | `handle` | Discards the child results waiting for a paused subagent. |
 | `list` | none | Shows the subagents on the current branch as a tree. |
 
 Statuses: `queued` (waiting for a slot or for its child session to open), `running`, `paused`, `completed`, `failed`, `stopped`.
 An interrupt or stop on a queued run cancels it: the record becomes `stopped` with `cancelled before it started`.
+`paused` can be resumed (same context) or restarted (fresh context); `stopped` can only be restarted.
+
+`waitMinutes` (foreground `run`, `parallel`, `chain`, `resume` and `continue`) bounds how long the call itself waits: at
+the deadline those runs are paused exactly like a stall, and the call returns normally with `paused` records. Background
+calls ignore it.
+
+`stop`, `interrupt` and `restart` need a `handle`; `stop-all` and `interrupt-all` refuse one, so a typo can never
+silently narrow or widen their scope. A subagent may not call `stop-all`/`interrupt-all` at all (`only the main agent can
+stop all subagents`).
 
 Children are asked to end with a `<summary>` tag; without one (or with an empty one) the first 1200 characters are used as the summary.
 
@@ -136,13 +151,53 @@ Mentions are only recognised at the start of a message, typed in the TUI (not RP
 
 ## Command
 
-- `/subagents list` (default): the subagents on the current branch as a tree under `main`, with handle, agent, run,
-  cost (parents also show their subtree total), the first line of an error, the status at the end of the line, and
-  `(N results waiting · 12m)` when child results wait for it.
-- `/subagents cost`: the same tree with input, output, cache read and cache write tokens and cost, plus a total line;
-  a parent row also shows its `subtree $X` total and the waiting hint.
+`/subagents <verb> [@handle] [message]` — the verb comes first.
 
-Both are shown in the TUI only; they are custom entries and never enter the model context.
+| Command | What it does |
+| --- | --- |
+| `/subagents list` (default) | The subagents on the current branch as a tree under `main`, with handle, agent, run, cost (parents also show their subtree total), the first line of an error, the status at the end of the line, and `(N results waiting · 12m)` when child results wait for it. A live run also shows its phase: `[running] · bash 45m`. |
+| `/subagents cost` | The same tree with input, output, cache read and cache write tokens and cost, plus a total line; a parent row also shows its `subtree $X` total and the waiting hint. |
+| `/subagents stop @x` | Ends that subagent (and its descendants); it cannot be resumed. |
+| `/subagents interrupt @x` | Pauses that subagent; the main agent can resume it, or `/subagents restart @x` reruns the task in a fresh session. |
+| `/subagents restart @x [message]` | Starts `run 2` of the same handle in a brand-new session (background, so the command returns at once). The rest of the line is appended to the original task. |
+| `/subagents stop-all` | Ends every active subagent; `paused` ones stay resumable. |
+| `/subagents interrupt-all` | Pauses every running subagent. |
+| `/subagents help` | This table, one line per verb. |
+
+`list` and `cost` are shown in the TUI only; they are custom entries and never enter the model context.
+
+The handle can be written `@x`, `x` or `@sub:x`; a nested one as `@父/子`. `stop`/`interrupt`/`restart` **require** a
+handle — a missing one is an error, never "all of them". The shortcut `ctrl+shift+x` is `/subagents stop-all`.
+
+Why not `@x stop`: `@handle …` means "send this message to that subagent" (steer when running, resume when paused), so
+`@x stop` would just be a (dangerous) message. Control words are therefore only read as the **first** word after
+`/subagents`.
+
+A command handler runs even while the main agent is streaming (pi calls registered extension commands before it queues
+the input), so these verbs work when the main turn is busy. The handler deliberately does **not** call
+`ctx.abort()` after an action that released the blocking run (that cascade would pause every other healthy subagent);
+it only aborts when the turn is still busy and the action settled nothing.
+
+## Stall control
+
+A subagent that sits inside one tool call has no natural end, and a foreground call blocks the main agent until it
+returns. Three budgets bound that, all in the settings file:
+
+| Budget | Counts from | At the deadline |
+| --- | --- | --- |
+| `toolIdleTimeoutMinutes` (45) | the last **real** output of one `toolCallId` (a start, or an empty update such as bash's, is not output) | pause that subagent |
+| `turnHardTimeoutMinutes` (0) | the start of the turn; never refreshed | pause that subagent |
+| `interruptGraceSeconds` (20) | the moment the pause was requested | abandon: record `paused` with `did not settle after abort…` and return the call |
+
+Only a pause is ever automatic — never a stop, never an automatic resume, never a delivery. The tool call that was
+waiting then returns with the record `paused`, and the reason is kept in the record's `error`
+(`stalled: bash produced no progress for 45m (tool call call_8699…)`), so `/subagents list` and the notification say
+what happened. From there the choice is yours: `resume` continues the same context, `restart` clears it and reruns the
+task, `stop` ends the record. Parallel tool calls are judged per call, so one chatty call never keeps a silent one alive.
+
+When the main agent may stop things: while it has a turn. A foreground `run`/`parallel`/`chain`/`resume` holds the turn,
+so the model cannot issue a second tool call — only the budgets above or the user (`/subagents stop-all`,
+`ctrl+shift+x`) can intervene then.
 
 ## Starting a subagent from the prompt
 
@@ -229,6 +284,10 @@ and a read-only snapshot `<sessionDir>/<sessionId>.subagents.json` (never used f
 ## Known limits
 
 - Esc pauses subagents only while the `subagents` tool call is executing. Background children keep running after Esc; use `interrupt` or `stop`.
+- An interrupt/stop sent by the main agent needs a turn of its own. While it is blocked in a foreground `run`, `parallel`, `chain`, `resume` or `continue`, only the stall budgets, `/subagents …` and `ctrl+shift+x` can release it.
+- A long **silent** tool (a remote build, `git fetch`, a watcher) is paused once `toolIdleTimeoutMinutes` passes with no output. That is the deliberate trade-off: the cost is one pause and a `resume`, the gain is that an endless wait is bounded. Raise the value or set it to `0` to disable that budget.
+- A subagent stuck inside a tool call is better `restart`ed than `resume`d: resuming hands the same wedged state back.
+- An abandoned run of an in-process (SDK) child cannot be killed; its record stays `paused` and its pending work lives in the parent process until it exits. An RPC child is killed.
 - After `/fork` or `/tree`, each branch resumes a subagent from the point its own record last ended, so branches do not see each other's later turns. Their turns are written to the same child session file as separate branches; two pi processes resuming the same handle at the same time write to that file without a lock.
 - Without a session directory (in-memory session), child sessions and outputs go to `<tmpdir>/pi-subagents/<sessionId>/` and no snapshot is written.
 - `private` results are visible only in the TUI; in print, JSON or RPC mode they are not displayed.
