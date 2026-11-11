@@ -12,7 +12,7 @@ import {
 import { childExtension, type DelegationHost } from "../child.ts";
 import type { Usage } from "../registry.ts";
 import { type TurnMessage, turnResult } from "./result.ts";
-import type { ChildResult, ChildSession, ChildSpec, Runner } from "./types.ts";
+import type { ChildActivity, ChildResult, ChildSession, ChildSpec, Runner } from "./types.ts";
 
 export type ModelResolver = (spec: string | undefined) => Model<any> | undefined;
 
@@ -74,6 +74,16 @@ export function defaultProjectTrust(cwd: string, agentDir: string): boolean {
   return SettingsManager.create(cwd, agentDir, { projectTrusted: false }).getDefaultProjectTrust() === "always";
 }
 
+/** True when a tool's partial result carries non-empty text; an empty update is not progress (bash's start update). */
+export function hasPartialText(partial: unknown): boolean {
+  const content = (partial as { content?: unknown })?.content;
+  if (!Array.isArray(content)) return false;
+  return content.some((block) => {
+    const b = block as { type?: string; text?: unknown };
+    return b?.type === "text" && typeof b.text === "string" && b.text.length > 0;
+  });
+}
+
 function totals(session: AgentSession): Usage {
   const s = session.getSessionStats();
   return { input: s.tokens.input, output: s.tokens.output, cacheRead: s.tokens.cacheRead, cacheWrite: s.tokens.cacheWrite, cost: s.cost };
@@ -102,6 +112,31 @@ export class SdkChildSession implements ChildSession {
   /** An in-process session never ends on its own. */
   onExit(): () => void {
     return () => {};
+  }
+
+  onActivity(listener: (activity: ChildActivity) => void): () => void {
+    return this.session.subscribe((event) => {
+      switch (event.type) {
+        case "message_start":
+        case "message_update":
+        case "turn_start":
+          listener({ phase: "model" });
+          break;
+        case "tool_execution_start":
+          listener({ phase: "tool", toolCallId: event.toolCallId, toolName: event.toolName, progress: false });
+          break;
+        case "tool_execution_update":
+          listener({ phase: "tool", toolCallId: event.toolCallId, toolName: event.toolName, progress: hasPartialText(event.partialResult) });
+          break;
+        case "tool_execution_end":
+          // One call finished, not necessarily the whole message: the manager drops exactly this id (F10).
+          listener({ phase: "tool-end", toolCallId: event.toolCallId });
+          break;
+        case "agent_settled":
+          listener({ phase: "idle" });
+          break;
+      }
+    });
   }
 
   get sessionFile(): string {

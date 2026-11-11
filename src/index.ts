@@ -1,12 +1,13 @@
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve as resolvePath } from "node:path";
-import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext, getAgentDir, rawKeyHint } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { type AgentDef, loadAgents } from "./agents.ts";
 import { CHAIN_ENTRY_TYPE, ChainStore } from "./chain.ts";
 import { childExtension, childRecordId, type DelegationHost, mailboxHost } from "./child.ts";
+import { type ControlCommand, parseSubagentsCommand, SUBAGENTS_HELP, subagentsCompletions } from "./commands.ts";
 import { mentionProvider } from "./complete.ts";
 import { PRIVATE_ENTRY_TYPE, SETTLED_EVENT, type PrivateEntryData } from "./delivery.ts";
 import { createNameCache, parseEntryRequest, parseSubCommand, SUB_USAGE, skillNames, templateNames, type EntryRequest } from "./entries.ts";
@@ -20,8 +21,8 @@ import { type ModelResolver, SdkRunner, defaultProjectTrust } from "./runner/sdk
 import type { Runner } from "./runner/types.ts";
 import { Scheduler } from "./scheduler.ts";
 import { loadSettings, loadSettingsLayered, limitAllows, type DeliveryMode, type SubagentSettings } from "./settings.ts";
-import { executeAction, SubagentsParams, toolCallInput, type SubagentsInput } from "./tool.ts";
-import { pendingReminderText, renderTree, TREE_ENTRY_TYPE, type TreeEntryData, type TreeView } from "./tree.ts";
+import { ACTION_GUIDANCE, executeAction, SubagentsParams, toolCallInput, type SubagentsInput } from "./tool.ts";
+import { pendingReminderText, renderTree, TREE_ENTRY_TYPE, type TreeEntryData } from "./tree.ts";
 
 interface State {
   manager: SubagentManager;
@@ -95,6 +96,9 @@ function writeSnapshotSafely(file: string | undefined, registry: Registry): void
 
 /** Set when this process was started as a subagent: it then loads only the proxy tool (plan 6.9 item 1). */
 const CHILD_RECORD = childRecordId();
+
+/** Lines pi's own tool-output fallback shows before it asks for `Ctrl+O`; kept in sync with that fallback. */
+const RESULT_PREVIEW_LINES = 10;
 
 export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI) => void {
   if (CHILD_RECORD) {
@@ -231,6 +235,7 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
         },
         onPendingReminder: (record, count, minutes) =>
           notify(pendingReminderText(record, count, minutes, state?.manager.recordPath(record) ?? record.handle), "warning"),
+        onStall: (record, reason) => notify(`@${record.handle} ${reason}; resume it or restart it`, "warning"),
         onRecordCreated: (record) => {
           if (existsSync(join(ctx.cwd, record.handle))) {
             warnOnce(`@${record.handle} has the same name as a file in ${ctx.cwd}; use @sub:${record.handle} to reach the subagent`);
@@ -318,7 +323,8 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
     // Private results are custom entries: shown in the TUI only, never part of the LLM context.
     pi.registerEntryRenderer<PrivateEntryData>(PRIVATE_ENTRY_TYPE, (entry, { expanded }, theme) => {
       const data = entry.data;
-      return data ? renderPrivateEntry(data, expanded, theme) : undefined;
+      const full = expanded || (state?.settings.expandResults ?? false);
+      return data ? renderPrivateEntry(data, full, theme) : undefined;
     });
 
     // /subagents list|cost: a display-only tree entry; custom entries never enter the LLM context.
@@ -341,22 +347,103 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
      * disabled, from an enabled `session_start`; a disabled session (`maxDepth: 0`) advertises neither.
      */
     function registerSubagentCapabilities(): void {
-      const VIEWS: TreeView[] = ["list", "cost"];
+      /**
+       * Runs one control verb, then releases a blocked main turn only when the action settled nothing. `ctx.abort()`
+       * cascades into the tool signal's `onAbort` -> `manager.interruptAll()`, which would pause every healthy
+       * subagent, so it is the last resort — an action that made the blocking run settle needs no abort at all.
+       */
+      const runControl = async (parsed: ControlCommand, ctx: ExtensionContext): Promise<void> => {
+        const current = state;
+        if (!current) {
+          ctx.ui.notify("pi-subagents: not initialised for this session yet", "error");
+          return;
+        }
+        const notify = (message: string, type: "info" | "error" = "info") => ctx.ui.notify(`pi-subagents: ${message}`, type);
+        const activeIds = () => new Set(current.manager.activeRecords().map((r) => r.id));
+        const before = activeIds();
+        try {
+          switch (parsed.kind) {
+            case "stop":
+              await current.manager.stop(parsed.handle);
+              notify(`@${parsed.handle} stopped; it cannot be resumed, but /subagents restart @${parsed.handle} runs it again.`);
+              break;
+            case "interrupt": {
+              const outcome = await current.manager.interrupt(parsed.handle);
+              notify(
+                outcome === "cancelled"
+                  ? `${parsed.handle} had not started yet; it is cancelled.`
+                  : `${parsed.handle} paused; the main agent can resume it, or /subagents restart @${parsed.handle} reruns the task in a fresh session.`,
+              );
+              break;
+            }
+            case "stop-all": {
+              const out = await current.manager.stopAll();
+              notify(
+                out.stopped
+                  ? `stopped ${out.stopped} subagent(s)${out.cancelled ? ` (${out.cancelled} were still queued)` : ""}; paused ones were left resumable`
+                  : "no subagent was running",
+              );
+              break;
+            }
+            case "interrupt-all": {
+              const count = await current.manager.interruptAll();
+              notify(count ? `paused ${count} subagent(s); the main agent can resume them` : "no subagent was running");
+              break;
+            }
+            case "restart": {
+              // Background: the command handler must not wait for the new run, or the command itself would hang.
+              const { record } = await current.manager.restart(parsed.handle, {
+                background: true,
+                ...(parsed.message ? { message: parsed.message } : {}),
+              });
+              notify(`@${record.handle} restarted as run ${record.runId} in a fresh session`);
+              break;
+            }
+          }
+        } catch (error) {
+          notify((error as Error).message, "error");
+          return;
+        }
+        // Let the settled run unwind (its status is written a tick after the abort) before judging what is active.
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        const after = activeIds();
+        // A restart halts the previous run before it starts runId+1, so whatever waited on the old run is released even
+        // though the same record id is active again.
+        const settled = parsed.kind === "restart" || [...before].some((id) => !after.has(id));
+        if (!ctx.isIdle() && !settled) ctx.abort();
+      };
+
       pi.registerCommand("subagents", {
-        description: "Show subagents as a tree: /subagents [list|cost]",
-        getArgumentCompletions: (prefix) =>
-          VIEWS.filter((v) => v.startsWith(prefix.trim().toLowerCase())).map((v) => ({ value: v, label: v, description: v === "list" ? "status and cost" : "tokens and cost" })),
+        description: "Subagents: /subagents list|cost|help|stop|stop-all|interrupt|interrupt-all|restart [@handle] [message]",
+        getArgumentCompletions: (prefix) => subagentsCompletions(prefix, () => state?.manager.list().map((r) => r.handle) ?? []),
         handler: async (args, ctx) => {
           if (state) state.ctx = ctx;
-          const raw = args.trim();
-          const view = (raw.toLowerCase() || "list") as TreeView;
-          if (!VIEWS.includes(view)) {
-            // A leading "/" usually means two commands were typed on one line (e.g. "/subagents /debug-agent").
-            const hint = raw.includes("/") ? `${raw} was not run; type it on its own line` : "use /subagents list or /subagents cost";
-            ctx.ui.notify(`pi-subagents: unknown view "${raw}"; ${hint}`, "error");
+          const parsed = parseSubagentsCommand(args);
+          if (parsed.kind === "error") {
+            ctx.ui.notify(`pi-subagents: ${parsed.message}`, "error");
             return;
           }
-          pi.appendEntry<TreeEntryData>(TREE_ENTRY_TYPE, { view, text: renderTree(state?.registry.list() ?? [], view, state?.manager.listChains() ?? []) });
+          if (parsed.kind === "help") {
+            ctx.ui.notify(SUBAGENTS_HELP, "info");
+            return;
+          }
+          if (parsed.kind === "view") {
+            pi.appendEntry<TreeEntryData>(TREE_ENTRY_TYPE, {
+              view: parsed.view,
+              text: renderTree(state?.registry.list() ?? [], parsed.view, state?.manager.listChains() ?? [], Date.now(), state?.manager.activitySnapshot()),
+            });
+            return;
+          }
+          await runControl(parsed, ctx);
+        },
+      });
+      // A shortcut is the only control surface that needs no turn at all: it runs from the editor's key handler, even
+      // while the agent streams (pi's command handlers do too — see the spike note in README).
+      pi.registerShortcut("ctrl+shift+x", {
+        description: "subagents: stop every active subagent",
+        handler: async (ctx) => {
+          if (state) state.ctx = ctx;
+          await runControl({ kind: "stop-all" }, ctx);
         },
       });
       // `/sub` creates a subagent without going through the main model; the symbol in the command name picks the delivery.
@@ -418,8 +505,9 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
           "Delegate work to named, persistent subagents. action=run starts a new one from exactly one entry — agent (needs task), skill or command — and returns its @handle. " +
           "action=parallel runs many at once; chain runs steps in order, where {previous} is the previous step's output; continue resumes the step that stopped a chain and finishes it. " +
           "action=resume continues an existing one in its own context (handle + message); prefer it when the user wants the same subagent to revise its work. " +
-          "action=steer guides a running one; interrupt pauses; stop ends it (and every descendant); list shows all; " +
-          "action=drain hands a paused parent's waiting child results to the caller; action=drop discards them.",
+          "action=steer guides a running one; interrupt pauses one; interrupt-all pauses every running one; restart reruns its task in a fresh session; stop ends it (and every descendant); stop-all ends every active one; list shows all; " +
+          "action=drain hands a paused parent's waiting child results to the caller; action=drop discards them. " +
+          ACTION_GUIDANCE,
         parameters: SubagentsParams,
         async execute(_toolCallId, params, signal, _onUpdate, ctx) {
           if (!state) throw new Error("pi-subagents is not initialised for this session yet");
@@ -428,6 +516,20 @@ export function createExtension(opts: ExtensionOptions = {}): (pi: ExtensionAPI)
           // the main session always dispatches as the depth-0 requester with no whitelist.
           const out = await executeAction(state.manager, toolCallInput(params as SubagentsInput), signal);
           return { content: [{ type: "text", text: out.text }], details: out.details };
+        },
+        // pi's fallback preview stops after 10 lines; the same shape is repeated here so `expandResults` can show the
+        // whole answer at once. A renderer cannot fall back to the default one per render, so both states live here.
+        // `rawKeyHint` rather than the render context's `keyHint`: the latter arrives in pi 1.5, and this extension
+        // supports 1.2 (a literal `ctrl+o` is what the fallback hint shows with the default keybindings).
+        renderResult(result, { expanded }, theme) {
+          const text = result.content.map((part) => (part.type === "text" ? part.text : "")).join("\n");
+          const lines = text.split("\n");
+          const shown = expanded || (state?.settings.expandResults ?? false) ? lines : lines.slice(0, RESULT_PREVIEW_LINES);
+          let body = shown.map((line) => theme.fg("toolOutput", line)).join("\n");
+          if (shown.length < lines.length) {
+            body += `${theme.fg("muted", `\n... (${lines.length - shown.length} more lines,`)} ${rawKeyHint("ctrl+o", "to expand")}${theme.fg("muted", ")")}`;
+          }
+          return new Text(body, 0, 0);
         },
       });
     }

@@ -17,21 +17,43 @@ const BatchItem = Type.Object({
  * Every action the `subagents` tool accepts. The schema union, the delegating session's gate and the dispatcher all
  * read this one list, so adding an action cannot silently miss one of them (REVIEW-040).
  */
-export const SUBAGENT_ACTIONS = ["run", "parallel", "chain", "resume", "continue", "steer", "interrupt", "stop", "drain", "drop", "list"] as const;
+/**
+ * The "which action when" guidance the model reads. One constant, reused by the main tool description, the child tool
+ * description and the README, so the advice cannot drift between the three (spec §12.3).
+ */
+export const ACTION_GUIDANCE =
+  "Use interrupt to pause a subagent you may continue (resume) or rerun (restart); use restart when it ran long or went off track and you want a clean context with the same handle; use stop when you are done with it (stopped records can still be restarted, but not resumed); use stop-all or interrupt-all when you cannot tell which subagent is stuck.";
+
+export const SUBAGENT_ACTIONS = [
+  "run",
+  "parallel",
+  "chain",
+  "resume",
+  "continue",
+  "restart",
+  "steer",
+  "interrupt",
+  "interrupt-all",
+  "stop",
+  "stop-all",
+  "drain",
+  "drop",
+  "list",
+] as const;
 
 // TODO(delivery): background results from the main agent are always delivered with "auto". Add a `delivery`
 // parameter back if a use case appears (plan section 6.5 item 4).
 export const SubagentsParams = Type.Object({
   action: Type.Union(
     SUBAGENT_ACTIONS.map((action) => Type.Literal(action)),
-    { description: "run = new subagent; parallel = many at once; chain = sequential with {previous}; resume = continue a finished/paused one by handle; continue = resume the step that stopped a chain and finish it; drain = hand a paused parent's waiting child results to the caller; drop = discard them" },
+    { description: "run = new subagent; parallel = many at once; chain = sequential with {previous}; resume = continue a finished/paused one by handle; continue = resume the step that stopped a chain and finish it; restart = run the same task again in a fresh session (clears the context, keeps the handle); interrupt pauses one; interrupt-all pauses every running one (all resumable); stop ends one (and its descendants); stop-all ends every active one; drain = hand a paused parent's waiting child results to the caller; drop = discard them" },
   ),
   agent: Type.Optional(Type.String({ description: "Agent name (run); give exactly one of agent, skill or command" })),
   skill: Type.Optional(Type.String({ description: "Skill name (run), run as /skill:<name> in the child" })),
   command: Type.Optional(Type.String({ description: "Prompt template name (run), run as /<name> in the child" })),
   task: Type.Optional(Type.String({ description: "Task for an agent entry, or arguments appended to the skill/template (run)" })),
-  handle: Type.Optional(Type.String({ description: "Existing subagent handle, e.g. reviewer-2 (resume/steer/interrupt/stop/continue)" })),
-  message: Type.Optional(Type.String({ description: "Message for resume, steer or continue" })),
+  handle: Type.Optional(Type.String({ description: "Existing subagent handle, e.g. reviewer-2 (resume/continue/restart/steer/interrupt/stop/drain/drop)" })),
+  message: Type.Optional(Type.String({ description: "Message for resume, restart, steer or continue" })),
   cwd: Type.Optional(Type.String({ description: "Working directory for a single run (run)" })),
   model: Type.Optional(
     Type.String({
@@ -48,6 +70,12 @@ export const SubagentsParams = Type.Object({
   tasks: Type.Optional(Type.Array(BatchItem, { description: "parallel: tasks to run at the same time" })),
   chain: Type.Optional(Type.Array(BatchItem, { description: "chain: steps to run in order; {previous} is the previous step's output" })),
   background: Type.Optional(Type.Boolean({ description: "Return immediately; the result arrives later" })),
+  waitMinutes: Type.Optional(
+    Type.Number({
+      description:
+        "Foreground only: give up waiting after this many minutes and pause the child (the record stays resumable); background runs ignore it.",
+    }),
+  ),
   mode: Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("followUp")])),
 });
 
@@ -123,6 +151,11 @@ function needList<T>(value: readonly T[] | undefined, name: string, action: stri
   return [...value];
 }
 
+/** Mass actions take no handle: a typo must not silently narrow (or widen) their scope. */
+function noHandle(input: SubagentsInput, action: string): void {
+  if (input.handle !== undefined && input.handle !== "") throw new Error(`action "${action}" takes no handle; it applies to every subagent`);
+}
+
 /** The entry fields of a tool call, only present when the caller set them (keeps call signatures stable). */
 function entryFields(input: SubagentsInput): EntryRequest {
   return {
@@ -184,6 +217,7 @@ async function dispatch(
     ...(input.background ? { background: true, delivery: "auto" as const } : {}),
     ...(input.detach ? { detach: true } : {}),
     ...(signal ? { signal } : {}),
+    ...(input.waitMinutes ? { waitMinutes: input.waitMinutes } : {}),
   };
   // Internal only: the parent record the delegation path attributes runs to. The main agent's tool call never
   // carries it, so `run`/`parallel`/`chain` keep the depth-0 requester (no whitelist) for the main session.
@@ -202,6 +236,7 @@ async function dispatch(
         ...(input.thinking ? { thinking: input.thinking } : {}),
         ...(input.background ? { background: true } : {}),
         ...(input.detach ? { detach: true } : {}),
+        ...(input.waitMinutes ? { waitMinutes: input.waitMinutes } : {}),
         ...(signal ? { signal } : {}),
       });
       const body = payload ? payload.text : "Started in the background; the result will be delivered when it finishes.";
@@ -212,6 +247,7 @@ async function dispatch(
         items: needList(input.tasks, "tasks", "parallel"),
         ...(parentId ? { parentId } : {}),
         background: input.background ?? false,
+        ...(input.waitMinutes ? { waitMinutes: input.waitMinutes } : {}),
         ...(signal ? { signal } : {}),
       });
       return batchResult(out, "parallel");
@@ -221,6 +257,7 @@ async function dispatch(
         steps: needList(input.chain, "chain", "chain"),
         ...(parentId ? { parentId } : {}),
         background: input.background ?? false,
+        ...(input.waitMinutes ? { waitMinutes: input.waitMinutes } : {}),
         ...(signal ? { signal } : {}),
       });
       return batchResult(out, "chain");
@@ -228,6 +265,7 @@ async function dispatch(
     case "continue": {
       const out = await manager.continueChain(need(input.handle, "handle", "continue"), input.message, {
         background: input.background ?? false,
+        ...(input.waitMinutes ? { waitMinutes: input.waitMinutes } : {}),
         ...(signal ? { signal } : {}),
       });
       return batchResult(out, "continue");
@@ -239,6 +277,15 @@ async function dispatch(
     case "steer":
       await manager.steer(need(input.handle, "handle", "steer"), need(input.message, "message", "steer"), input.mode ?? "steer");
       return { text: `Steering message delivered to ${input.handle}.`, details: {} };
+    case "restart": {
+      const { record, payload } = await manager.restart(need(input.handle, "handle", "restart"), {
+        ...(input.message ? { message: input.message } : {}),
+        background: input.background ?? false,
+        ...(signal ? { signal } : {}),
+      });
+      const body = payload ? payload.text : "Restarted in the background; the result will be delivered when it finishes.";
+      return { text: `@${record.handle} restarted as run ${record.runId} in a fresh session.\n\n${body}`, details: { handle: record.handle, runId: record.runId } };
+    }
     case "interrupt": {
       const outcome = await manager.interrupt(need(input.handle, "handle", "interrupt"));
       const text =
@@ -250,6 +297,21 @@ async function dispatch(
     case "stop":
       await manager.stop(need(input.handle, "handle", "stop"));
       return { text: `${input.handle} stopped; it cannot be resumed.`, details: {} };
+    case "stop-all": {
+      noHandle(input, "stop-all");
+      const out = await manager.stopAll();
+      if (!out.stopped) return { text: "No subagent was running; paused ones were left resumable.", details: out };
+      const lines = out.handles.map((h) => `@${h.handle} (${h.wasQueued ? "queued→cancelled" : "running→stopped"})`);
+      return { text: `Stopped ${out.stopped} subagent(s):\n${lines.join("\n")}\nPaused subagents were left resumable.`, details: out };
+    }
+    case "interrupt-all": {
+      noHandle(input, "interrupt-all");
+      const count = await manager.interruptAll();
+      return {
+        text: count ? `Paused ${count} subagent(s); continue them with action=resume.` : "No subagent was running.",
+        details: { count },
+      };
+    }
     case "drain": {
       // Hand a paused parent's waiting child results to the caller instead of resuming the parent.
       const out = await manager.drainPending(need(input.handle, "handle", "drain"));

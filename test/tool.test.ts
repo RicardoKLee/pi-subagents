@@ -9,8 +9,11 @@ function fakeManager(overrides: Partial<Record<keyof SubagentManager, unknown>> 
     run: vi.fn(async () => ({ record, payload: { text: "LGTM", summary: "LGTM" } })),
     resume: vi.fn(async () => ({ record: { ...record, runId: 2 }, payload: { text: "again", summary: "again" } })),
     steer: vi.fn(async () => {}),
+    restart: vi.fn(async () => ({ record: { ...record, runId: 2, status: "running" }, payload: { text: "fresh", summary: "fresh" } })),
     interrupt: vi.fn(async () => {}),
+    interruptAll: vi.fn(async () => 0),
     stop: vi.fn(async () => {}),
+    stopAll: vi.fn(async () => ({ stopped: 0, cancelled: 0, handles: [] })),
     list: vi.fn(() => [record]),
     listChains: vi.fn(() => []),
     ...overrides,
@@ -138,5 +141,100 @@ describe("executeAction", () => {
     const m = fakeManager();
     await expect(executeAction(m, { action: "run", agent: "reviewer", skill: "pdf-tools", task: "x" })).rejects.toThrow(/exactly one of/);
     expect(m.run).not.toHaveBeenCalled();
+  });
+
+  it("stop-all reports what it stopped and what it left resumable", async () => {
+    const m = fakeManager({
+      stopAll: vi.fn(async () => ({ stopped: 2, cancelled: 1, handles: [{ handle: "reviewer", wasQueued: false }, { handle: "reviewer-2", wasQueued: true }] })),
+    });
+    const out = await executeAction(m, { action: "stop-all" });
+    expect(out.text).toContain("Stopped 2 subagent(s)");
+    expect(out.text).toContain("@reviewer (running→stopped)");
+    expect(out.text).toContain("@reviewer-2 (queued→cancelled)");
+    expect(out.text).toContain("Paused subagents were left resumable");
+    expect(out.details).toMatchObject({ stopped: 2, cancelled: 1 });
+  });
+
+  it("stop-all with nothing active says so", async () => {
+    const out = await executeAction(fakeManager(), { action: "stop-all" });
+    expect(out.text).toMatch(/No subagent was running/);
+  });
+
+  it("interrupt-all reports the paused count", async () => {
+    const m = fakeManager({ interruptAll: vi.fn(async () => 3) });
+    const out = await executeAction(m, { action: "interrupt-all" });
+    expect(out.text).toContain("Paused 3 subagent(s)");
+    expect(out.details).toEqual({ count: 3 });
+  });
+
+  it("mass actions take no handle", async () => {
+    for (const action of ["stop-all", "interrupt-all"] as const) {
+      const m = fakeManager();
+      await expect(executeAction(m, { action, handle: "reviewer" })).rejects.toThrow(/takes no handle/);
+    }
+    expect(fakeManager().stopAll).not.toHaveBeenCalled();
+  });
+
+  it("every single-record action still refuses to run without a handle", async () => {
+    // Regression: the mass actions must never become the fallback for a forgotten handle.
+    const m = fakeManager();
+    for (const action of ["stop", "interrupt", "steer", "restart"] as const) {
+      await expect(executeAction(m, { action })).rejects.toThrow(/requires "handle"/);
+    }
+    expect(m.stop).not.toHaveBeenCalled();
+    expect(m.interrupt).not.toHaveBeenCalled();
+    expect(m.steer).not.toHaveBeenCalled();
+    expect(m.restart).not.toHaveBeenCalled();
+    expect(m.stopAll).not.toHaveBeenCalled();
+    expect(m.interruptAll).not.toHaveBeenCalled();
+  });
+});
+
+describe("restart action", () => {
+  it("requires a handle and reports the new run", async () => {
+    const m = fakeManager();
+    const out = await executeAction(m, { action: "restart", handle: "@reviewer", message: "retry differently" });
+    expect(m.restart).toHaveBeenCalledWith("@reviewer", { message: "retry differently", background: false });
+    expect(out.text).toContain("restarted as run 2");
+    expect(out.text).toContain("fresh");
+    expect(out.details).toEqual({ handle: "reviewer", runId: 2 });
+  });
+
+  it("restarts in the background when asked, and says the result arrives later", async () => {
+    const m = fakeManager({ restart: vi.fn(async () => ({ record: { ...record, runId: 2, status: "running" } })) });
+    const out = await executeAction(m, { action: "restart", handle: "reviewer", background: true });
+    expect(m.restart).toHaveBeenCalledWith("reviewer", { background: true });
+    expect(out.text).toContain("Restarted in the background");
+  });
+
+  it("without a handle it refuses instead of restarting something", async () => {
+    await expect(executeAction(fakeManager(), { action: "restart" })).rejects.toThrow(/requires "handle"/);
+  });
+});
+
+describe("waitMinutes parameter", () => {
+  it("is exposed to the model as an optional number", () => {
+    const property = SubagentsParams.properties.waitMinutes as { type?: string };
+    expect(property.type).toBe("number");
+    expect((SubagentsParams as { required?: string[] }).required ?? []).not.toContain("waitMinutes");
+  });
+
+  it("reaches run, parallel, chain, resume and continue", async () => {
+    const m = fakeManager({
+      runParallel: vi.fn(async () => ({ records: [record], payload: { text: "group", summary: "group" } })),
+      runChain: vi.fn(async () => ({ records: [record], payload: { text: "chain", summary: "chain" } })),
+      continueChain: vi.fn(async () => ({ records: [record], payload: { text: "continued", summary: "continued" } })),
+    });
+    await executeAction(m, { action: "run", agent: "reviewer", task: "x", waitMinutes: 5 });
+    await executeAction(m, { action: "parallel", tasks: [{ agent: "reviewer", task: "x" }], waitMinutes: 5 });
+    await executeAction(m, { action: "chain", chain: [{ agent: "reviewer", task: "x" }], waitMinutes: 5 });
+    await executeAction(m, { action: "resume", handle: "reviewer", message: "y", waitMinutes: 5 });
+    await executeAction(m, { action: "continue", handle: "reviewer", waitMinutes: 5 });
+
+    expect(m.run).toHaveBeenCalledWith(expect.objectContaining({ waitMinutes: 5 }));
+    expect(m.runParallel).toHaveBeenCalledWith(expect.objectContaining({ waitMinutes: 5 }));
+    expect(m.runChain).toHaveBeenCalledWith(expect.objectContaining({ waitMinutes: 5 }));
+    expect(m.resume).toHaveBeenCalledWith("reviewer", "y", expect.objectContaining({ waitMinutes: 5 }));
+    expect(m.continueChain).toHaveBeenCalledWith("reviewer", undefined, expect.objectContaining({ waitMinutes: 5 }));
   });
 });

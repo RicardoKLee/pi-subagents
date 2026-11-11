@@ -89,7 +89,10 @@ export function routeMention(text: string, ctx: RouteContext): Route {
     case "queued":
       return { action: "error", message: `@${record.handle} is queued and has not started yet` };
     case "stopped":
-      return { action: "error", message: `@${record.handle} was stopped and cannot be resumed; ask the main agent to start a new one` };
+      return {
+        action: "error",
+        message: `@${record.handle} was stopped and cannot be resumed; ask the main agent to restart it (or /subagents restart @${record.handle})`,
+      };
     default:
       return { action: "resume", handle: record.handle, message, delivery: delivery ?? ctx.defaultDelivery };
   }

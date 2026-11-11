@@ -5,7 +5,8 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type { Usage } from "../registry.ts";
 import { turnResult, type TurnMessage } from "./result.ts";
 import { ABORT_TIMEOUT_MS, READY_TIMEOUT_MS, RpcProcess } from "./rpc-process.ts";
-import type { ChildResult, ChildSession, ChildSpec, Runner } from "./types.ts";
+import { hasPartialText } from "./sdk.ts";
+import type { ChildActivity, ChildResult, ChildSession, ChildSpec, Runner } from "./types.ts";
 
 export const LEAF_PIN_ENTRY_TYPE = "pi-subagents/leaf-pin";
 const CLI_SUFFIX = join("@earendil-works", "pi-coding-agent", "dist", "cli.js");
@@ -114,6 +115,23 @@ class RpcChildSession implements ChildSession {
 
   onExit(listener: (reason: string) => void): () => void {
     return this.proc.onExit(listener);
+  }
+
+  onActivity(listener: (activity: ChildActivity) => void): () => void {
+    return this.proc.onEvent((event) => {
+      if (event.type === "tool_execution_start") {
+        listener({ phase: "tool", toolCallId: String(event.toolCallId), toolName: String(event.toolName), progress: false });
+      } else if (event.type === "tool_execution_update") {
+        listener({ phase: "tool", toolCallId: String(event.toolCallId), toolName: String(event.toolName), progress: hasPartialText(event.partialResult) });
+      } else if (event.type === "tool_execution_end") {
+        // One call finished, not necessarily the whole message: the manager drops exactly this id (F10).
+        listener({ phase: "tool-end", toolCallId: String(event.toolCallId) });
+      } else if (event.type === "message_start" || event.type === "message_update") {
+        listener({ phase: "model" });
+      } else if (event.type === "agent_settled") {
+        listener({ phase: "idle" });
+      }
+    });
   }
 
   async prompt(text: string): Promise<ChildResult> {

@@ -91,7 +91,10 @@ describe("routeMention", () => {
   });
 
   it("reports stopped and queued subagents", () => {
-    expect(routeMention("@reviewer x", ctx([record("reviewer", "stopped")]))).toMatchObject({ action: "error", message: expect.stringContaining("stopped") });
+    const stopped = routeMention("@reviewer x", ctx([record("reviewer", "stopped")]));
+    expect(stopped).toMatchObject({ action: "error", message: expect.stringContaining("stopped") });
+    // A stopped record is not a dead end any more: point the user at restart instead of "start a new subagent".
+    expect(stopped).toMatchObject({ action: "error", message: expect.stringContaining("restart") });
     expect(routeMention("@reviewer x", ctx([record("reviewer", "queued")]))).toMatchObject({ action: "error", message: expect.stringContaining("queued") });
   });
 

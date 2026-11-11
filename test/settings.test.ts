@@ -53,6 +53,18 @@ describe("parseSettings", () => {
     expect(parseSettings({ mentionQuoteMaxChars: 500 }).settings.mentionQuoteMaxChars).toBe(500);
   });
 
+  it("defaults expandResults to false and accepts a boolean", () => {
+    expect(DEFAULT_SETTINGS.expandResults).toBe(false);
+    expect(parseSettings({ expandResults: true }).settings.expandResults).toBe(true);
+    expect(parseSettings({}).settings.expandResults).toBe(false);
+  });
+
+  it("rejects a non-boolean expandResults with a warning", () => {
+    const { settings, warnings } = parseSettings({ expandResults: "yes" });
+    expect(settings.expandResults).toBe(false);
+    expect(warnings[0]).toContain("expandResults");
+  });
+
   it("warns when the root is not an object", () => {
     const { settings, warnings } = parseSettings([1, 2]);
     expect(settings).toEqual(DEFAULT_SETTINGS);
@@ -83,6 +95,29 @@ describe("parseSettings", () => {
     expect(settings.maxChainSteps).toBe(8);
     expect(warnings.join(" ")).toContain("maxParallelTasks");
     expect(warnings.join(" ")).toContain("maxChainSteps");
+  });
+});
+
+describe("the stall-control budgets", () => {
+  it("defaults: toolIdle 45, turnHard off, grace 20", () => {
+    const { settings } = parseSettings({});
+    expect([settings.toolIdleTimeoutMinutes, settings.turnHardTimeoutMinutes, settings.interruptGraceSeconds]).toEqual([45, 0, 20]);
+  });
+
+  it("parses the stall-control settings and rejects bad values", () => {
+    const { settings, warnings } = parseSettings({ toolIdleTimeoutMinutes: 10, turnHardTimeoutMinutes: 0, interruptGraceSeconds: 5 });
+    expect(settings.toolIdleTimeoutMinutes).toBe(10);
+    expect(settings.turnHardTimeoutMinutes).toBe(0);
+    expect(settings.interruptGraceSeconds).toBe(5);
+    expect(warnings).toEqual([]);
+
+    const bad = parseSettings({ toolIdleTimeoutMinutes: -1, turnHardTimeoutMinutes: 1.5, interruptGraceSeconds: 0 });
+    expect(bad.settings.toolIdleTimeoutMinutes).toBe(DEFAULT_SETTINGS.toolIdleTimeoutMinutes);
+    expect(bad.settings.turnHardTimeoutMinutes).toBe(DEFAULT_SETTINGS.turnHardTimeoutMinutes);
+    expect(bad.settings.interruptGraceSeconds).toBe(DEFAULT_SETTINGS.interruptGraceSeconds);
+    expect(bad.warnings.join("\n")).toMatch(/toolIdleTimeoutMinutes/);
+    expect(bad.warnings.join("\n")).toMatch(/turnHardTimeoutMinutes/);
+    expect(bad.warnings.join("\n")).toMatch(/interruptGraceSeconds/);
   });
 });
 

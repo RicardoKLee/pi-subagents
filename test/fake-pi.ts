@@ -8,6 +8,8 @@ export class FakePi {
   readonly tools = new Map<string, any>();
   readonly commands = new Map<string, any>();
   readonly entryRenderers = new Map<string, any>();
+  /** Registered keyboard shortcuts, keyed by their key id. */
+  readonly shortcuts = new Map<string, { description?: string; handler: (ctx: ExtensionContext) => unknown }>();
   readonly sent: { message: any; options: any }[] = [];
   /** Every `pi.events.emit()` call, in order. */
   readonly events: { channel: string; data: unknown }[] = [];
@@ -26,6 +28,7 @@ export class FakePi {
       registerTool: (tool: any) => void this.tools.set(tool.name, tool),
       registerCommand: (name: string, options: any) => void this.commands.set(name, { name, ...options }),
       registerEntryRenderer: (type: string, renderer: any) => void this.entryRenderers.set(type, renderer),
+      registerShortcut: (shortcut: string, options: any) => void this.shortcuts.set(shortcut, options),
       events: {
         emit: (channel: string, data: unknown) => void this.events.push({ channel, data }),
         on: () => () => {},
@@ -57,12 +60,15 @@ export interface FakeCtxOptions {
   find?: (provider: string, id: string) => unknown;
   /** Project trust reported to the extension; absent means "not asked" (`isProjectTrusted` is left off). */
   projectTrusted?: boolean;
+  /** What `ctx.isIdle()` answers; default true (the main agent has its turn back). */
+  idle?: boolean;
 }
 
 /** ExtensionContext stand-in whose session branch is `pi.branch`; notify calls and autocomplete factories are recorded. */
 export function fakeCtx(pi: FakePi, opts: FakeCtxOptions) {
   const notes: { message: string; type?: string }[] = [];
   const providers: unknown[] = [];
+  const aborts: number[] = [];
   const ui = {
     notify: (message: string, type?: string) => void notes.push({ message, type }),
     addAutocompleteProvider: (factory: unknown) => void providers.push(factory),
@@ -73,6 +79,8 @@ export function fakeCtx(pi: FakePi, opts: FakeCtxOptions) {
     cwd: opts.cwd,
     model: opts.model,
     modelRegistry: { find: (provider: string, id: string) => opts.find?.(provider, id) },
+    isIdle: () => opts.idle ?? true,
+    abort: () => void aborts.push(1),
     sessionManager: {
       getBranch: () => pi.branch,
       getSessionDir: () => opts.sessionDir,
@@ -80,5 +88,5 @@ export function fakeCtx(pi: FakePi, opts: FakeCtxOptions) {
     },
     ...(opts.projectTrusted === undefined ? {} : { isProjectTrusted: () => opts.projectTrusted }),
   } as unknown as ExtensionContext;
-  return { ctx, notes, providers };
+  return { ctx, notes, providers, aborts };
 }

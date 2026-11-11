@@ -7,7 +7,7 @@ import { type Ask, deliver, type DeliveryPort, deliverBatch, quoteAsk, renderAsk
 import { BUILTIN_ENTRY_AGENT_DEF, type EntryRequest, parseEntryRequest, type ResolvedEntry, validateEntryTarget } from "./entries.ts";
 import { type MailboxErrorInfo, MailboxServer } from "./mailbox.ts";
 import { estimateTokens, type Payload, preparePayload, SUMMARY_INSTRUCTION, writeOutput } from "./output.ts";
-import { type PendingResult, recordEntryLabel, type Registry, type RunStatus, type SubagentRecord, type Usage, ZERO_USAGE } from "./registry.ts";
+import { type PendingResult, recordEntryLabel, type RecordPatch, type Registry, type RunStatus, type SubagentRecord, type Usage, ZERO_USAGE } from "./registry.ts";
 import type { ChildDelegation, ChildResult, ChildSession, Runner } from "./runner/types.ts";
 import { type Scheduler, SubagentsDisabledError } from "./scheduler.ts";
 import type { DeliveryMode, RunnerKind, SubagentSettings } from "./settings.ts";
@@ -44,7 +44,7 @@ const DELEGATION_ACTIONS = new Set<string>(SUBAGENT_ACTIONS);
  * (REVIEW-046). `list`, `steer`, `interrupt` and `stop` only touch records that already exist and return without
  * starting a run, so they must never release and re-acquire the parent's slot (REVIEW-049).
  */
-const YIELDING_DELEGATION_ACTIONS = new Set<string>(["run", "resume", "continue", "parallel", "chain"]);
+const YIELDING_DELEGATION_ACTIONS = new Set<string>(["run", "resume", "restart", "continue", "parallel", "chain"]);
 
 export interface SettledInfo {
   handle: string;
@@ -89,6 +89,8 @@ export interface ManagerDeps {
   mailboxDir?: string;
   /** Called once when a pending child-result batch has waited longer than `pendingResultTimeoutMinutes` (M6). */
   onPendingReminder?: (record: SubagentRecord, count: number, oldestMinutes: number) => void;
+  /** Called when a run was paused because it exceeded a stall budget; the run stays resumable (M7). */
+  onStall?: (record: SubagentRecord, reason: string) => void;
   /** Injectable clock (tests); defaults to Date.now. */
   now?: () => number;
 }
@@ -123,6 +125,11 @@ export interface RunRequest extends EntryRequest {
   parentId?: string;
   /** Informational only: a record's depth is always derived from its parent (root subagents are depth 1). */
   depth?: number;
+  /**
+   * Foreground only: how long this call may wait before the child is paused (and the call returns). Ignored for a
+   * background run; the record stays resumable either way.
+   */
+  waitMinutes?: number;
 }
 
 export interface RunOutcome {
@@ -184,6 +191,13 @@ interface LaunchOptions {
   asks?: Ask[];
   /** Delegation-path background run: return the queued handle and wait for a slot in a detached task (LATENT-046-BG). */
   detach?: boolean;
+  /** The caller's own waiting budget in minutes: at the deadline the run is paused and the call returns. */
+  waitMinutes?: number;
+  /**
+   * The caller is still holding its turn for this run, so its signal (Esc, a bounded call) must pause it. Overrides the
+   * default `!background`: a foreground batch item is launched with `background: true` internally yet its caller waits.
+   */
+  waiting?: boolean;
 }
 
 interface Live {
@@ -197,12 +211,50 @@ interface Live {
    */
   release?: () => void;
   /**
+   * The grant `execute` was handed for this run, before any delegation swapped it. Kept so `abandon()` can release the
+   * slot of a job whose `finally` will never run (a child that never settles after an abort).
+   */
+  ownRelease?: () => void;
+  /**
    * How many foreground delegations have given up this run's slot and are still waiting on a child. The first one
    * releases the slot (0 -> 1) and the last one to finish re-acquires it (1 -> 0); concurrent delegations from one
    * parent therefore share a single yielded grant instead of each releasing and re-acquiring its own, which deadlocked
    * two parallel calls under maxConcurrent 1 (REVIEW-046).
    */
   yielding?: number;
+  /** Where this run is and how long it has been there; drives the stall budgets and the `/subagents` phase label. */
+  activity: LiveActivity;
+  /** Releases a foreground caller that is racing this run with `job`; `abandon` resolves it with the paused record. */
+  settle?: (outcome: RunOutcome) => void;
+  /** Set once the run was declared paused because it would not settle after an abort; a late result is ignored. */
+  abandoned?: boolean;
+  /** This run's own job, so `abandon` can stop it keeping `whenIdle()`/`shutdown()` alive. */
+  job?: Promise<unknown>;
+  /** Why the run was paused by the stall watchdog; survives into `record.error`. */
+  stallReason?: string;
+  /** Set when a pause was already requested, so one run is never stalled twice. */
+  stallRequested?: boolean;
+  /** Set once an interrupt was requested through `abortWithinGrace`, so Esc and a stall cannot double-request it. */
+  pauseRequested?: boolean;
+  /** Resolves once this run has wound down (its own settle), so a grace window never outlives the run it guards. */
+  finished?: Promise<void>;
+}
+
+/**
+ * One run's phase bookkeeping. Tool calls are tracked per `toolCallId` because a single assistant message may run
+ * several in parallel (pi runs them concurrently): a shared "current tool" would let one call's output keep another
+ * alive. `turnStartedAt` is the only clock the hard budget reads, and nothing refreshes it.
+ */
+interface LiveActivity {
+  phase: "model" | "tool" | "idle";
+  /** Tool name of the current phase, when `phase === "tool"` (falls back to the last started call). */
+  toolName?: string;
+  /** When the current phase began (model/tool transitions). */
+  phaseSince: number;
+  /** When this turn began; never refreshed (the hard budget counts from here). */
+  turnStartedAt: number;
+  /** In-flight tool calls by id: `lastProgressAt` moves only on a non-empty partial result. */
+  tools: Map<string, { name: string; startedAt: number; lastProgressAt: number }>;
 }
 
 export class SubagentManager {
@@ -225,6 +277,8 @@ export class SubagentManager {
   private closed = false;
   /** Reminder watch for queued child results (M6); started only while something is waiting. */
   private pendingTimer?: NodeJS.Timeout;
+  /** Stall watchdog: only runs while at least one child is live (M7). */
+  private stallTimer?: NodeJS.Timeout;
   /** Aborted on shutdown so queued run/resume calls stop waiting for a slot. */
   private readonly lifetime = new AbortController();
 
@@ -242,6 +296,127 @@ export class SubagentManager {
   /** Chains on the current branch, in creation order (for the list tree). */
   listChains(): ChainRecord[] {
     return this.deps.chainStore.list();
+  }
+
+  /** Live-only phase labels for `/subagents`; a record with no run in this process has no entry. */
+  activitySnapshot(): Map<string, { label: string; since: number }> {
+    const out = new Map<string, { label: string; since: number }>();
+    for (const [id, live] of this.live) {
+      const { phase, toolName, phaseSince } = live.activity;
+      out.set(id, { label: phase === "tool" ? (toolName ?? "tool") : phase, since: phaseSince });
+    }
+    return out;
+  }
+
+  /**
+   * Starts the stall watchdog while at least one child is live. The timer is unref'd, so it never keeps the process
+   * alive on its own, and `checkStalls()` works without it.
+   */
+  private ensureStallWatch(): void {
+    if (this.stallTimer || !this.live.size) return;
+    this.stallTimer = setInterval(() => this.checkStalls(), 30_000);
+    this.stallTimer.unref?.();
+  }
+
+  private stopStallWatch(): void {
+    if (this.stallTimer) clearInterval(this.stallTimer);
+    this.stallTimer = undefined;
+  }
+
+  /**
+   * One stall pass, testable without any timer. A tool call is judged by its own last progress (parallel calls never
+   * refresh each other), and the turn budget counts from the start of the turn and is never refreshed. Only an
+   * interrupt is requested here: whether to stop is the caller's decision.
+   */
+  checkStalls(): number {
+    const settings = this.deps.settings();
+    const toolBudget = settings.toolIdleTimeoutMinutes * 60_000;
+    const hardBudget = settings.turnHardTimeoutMinutes * 60_000;
+    if (toolBudget <= 0 && hardBudget <= 0) return 0;
+    let fired = 0;
+    for (const [id, live] of this.live) {
+      // A run that is already stopping keeps its stop intent, and a stall is requested at most once per run.
+      if (live.intent === "stop" || live.stallRequested) continue;
+      const record = this.deps.registry.get(id);
+      if (!record) continue;
+      const now = this.now();
+      let reason: string | undefined;
+      if (toolBudget > 0) {
+        // The earliest deadline wins: one stuck call is enough, however busy the other calls are.
+        let worst: { name: string; toolCallId: string; lastProgressAt: number } | undefined;
+        for (const [toolCallId, call] of live.activity.tools) {
+          if (!worst || call.lastProgressAt < worst.lastProgressAt) worst = { name: call.name, toolCallId, lastProgressAt: call.lastProgressAt };
+        }
+        if (worst && now - worst.lastProgressAt >= toolBudget) {
+          reason = `stalled: ${worst.name} produced no progress for ${Math.round((now - worst.lastProgressAt) / 60_000)}m (tool call ${worst.toolCallId})`;
+        }
+      }
+      if (!reason && hardBudget > 0 && now - live.activity.turnStartedAt >= hardBudget) {
+        reason = `stalled: the turn exceeded ${settings.turnHardTimeoutMinutes}m`;
+      }
+      if (!reason) continue;
+      this.stall(record, live, reason);
+      fired++;
+    }
+    return fired;
+  }
+
+  /** Requests a pause (never a stop): the run settles as `paused` and can be resumed or restarted. */
+  private stall(record: SubagentRecord, live: Live, reason: string): void {
+    live.stallRequested = true;
+    live.stallReason = reason;
+    live.intent = "interrupt";
+    void live.session.abort().catch(() => {});
+    this.track(this.grace(record, live, reason));
+    try {
+      this.deps.onStall?.(record, reason);
+    } catch {
+      // Notification is a side channel.
+    }
+  }
+
+  /**
+   * After the grace window without a settle, the run is abandoned so the awaiting call returns. The window ends early
+   * when the run settles on its own, so a normal pause never holds `whenIdle()` for the whole grace period.
+   */
+  /**
+   * Requests an abort and always releases the caller: when the child does not settle inside the grace window the run is
+   * abandoned (spec §3.5). Manual interrupt/stop go through here too, so a child that ignores the signal can never hang
+   * the tool call, `whenIdle()` or session shutdown. `abandon` keeps the intent: `stop` ends as `stopped`, `interrupt`
+   * as `paused`.
+   */
+  private async abortWithinGrace(record: SubagentRecord, live: Live, intent: "interrupt" | "stop", reason: string): Promise<void> {
+    // One pause per run: Esc, the stall budget and `waitMinutes` may all fire, and a second request must not re-abort.
+    if (intent === "interrupt" && live.pauseRequested) return;
+    if (intent === "interrupt") live.pauseRequested = true;
+    // An interrupt must never downgrade a stop that is already in flight.
+    if (live.intent !== "stop") live.intent = intent;
+    let abortError: unknown;
+    const aborted = live.session.abort().catch((error: unknown) => {
+      abortError = error;
+    });
+    const guarded = this.grace(record, live, reason);
+    this.track(guarded);
+    await Promise.race([aborted, guarded]);
+    // An abort that failed still surfaces (a caller must not think the child stopped), unless the run was abandoned —
+    // then the record status is the answer and the wedged child is no longer the caller's problem.
+    if (abortError !== undefined && !live.abandoned) throw abortError;
+  }
+
+  /** Fire-and-forget pause request that also arms the abandonment window (Esc, a caller's aborted tool call). */
+  private requestPause(record: SubagentRecord, live: Live, reason: string): void {
+    void this.abortWithinGrace(record, live, "interrupt", reason).catch(() => {});
+  }
+
+  private async grace(record: SubagentRecord, live: Live, reason: string): Promise<void> {
+    const ms = this.deps.settings().interruptGraceSeconds * 1_000;
+    const deadline = new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, ms);
+      timer.unref?.();
+    });
+    await Promise.race([deadline, live.finished ?? deadline]);
+    if (this.live.get(record.id) !== live || live.abandoned) return;
+    this.abandon(record, live, reason);
   }
 
   /**
@@ -518,7 +693,12 @@ export class SubagentManager {
       const records = this.descendants(parent.id);
       const ids = new Set(records.map((r) => r.id));
       const chains = this.listChains().filter((c) => c.stepRecordIds.some((id) => ids.has(id)));
-      return { text: renderTree(records, "list", chains), details: { count: records.length } };
+      return { text: renderTree(records, "list", chains, Date.now(), this.activitySnapshot()), details: { count: records.length } };
+    }
+    // Mass actions have no handle to scope, and a child has no business ending the tree it lives in; `DELEGATION_ACTIONS`
+    // is derived from `SUBAGENT_ACTIONS`, so the refusal must be explicit here rather than by omitting the action.
+    if (input.action === "stop-all" || input.action === "interrupt-all") {
+      throw new Error("only the main agent can stop all subagents");
     }
     const scoped: DispatchInput = { ...input };
     if (input.handle) {
@@ -607,6 +787,24 @@ export class SubagentManager {
     return [...ids].map((id) => this.deps.registry.get(id)).filter((r): r is SubagentRecord => r !== undefined);
   }
 
+  /**
+   * Every record a mass stop must end, deepest last: anything with a live child, a pending resume claim, a queued run,
+   * plus a record the registry still calls `running`/`queued` (a recovered record has no run of its own any more, but
+   * it must still end). `paused` is deliberately absent: a paused record stays resumable.
+   */
+  private stopTargets(): SubagentRecord[] {
+    const ids = new Set([...this.live.keys(), ...this.claims.keys(), ...this.queued.keys()]);
+    for (const record of this.deps.registry.list()) {
+      if (record.status === "running" || record.status === "queued") ids.add(record.id);
+    }
+    const out: SubagentRecord[] = [];
+    for (const id of ids) {
+      const record = this.deps.registry.get(id);
+      if (record) out.push(record);
+    }
+    return out.sort((a, b) => a.depth - b.depth);
+  }
+
   async run(req: RunRequest): Promise<RunOutcome> {
     const requester = this.requesterFor(req.parentId);
     const resolved = this.resolveTarget(req, "run", requester);
@@ -615,6 +813,8 @@ export class SubagentManager {
       ...(req.receiverContextWindow ? { receiverContextWindow: req.receiverContextWindow } : {}),
       ...(req.ask ? { asks: [this.ask("ask", req.ask)] } : {}),
       ...(req.detach ? { detach: true } : {}),
+      // A background run has nobody waiting on it, so a wait budget would only cost it time.
+      ...(req.waitMinutes && !req.background ? { waitMinutes: req.waitMinutes } : {}),
     });
   }
 
@@ -739,7 +939,7 @@ export class SubagentManager {
   }
 
   /** Starts every task at once (the scheduler still caps concurrency) and summarizes the group afterwards. */
-  async runParallel(req: { items: readonly BatchItem[]; parentId?: string; background?: boolean; signal?: AbortSignal }): Promise<BatchOutcome> {
+  async runParallel(req: { items: readonly BatchItem[]; parentId?: string; background?: boolean; signal?: AbortSignal; waitMinutes?: number }): Promise<BatchOutcome> {
     if (this.closed) throw shutDownError();
     // A nested batch names its parent once at the top; each item inherits it unless it names one itself.
     const items = this.inheritParent(req.items, req.parentId);
@@ -762,7 +962,11 @@ export class SubagentManager {
     });
     const prepared = items.map((item, i) => this.prepare(targets[i]!, { ...(item.parentId ? { parentId: item.parentId } : {}) }));
     // One item failing to start (runner.open, a cancel while queued/opening, shutdown) must not drop the others' results.
-    const settled = Promise.allSettled(prepared.map((p) => this.launch(p, true, req.signal, { mode: "batch" })));
+    // The wait budget belongs to the calling tool call, not to the batch: every item gets its own deadline.
+    const waitMinutes = req.background ? undefined : req.waitMinutes;
+    const settled = Promise.allSettled(
+      prepared.map((p) => this.launch(p, true, req.signal, { mode: "batch", waiting: !req.background, ...(waitMinutes ? { waitMinutes } : {}) })),
+    );
     const outcomes = settled.then((results) => results.map((result, i) => (result.status === "fulfilled" ? result.value : this.failureOutcome(prepared[i]!.record))));
     if (!req.background) {
       const done = await outcomes;
@@ -777,7 +981,7 @@ export class SubagentManager {
   }
 
   /** Runs the steps one after another; a failing, interrupted or stopped step stops the chain and can be continued later. */
-  async runChain(req: { steps: readonly BatchItem[]; parentId?: string; background?: boolean; signal?: AbortSignal }): Promise<BatchOutcome> {
+  async runChain(req: { steps: readonly BatchItem[]; parentId?: string; background?: boolean; signal?: AbortSignal; waitMinutes?: number }): Promise<BatchOutcome> {
     if (this.closed) throw shutDownError();
     // A nested chain names its parent once at the top; each step inherits it unless it names one itself.
     const steps = this.inheritParent(req.steps, req.parentId);
@@ -804,9 +1008,10 @@ export class SubagentManager {
     // `chainStore` does not persist `parentId`, so the original `steps` array is the only source here; a continued
     // chain falls back to the resumed record's parent instead (see `continueChainLoop`).
     const parentOf = (index: number): string | undefined => steps[index]?.parentId;
-    if (!req.background) return this.runChainLoop(chain, 0, "", req.signal, [], parentOf);
+    const waitMinutes = req.background ? undefined : req.waitMinutes;
+    if (!req.background) return this.runChainLoop(chain, 0, "", req.signal, [], parentOf, waitMinutes, true);
     this.track(
-      this.runChainLoop(chain, 0, "", req.signal, [], parentOf).then((outcome) => {
+      this.runChainLoop(chain, 0, "", req.signal, [], parentOf, waitMinutes, false).then((outcome) => {
         this.sendBatch("chain", outcome.payload!, outcome.records, outcome.chain);
       }),
       (error) => this.reportBatchError(this.firstChainRecord(chain.id), error),
@@ -815,7 +1020,7 @@ export class SubagentManager {
   }
 
   /** Continues the chain that stopped at the step behind `handle`: resumes that step, then runs the remaining ones. */
-  async continueChain(handle: string, message?: string, opts: { background?: boolean; signal?: AbortSignal } = {}): Promise<BatchOutcome> {
+  async continueChain(handle: string, message?: string, opts: { background?: boolean; signal?: AbortSignal; waitMinutes?: number } = {}): Promise<BatchOutcome> {
     if (this.closed) throw shutDownError();
     const record = this.requireRecord(handle);
     const chain = record.chainId ? this.deps.chainStore.get(record.chainId) : undefined;
@@ -836,9 +1041,10 @@ export class SubagentManager {
     for (let i = index + 1; i < chain.steps.length; i++) {
       this.resolveTarget(chain.steps[i]!, "chain", this.requesterFor(record.parentId));
     }
-    if (!opts.background) return this.continueChainLoop(chain, record, index, message, opts.signal, record.parentId);
+    const waitMinutes = opts.background ? undefined : opts.waitMinutes;
+    if (!opts.background) return this.continueChainLoop(chain, record, index, message, opts.signal, record.parentId, waitMinutes, true);
     this.track(
-      this.continueChainLoop(chain, record, index, message, opts.signal, record.parentId).then((outcome) => {
+      this.continueChainLoop(chain, record, index, message, opts.signal, record.parentId, waitMinutes, false).then((outcome) => {
         this.sendBatch("chain", outcome.payload!, outcome.records, outcome.chain);
       }),
       (error) => this.reportBatchError(this.firstChainRecord(chain.id), error),
@@ -860,11 +1066,13 @@ export class SubagentManager {
     message: string | undefined,
     signal: AbortSignal | undefined,
     parentId?: string,
+    waitMinutes?: number,
+    waiting = false,
   ): Promise<BatchOutcome> {
     // The process can die between a step finishing and the chain advancing: that step must not run a second time.
     if (record.status === "completed") {
       const current = this.deps.chainStore.update(chain.id, { status: "running", usage: this.chainUsage(chain) });
-      const rest = await this.runChainLoop(current, index + 1, record.lastSummary ?? "", signal, [{ record }], () => parentId);
+      const rest = await this.runChainLoop(current, index + 1, record.lastSummary ?? "", signal, [{ record }], () => parentId, waitMinutes, waiting);
       return { records: rest.records, payload: rest.payload, chain: rest.chain };
     }
     // Resume the step that stopped the chain so it keeps its own session, then run the remaining steps.
@@ -872,8 +1080,11 @@ export class SubagentManager {
     const resumed = await this.resume(record.handle, message ?? record.task, {
       background: true,
       ...(signal ? { signal } : {}),
+      waiting,
       mode: "batch",
       ...(receiver ? { receiverContextWindow: receiver } : {}),
+      // The step is part of a foreground call, so the caller's budget applies to its resumed run too.
+      ...(waitMinutes ? { waitMinutes } : {}),
     });
     if (resumed.record.status !== "completed") {
       const stopped = this.deps.chainStore.update(chain.id, { status: chainStatusOf(resumed.record.status), usage: this.chainUsage(chain) });
@@ -881,7 +1092,7 @@ export class SubagentManager {
     }
     // The resumed step keeps its record id, so the chain usage stays the sum of every started step's record.
     const current = this.deps.chainStore.update(chain.id, { status: "running", usage: this.chainUsage(chain) });
-    const rest = await this.runChainLoop(current, index + 1, resumed.payload?.text ?? "", signal, [resumed], () => parentId);
+    const rest = await this.runChainLoop(current, index + 1, resumed.payload?.text ?? "", signal, [resumed], () => parentId, waitMinutes, waiting);
     // `runChainLoop` already carries the resumed outcome, so its records and payload span the whole chain.
     return { records: rest.records, payload: rest.payload, chain: rest.chain };
   }
@@ -893,9 +1104,17 @@ export class SubagentManager {
     signal: AbortSignal | undefined,
     outcomes: RunOutcome[] = [],
     parentOf: (index: number) => string | undefined = () => undefined,
+    waitMinutes?: number,
+    waiting = false,
   ): Promise<BatchOutcome> {
     let current = chain;
     for (let i = from; i < chain.steps.length; i++) {
+      // The caller stopped waiting (Esc): never start another step. Settle the chain as paused so `continue` can finish
+      // it, instead of launching a step whose record would be cancelled as "stopped before it started" (uncontinuable).
+      if (waiting && signal?.aborted) {
+        const paused = this.deps.chainStore.update(chain.id, { status: "paused", usage: this.chainUsage(current) });
+        return { records: outcomes.map((o) => o.record), payload: this.chainPayload(paused, outcomes), chain: paused };
+      }
       const step = chain.steps[i]!;
       // `{previous}` only affects the task text; the entry kind and name were already validated before the chain existed.
       const task = substitutePrevious(step.task ?? "", previous);
@@ -926,7 +1145,12 @@ export class SubagentManager {
       const receiver = this.chainReceiverWindow(chain, i);
       let outcome: RunOutcome;
       try {
-        outcome = await this.launch(prepared, true, signal, { mode: "batch", ...(receiver ? { receiverContextWindow: receiver } : {}) });
+        outcome = await this.launch(prepared, true, signal, {
+          mode: "batch",
+          waiting,
+          ...(receiver ? { receiverContextWindow: receiver } : {}),
+          ...(waitMinutes ? { waitMinutes } : {}),
+        });
       } catch (error) {
         // The run was cancelled or its session could not open; the record already says why.
         const failed = this.deps.registry.get(prepared.record.id) ?? prepared.record;
@@ -1114,7 +1338,7 @@ export class SubagentManager {
   async resume(
     handle: string,
     userMessage: string,
-    opts: { delivery?: DeliveryMode; background?: boolean; signal?: AbortSignal; mention?: boolean; receiverContextWindow?: number; mode?: "single" | "batch"; detach?: boolean } = {},
+    opts: { delivery?: DeliveryMode; background?: boolean; signal?: AbortSignal; mention?: boolean; receiverContextWindow?: number; mode?: "single" | "batch"; detach?: boolean; waitMinutes?: number; waiting?: boolean } = {},
   ): Promise<RunOutcome> {
     const { record, agent, runner, cwd } = this.preflight(handle);
     // Child results that arrived while this record was paused are handed to the model before the user's message.
@@ -1224,7 +1448,9 @@ export class SubagentManager {
       }
       const outcome = await this.execute(claimed, session, message, release, opts.background ?? false, signal, opts.mention ? [this.ask("ask", message)] : [], {
         ...(opts.mode ? { mode: opts.mode } : {}),
+        ...(opts.waiting !== undefined ? { waiting: opts.waiting } : {}),
         ...(opts.receiverContextWindow ? { receiverContextWindow: opts.receiverContextWindow } : {}),
+        ...(opts.waitMinutes && !opts.background ? { waitMinutes: opts.waitMinutes } : {}),
       });
       // The queued results reached the model with this message; drop exactly those entries (a child that finished
       // while this resume waited for a slot may have queued another one, which must stay).
@@ -1252,6 +1478,176 @@ export class SubagentManager {
       return undefined;
     } catch (error) {
       return error as Error;
+    }
+  }
+
+  /**
+   * The resume preflight for a restart: a stopped record may restart, and a live/queued one is refused here only when it
+   * has nothing to rerun yet. The session file is deliberately not checked, because a restart opens a new one.
+   */
+  private restartTarget(handle: string): { record: SubagentRecord; agent: AgentDef; runner: Runner; cwd: string; trusted: boolean | undefined } {
+    const record = this.requireRecord(handle);
+    if (record.chainId !== undefined) throw new SubagentError("busy", `@${record.handle} is a chain step; use action=continue to finish its chain`);
+    if (record.status === "queued" || this.queued.has(record.id)) throw new SubagentError("busy", `@${record.handle} is queued and has not started yet`);
+    const base = record.entry ? BUILTIN_ENTRY_AGENT_DEF : this.requireAgent(record.agent);
+    // The model and thinking level stay those the run was created with, exactly as a resume keeps them.
+    const agent = this.effectiveAgent(base, record.model, record.thinking);
+    const runner = this.requireRunner(record.runner);
+    const cwd = this.resolveCwd(record.cwd);
+    return { record, agent, runner, cwd, trusted: this.deps.trustForCwd?.(cwd) };
+  }
+
+  /**
+   * Runs the record's task again in a brand-new child session and keeps the handle: the record moves to `runId + 1` with
+   * `sessionFile` cleared, so the runner creates a fresh session (the old file stays on disk for review). A run that is
+   * still live is halted first, so two runs of one record never overlap. Pending child results are left queued: the new
+   * context knows nothing about them (`drain` hands them over).
+   */
+  async restart(
+    handle: string,
+    opts: { message?: string; background?: boolean; delivery?: DeliveryMode; signal?: AbortSignal } = {},
+  ): Promise<RunOutcome> {
+    if (this.closed) throw shutDownError();
+    // Refuse before halting anything: a queued record has nothing to rerun and a chain step belongs to its chain.
+    this.restartTarget(handle);
+    const target = this.requireRecord(handle);
+    if (this.live.has(target.id) || this.claims.has(target.id) || this.queued.has(target.id) || target.status === "running") await this.halt(target);
+    const { record, agent, runner, cwd, trusted } = this.restartTarget(handle);
+    // The new run must create a fresh session: close the parked child before opening the next one.
+    await this.closeIdle(record.id);
+    const prompt = opts.message ? `${record.task}\n\n${opts.message}` : record.task;
+    // Snapshot taken before the claim so a restart that never opened a session rolls back completely (no "running"
+    // leak, no cleared `sessionFile`).
+    const previous: RecordPatch = {
+      status: record.status,
+      runId: record.runId,
+      sessionFile: record.sessionFile,
+      childLeafId: record.childLeafId,
+      delivery: record.delivery,
+      error: record.error,
+    };
+    const claimed = this.deps.registry.update(record.id, {
+      status: "running",
+      runId: record.runId + 1,
+      sessionFile: "",
+      childLeafId: undefined,
+      delivery: opts.delivery ?? record.delivery,
+      error: undefined,
+    });
+    const claim: { intent?: "stop"; controller: AbortController } = { controller: new AbortController() };
+    this.claims.set(record.id, claim);
+    const signal = opts.signal;
+    const abortClaim = () => claim.controller.abort();
+    if (this.lifetime.signal.aborted || signal?.aborted) abortClaim();
+    else {
+      this.lifetime.signal.addEventListener("abort", abortClaim, { once: true });
+      signal?.addEventListener("abort", abortClaim, { once: true });
+    }
+    const unlinkClaim = () => {
+      this.lifetime.signal.removeEventListener("abort", abortClaim);
+      signal?.removeEventListener("abort", abortClaim);
+    };
+    const stoppedWhileWaiting = () => {
+      this.markStopped(record.id);
+      return new SubagentError("stopped", `@${record.handle} was stopped while restarting`);
+    };
+    const proceed = async (): Promise<RunOutcome> => {
+      let release: () => void;
+      let delegation: ChildDelegation | undefined;
+      let session: ChildSession;
+      try {
+        release = await this.deps.scheduler.acquire(claim.controller.signal);
+        try {
+          delegation = this.delegationSpecFor(record);
+          // No resumeFile/resumeLeafId: a restart never reuses the old context.
+          session = await runner.open({
+            agent,
+            cwd,
+            sessionDir: this.deps.sessionDir,
+            ...(trusted !== undefined ? { projectTrusted: trusted } : {}),
+            appendSystemPrompt: [agent.systemPrompt, SUMMARY_INSTRUCTION].filter(Boolean),
+            ...(delegation ? { delegation } : {}),
+          });
+          if (this.closed) {
+            await this.close(record.id, session);
+            throw shutDownError();
+          }
+          if (signal?.aborted && claim.intent !== "stop") {
+            await this.close(record.id, session);
+            throw new SubagentError("interrupted", `@${record.handle} was interrupted before it restarted`);
+          }
+        } catch (error) {
+          release();
+          throw error;
+        }
+      } catch (error) {
+        unlinkClaim();
+        this.claims.delete(record.id);
+        this.maybeStopMailbox();
+        if (claim.intent === "stop") throw stoppedWhileWaiting();
+        // A restart that never opened a session puts the record back exactly as it was.
+        this.deps.registry.update(record.id, previous);
+        throw error;
+      }
+      unlinkClaim();
+      this.claims.delete(record.id);
+      if (claim.intent === "stop") {
+        release();
+        this.maybeStopMailbox();
+        await this.close(record.id, session);
+        throw stoppedWhileWaiting();
+      }
+      if (delegation?.canDelegate) {
+        try {
+          this.ensureMailbox();
+        } catch (error) {
+          this.maybeStopMailbox();
+          release();
+          await this.close(record.id, session);
+          this.deps.registry.update(record.id, previous);
+          throw error;
+        }
+      }
+      // A resume reuses the record's file, so nothing else writes it; a restart must point the record at the new one.
+      const running = this.deps.registry.update(record.id, { status: "running", sessionFile: session.sessionFile });
+      // Pending child results are deliberately NOT consumed: the new context knows nothing about them.
+      return this.execute(running, session, prompt, release, opts.background ?? false, signal, []);
+    };
+    if (opts.background && !this.deps.scheduler.hasCapacity()) {
+      this.track(proceed());
+      return { record: claimed };
+    }
+    return proceed();
+  }
+
+  /** Halts a live/claiming/queued run with interrupt semantics and waits (bounded) for it to settle. */
+  private async halt(record: SubagentRecord): Promise<void> {
+    try {
+      await this.haltRecord(record, "interrupt");
+    } catch {
+      // A failed abort must not block the restart; waitForSettled abandons the run instead.
+    }
+    await this.waitForSettled(record.id, this.deps.settings().interruptGraceSeconds * 1_000);
+  }
+
+  /**
+   * Waits until no run is live, claiming or queued for `id`, so a new run never overlaps the old one. A child that will
+   * not settle within `ms` is abandoned, which releases the awaiting call and leaves the record paused (restartable).
+   */
+  private async waitForSettled(id: string, ms: number): Promise<void> {
+    const deadline = Date.now() + ms;
+    const busy = () => this.live.has(id) || this.claims.has(id) || this.queued.has(id);
+    while (busy()) {
+      if (Date.now() >= deadline) {
+        const live = this.live.get(id);
+        const record = this.deps.registry.get(id);
+        if (live && record) this.abandon(record, live, "restart stopped waiting for the previous run to settle");
+        return;
+      }
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 25);
+        timer.unref?.();
+      });
     }
   }
 
@@ -1286,8 +1682,8 @@ export class SubagentManager {
     if (this.cancelQueued(record)) return "cancelled";
     const live = this.live.get(record.id);
     if (!live) throw new SubagentError("not_running", `@${record.handle} is ${record.status}`);
-    live.intent = "interrupt";
-    await live.session.abort();
+    // Bounded: a child that ignores the abort is abandoned at the end of the grace window instead of hanging the call.
+    await this.abortWithinGrace(record, live, "interrupt", "interrupted by the main agent");
     return "paused";
   }
 
@@ -1324,7 +1720,7 @@ export class SubagentManager {
     // Synchronously shut every door a descendant could still run through before the first await. Stopping the parent
     // releases its scheduler slot mid-await, and without this the queued descendant would open a session before the
     // cascade reaches it; a descendant's pending resume claim is cancelled the same way (CR-5-1/CR-5-2).
-    this.cancelDescendantStarts(descendants);
+    this.cancelStarts(descendants);
     await halt(record);
     for (const descendant of descendants) {
       mark(descendant.id);
@@ -1334,26 +1730,66 @@ export class SubagentManager {
   }
 
   /**
-   * Bars every descendant from starting a run while the cascade awaits an abort/dispose: cancels each queued run and
-   * aborts each resume claim with `intent = "stop"`. Purely synchronous, so it runs before the parent's slot is freed.
+   * Stops every active record (queued/running, nested descendants included) and leaves paused records resumable.
+   * Everything is marked, de-queued and claim-aborted synchronously before the first await, so nothing can start
+   * while an abort is in flight; the aborts then reuse the same `stopRecord` path as a single `stop()`.
    */
-  private cancelDescendantStarts(descendants: readonly SubagentRecord[]): void {
-    for (const descendant of descendants) {
-      const claim = this.claims.get(descendant.id);
+  async stopAll(): Promise<{ stopped: number; cancelled: number; handles: { handle: string; wasQueued: boolean }[] }> {
+    const targets = this.stopTargets();
+    const handles: { handle: string; wasQueued: boolean }[] = [];
+    if (!targets.length) return { stopped: 0, cancelled: 0, handles };
+    const errors: unknown[] = [];
+    let stopped = 0;
+    let cancelled = 0;
+    // Synchronous phase: mark every target and count what will be cancelled, before any await frees a slot.
+    for (const record of targets) {
+      const wasQueued = this.queued.has(record.id);
+      if (wasQueued) cancelled++;
+      try {
+        this.markStoppedAndDiscardPending(record.id);
+        stopped++;
+        handles.push({ handle: record.handle, wasQueued });
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    this.cancelStarts(targets, errors);
+    for (const record of targets) {
+      try {
+        await this.stopRecord(record);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    // A stopped step must not leave its chain "running": settle it like a branch switch would.
+    this.reconcileChains();
+    this.maybeStopMailbox();
+    if (errors.length) throw errors[0];
+    return { stopped, cancelled, handles };
+  }
+
+  /**
+   * Bars every listed record from starting a run while a mass stop awaits an abort/dispose: cancels each queued run and
+   * aborts each resume claim with `intent = "stop"`. Purely synchronous, so it runs before a slot is freed.
+   */
+  private cancelStarts(records: readonly SubagentRecord[], errors: unknown[] = []): void {
+    for (const record of records) {
+      const claim = this.claims.get(record.id);
       if (claim) claim.intent = "stop";
       try {
-        this.cancelQueued(descendant);
-      } catch {
+        this.cancelQueued(record);
+      } catch (error) {
         // `cancelQueued` already aborted the queued run in its finally block; a persist failure is reported by the
         // per-record `mark`/`stopRecord` below instead of cutting the synchronous sweep short.
+        errors.push(error);
       }
       // Abort after cancelQueued so a run that is both queued and claimed cannot start; cancelQueued has no claim.
       if (claim) claim.controller.abort();
     }
   }
 
-  /** Stops one record's own run; its descendants are the caller's concern (see `stop`). */
-  private async stopRecord(record: SubagentRecord): Promise<void> {
+  /** Stops one record's own run with the given intent; its descendants are the caller's concern (see `stop`). */
+  private async haltRecord(record: SubagentRecord, intent: "interrupt" | "stop"): Promise<void> {
     if (this.cancelQueued(record)) return;
     // Start closing the idle child synchronously (before any await), and return only once it has finished closing.
     const closingIdle = this.closeIdle(record.id);
@@ -1367,17 +1803,37 @@ export class SubagentManager {
       }
       const live = this.live.get(record.id);
       if (live) {
-        live.intent = "stop";
-        await live.session.abort();
+        // Bounded as well: a stop on a child that ignores its abort still ends as `stopped` (see `abandon`).
+        await this.abortWithinGrace(record, live, intent, intent === "stop" ? "stopped by the main agent" : "interrupted");
       }
     } finally {
       await closingIdle;
     }
   }
 
-  /** Called when the main session is shutting down or the user aborts. */
-  async interruptAll(): Promise<void> {
-    await Promise.all([...this.live.values()].map((live) => ((live.intent = "interrupt"), live.session.abort())));
+  /** Stops one record's own run; its descendants are the caller's concern (see `stop`). */
+  private async stopRecord(record: SubagentRecord): Promise<void> {
+    return this.haltRecord(record, "stop");
+  }
+
+  /**
+   * Pauses every live child (the main agent's deliberate Esc) and reports how many it paused. A run that is already
+   * stopping keeps its `stop` intent: pausing it would turn a terminal stop into a resumable pause (F13).
+   */
+  async interruptAll(): Promise<number> {
+    const targets = [...this.live.entries()].filter(([, entry]) => entry.intent !== "stop");
+    await Promise.all(
+      targets.map(([id, entry]) => {
+        const record = this.deps.registry.get(id);
+        // No record left to write a status on: still request the abort.
+        if (!record) {
+          entry.intent = "interrupt";
+          return entry.session.abort().catch(() => {});
+        }
+        return this.abortWithinGrace(record, entry, "interrupt", "interrupted by the main session");
+      }),
+    );
+    return targets.length;
   }
 
   /** Main session is going away: cancel queued/opening run and resume calls, then interrupt live children. */
@@ -1385,6 +1841,7 @@ export class SubagentManager {
     this.closed = true;
     this.lifetime.abort();
     this.stopPendingWatch();
+    this.stopStallWatch();
     for (const claim of this.claims.values()) claim.controller.abort();
     await this.interruptAll();
     for (const id of [...this.idle.keys()]) void this.closeIdle(id);
@@ -1461,16 +1918,80 @@ export class SubagentManager {
     asks: Ask[] = [],
     options: LaunchOptions = {},
   ): Promise<RunOutcome> {
-    const live: Live = { session, asks: options.asks ?? asks, release };
-    this.live.set(record.id, live);
-    this.evictIdle();
-    const batch = options.mode === "batch";
-    // Only a foreground single call is still waiting on its tool signal; a background or batch call runs detached.
-    const callSignal = background || batch ? undefined : signal;
-    const onCallAbort = () => {
-      live.intent = "interrupt";
-      void session.abort().catch(() => {});
+    const now = this.now();
+    const live: Live = {
+      session,
+      asks: options.asks ?? asks,
+      release,
+      ownRelease: release,
+      activity: { phase: "model", phaseSince: now, turnStartedAt: now, tools: new Map() },
     };
+    this.live.set(record.id, live);
+    this.ensureStallWatch();
+    this.evictIdle();
+    // Phase bookkeeping for the stall budgets and `/subagents`; a runner without `onActivity` simply never reports.
+    const unwatch = session.onActivity?.((activity) => {
+      const stamp = this.now();
+      const state = live.activity;
+      if (activity.phase === "tool") {
+        const call = state.tools.get(activity.toolCallId) ?? { name: activity.toolName, startedAt: stamp, lastProgressAt: stamp };
+        call.name = activity.toolName;
+        // Only real output counts as progress: bash sends an empty update the moment it starts (F7).
+        if (activity.progress) call.lastProgressAt = stamp;
+        state.tools.set(activity.toolCallId, call);
+        if (state.phase !== "tool" || state.toolName !== activity.toolName) {
+          state.phase = "tool";
+          state.toolName = activity.toolName;
+          state.phaseSince = stamp;
+        }
+        return;
+      }
+      if (activity.phase === "tool-end") {
+        // Only this call is over: a parallel call of the same assistant message may still be running (F10), and it must
+        // keep its own budget instead of losing every in-flight entry.
+        state.tools.delete(activity.toolCallId);
+        const next = state.tools.values().next().value;
+        if (next) {
+          if (state.phase !== "tool") {
+            state.phase = "tool";
+            state.phaseSince = stamp;
+          }
+          state.toolName = next.name;
+          return;
+        }
+        // The last in-flight call ended: the run is back to waiting for the model.
+        state.phase = "model";
+        state.toolName = undefined;
+        state.phaseSince = stamp;
+        return;
+      }
+      state.phase = activity.phase;
+      state.toolName = undefined;
+      state.phaseSince = stamp;
+      // A new model request or the end of the turn leaves no call in flight.
+      state.tools.clear();
+    });
+    const batch = options.mode === "batch";
+    // A caller that is still holding its turn reacts to its own signal — including a foreground batch item, which is
+    // launched with `background: true` internally so it never delivers itself. Background work outlives the call.
+    const callSignal = (options.waiting ?? !background) ? signal : undefined;
+    // The caller's own waiting budget: independent of `batch`, because a foreground batch blocks the same turn. At the
+    // deadline the run is paused exactly like a stall (never stopped, never delivered) and the call returns normally.
+    const waitMs = options.waitMinutes ? options.waitMinutes * 60_000 : undefined;
+    const waitTimer = waitMs
+      ? setTimeout(() => {
+          const current = this.deps.registry.get(record.id);
+          if (current && this.live.get(current.id) === live) this.stall(current, live, `waited ${options.waitMinutes}m for this call`);
+        }, waitMs)
+      : undefined;
+    waitTimer?.unref?.();
+    const onCallAbort = () => this.requestPause(record, live, "interrupted by the caller");
+    let settle: ((outcome: RunOutcome) => void) | undefined;
+    const abandoned = new Promise<RunOutcome>((resolve) => (settle = resolve));
+    live.settle = settle;
+    // The grace window of a stall ends as soon as the run itself winds down.
+    let markFinished: (() => void) | undefined;
+    live.finished = new Promise<void>((resolve) => (markFinished = resolve));
     const job = (async (): Promise<RunOutcome> => {
       let result: ChildResult;
       let leafId: string | undefined;
@@ -1481,13 +2002,19 @@ export class SubagentManager {
       } catch (error) {
         result = { text: "", stopReason: "error", errorMessage: (error as Error).message, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } };
       } finally {
+        unwatch?.();
+        if (waitTimer) clearTimeout(waitTimer);
         callSignal?.removeEventListener("abort", onCallAbort);
         try {
           leafId = session.leafId;
         } catch {
           // A broken session simply leaves the previous leaf in place.
         }
-        this.live.delete(record.id);
+        // A restart may already have put a new run of the same record live; the old run must not remove its bookkeeping.
+        if (this.live.get(record.id) === live) this.live.delete(record.id);
+        markFinished?.();
+        // Nothing is left to watch: the interval must not outlive the last live child.
+        if (!this.live.size) this.stopStallWatch();
         // A foreground delegation may have swapped the grant while it waited for a child (REVIEW point 5); release
         // whichever grant the parent currently holds. The scheduler makes a repeated release a no-op.
         (live.release ?? release)();
@@ -1512,18 +2039,25 @@ export class SubagentManager {
       }
     })();
     this.work.add(job);
+    live.job = job;
     void job.catch(() => {}).finally(() => this.work.delete(job));
     if (background && !batch) return { record };
-    return job;
+    // A foreground caller must return even when the child never settles after an abort (an in-process SDK child cannot
+    // be killed): `abandon()` resolves this race with the paused record.
+    return Promise.race([job, abandoned]);
   }
 
   private finish(id: string, result: ChildResult, live: Live, background: boolean, leafId?: string, options: LaunchOptions = {}): RunOutcome {
     const registry = this.deps.registry;
     registry.addUsage(id, result.usage);
+    if (live.abandoned) {
+      // The run was declared paused when it would not settle; a late result must not rewrite that status or be delivered.
+      return { record: registry.get(id)!, payload: { text: "", summary: "" } };
+    }
     let status: RunStatus;
     let error: string | undefined;
     if (live.intent === "stop") status = "stopped";
-    else if (live.intent === "interrupt" || result.stopReason === "aborted") status = "paused";
+    else if (live.intent === "interrupt" || result.stopReason === "aborted") (status = "paused"), (error = live.stallReason);
     else if (result.stopReason === "error") (status = "failed"), (error = result.errorMessage ?? "child reported an error");
     else if (!result.text.trim()) (status = "failed"), (error = "child returned an empty answer");
     else status = "completed";
@@ -1825,6 +2359,49 @@ export class SubagentManager {
     return undefined;
   }
 
+  /**
+   * Gives up waiting on a child that did not settle after an abort. The record is paused (still resumable, `restart`
+   * can rerun it), the awaiting foreground call is released, and the wedged job stops keeping `whenIdle()`/`shutdown()`
+   * alive. The session is closed best-effort: an RPC child reaches SIGKILL, an in-process SDK child only drops its
+   * listeners. A late result is ignored by `finish()` except for its usage.
+   */
+  private abandon(record: SubagentRecord, live: Live, reason: string): void {
+    if (live.abandoned) return;
+    live.abandoned = true;
+    const stopping = live.intent === "stop";
+    // The stored error says both why the run was given up and that it may still be burning CPU: the status is `paused`
+    // (resumable) or `stopped` (final), and nothing guarantees the child stopped (an SDK child cannot be killed).
+    const message = `${reason}; did not settle after abort, the child may still be running`;
+    let settled = record;
+    try {
+      // An abandoned stop stays final and drops its pending child results exactly like a normal stop; an abandoned
+      // interrupt stays resumable. Downgrading one into the other is the F13 failure mode.
+      if (stopping) this.deps.registry.update(record.id, { status: "stopped", error: message, pending: [], pendingNotifiedAt: undefined });
+      else this.deps.registry.update(record.id, { status: "paused", error: message });
+      settled = this.deps.registry.get(record.id) ?? record;
+    } catch {
+      // The record keeps its in-memory status even when persisting fails.
+    }
+    // The waiting caller gets an actionable line: `restart` reruns a paused record in a fresh session.
+    const note = stopping
+      ? `@${settled.handle} stopped: did not settle after abort (the child may still be running)`
+      : `@${settled.handle} paused: did not settle after abort; use restart (the child may still be running)`;
+    try {
+      live.settle?.({ record: settled, payload: { text: note, summary: note } });
+    } catch {
+      // A settle callback must never throw into the watchdog.
+    }
+    if (live.job) this.work.delete(live.job);
+    // A restart may already own this record's live slot; never remove the new run's entry here.
+    if (this.live.get(record.id) === live) this.live.delete(record.id);
+    // The job of an abandoned run may never settle, so its `finally` never runs: release its slot and stop the watchdog
+    // here instead (the scheduler makes a repeated release a no-op, so a late `finally` is harmless).
+    (live.release ?? live.ownRelease)?.();
+    if (!this.live.size) this.stopStallWatch();
+    void this.close(record.id, live.session);
+    this.maybeStopMailbox();
+  }
+
   /** Closes the idle child of a record, if any; resolves once every close of that record has finished. */
   private closeIdle(id: string): Promise<void> {
     const session = this.idle.get(id);
@@ -1860,10 +2437,12 @@ export class SubagentManager {
   private preflight(handle: string): { record: SubagentRecord; agent: AgentDef; runner: Runner; cwd: string } {
     if (this.closed) throw shutDownError();
     const record = this.requireRecord(handle);
-    if (record.status === "stopped") throw new SubagentError("stopped", `@${record.handle} was stopped and cannot be resumed; start a new subagent instead`);
+    if (record.status === "stopped") {
+      throw new SubagentError("stopped", `@${record.handle} was stopped and cannot be resumed; use action=restart to run it again in a fresh session`);
+    }
     if (record.status === "queued") throw new SubagentError("busy", `@${record.handle} is queued and has not started yet`);
     if (record.status === "running" || this.live.has(record.id)) {
-      throw new SubagentError("busy", `@${record.handle} is still running; use steer to guide it`);
+      throw new SubagentError("busy", `@${record.handle} is still running; use steer to guide it, or interrupt/stop/restart it`);
     }
     if (!record.sessionFile) throw new SubagentError("missing_session", `@${record.handle} never started, so there is no session to resume`);
     if (!existsSync(record.sessionFile)) {

@@ -31,6 +31,12 @@ export interface SubagentSettings {
   contextRatio: number;
   /** Minutes a queued child result may wait before the user is reminded (used from M6). */
   pendingResultTimeoutMinutes: number;
+  /** Minutes one tool call may show no progress before the run is paused; 0 disables the budget. */
+  toolIdleTimeoutMinutes: number;
+  /** Absolute minutes one turn may run before it is paused; 0 disables the budget. Never refreshed mid-turn. */
+  turnHardTimeoutMinutes: number;
+  /** Seconds to wait for the child to settle after an abort request before the run is abandoned. */
+  interruptGraceSeconds: number;
   /** Longest user message quoted with an `@` result; longer messages are truncated with a note. */
   mentionQuoteMaxChars: number;
   /**
@@ -40,6 +46,11 @@ export interface SubagentSettings {
   defaultModel?: string;
   /** Thinking level for subagents whose agent file names none. `off` keeps a child from thinking unless something says so. */
   defaultThinking: ThinkingLevel;
+  /**
+   * Show a result in full instead of the collapsed preview: the `subagents` tool card and the full text of a `private`
+   * entry. `false` keeps pi's default (a 10-line preview until `Ctrl+O`).
+   */
+  expandResults: boolean;
 }
 
 export const DEFAULT_SETTINGS: SubagentSettings = Object.freeze({
@@ -53,8 +64,12 @@ export const DEFAULT_SETTINGS: SubagentSettings = Object.freeze({
   defaultRunner: "sdk",
   contextRatio: 0.3,
   pendingResultTimeoutMinutes: 30,
+  toolIdleTimeoutMinutes: 45,
+  turnHardTimeoutMinutes: 0,
+  interruptGraceSeconds: 20,
   mentionQuoteMaxChars: 2000,
   defaultThinking: "off",
+  expandResults: false,
 });
 
 const LIMIT_KEYS = ["maxConcurrent", "maxChildrenPerParent", "maxDepth", "maxResident", "maxParallelTasks", "maxChainSteps"] as const;
@@ -71,6 +86,19 @@ export function parseSettings(raw: unknown): { settings: SubagentSettings; warni
     return { settings, warnings };
   }
   const input = raw as Record<string, unknown>;
+
+  for (const key of ["toolIdleTimeoutMinutes", "turnHardTimeoutMinutes"] as const) {
+    if (input[key] === undefined) continue;
+    const value = input[key];
+    if (typeof value === "number" && Number.isInteger(value) && value >= 0) settings[key] = value;
+    else warnings.push(`${key} must be a non-negative integer; using ${DEFAULT_SETTINGS[key]}`);
+  }
+
+  if (input.interruptGraceSeconds !== undefined) {
+    const value = input.interruptGraceSeconds;
+    if (typeof value === "number" && Number.isInteger(value) && value > 0) settings.interruptGraceSeconds = value;
+    else warnings.push(`interruptGraceSeconds must be a positive integer; using ${DEFAULT_SETTINGS.interruptGraceSeconds}`);
+  }
 
   for (const key of LIMIT_KEYS) {
     if (input[key] === undefined) continue;
@@ -118,6 +146,12 @@ export function parseSettings(raw: unknown): { settings: SubagentSettings; warni
     const value = input.defaultThinking;
     if (isThinkingLevel(value)) settings.defaultThinking = value;
     else warnings.push(`defaultThinking must be one of ${THINKING_LEVELS.join(", ")}; using ${DEFAULT_SETTINGS.defaultThinking}`);
+  }
+
+  if (input.expandResults !== undefined) {
+    const value = input.expandResults;
+    if (typeof value === "boolean") settings.expandResults = value;
+    else warnings.push(`expandResults must be a boolean; using ${DEFAULT_SETTINGS.expandResults}`);
   }
 
   return { settings, warnings };

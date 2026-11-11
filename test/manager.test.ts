@@ -34,6 +34,8 @@ function setup(
     trustForCwd?: (cwd: string) => boolean | undefined;
     /** Context window of a given agent's model; used by chain steps to size `{previous}`. */
     agentWindow?: (agent: AgentDef) => number | undefined;
+    /** Injectable clock for the stall budgets. */
+    now?: () => number;
   } = {},
 ) {
   const root = tempDir("mgr-");
@@ -64,6 +66,7 @@ function setup(
     outputDir: opts.outputDir ?? join(root, "out"),
     ...(opts.trustForCwd ? { trustForCwd: opts.trustForCwd } : {}),
     ...(opts.agentWindow ? { receiverContextWindowFor: opts.agentWindow } : {}),
+    ...(opts.now ? { now: opts.now } : {}),
     onSettled: (info) => settled.push(info),
   });
   return { manager, runner, sent, entries, settled, root };
@@ -1260,5 +1263,21 @@ describe("resident children", () => {
     expect(runner.sessions.filter((s) => !s.disposed)).toHaveLength(1);
     expect(runner.sessions.filter((s) => s.disposed).every((s) => s.disposeDone)).toBe(true);
     await manager.shutdown();
+  });
+});
+
+describe("live activity", () => {
+  it("reports the running child's phase and forgets it once the run ends", async () => {
+    const { manager, runner } = setup({ hold: true, scripts: [[]] });
+    const pending = manager.run({ agent: "reviewer", task: "go" });
+    await vi.waitFor(() => expect(manager.activitySnapshot().size).toBe(1));
+    expect([...manager.activitySnapshot().values()][0]?.label).toBe("model");
+
+    runner.sessions[0]!.emitActivity({ phase: "tool", toolCallId: "call_1", toolName: "bash", progress: false });
+    expect([...manager.activitySnapshot().values()]).toEqual([expect.objectContaining({ label: "bash" })]);
+
+    runner.sessions[0]!.finish();
+    await pending;
+    expect(manager.activitySnapshot().size).toBe(0);
   });
 });
