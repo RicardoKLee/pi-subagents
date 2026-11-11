@@ -206,6 +206,11 @@ interface Live {
    */
   release?: () => void;
   /**
+   * The grant `execute` was handed for this run, before any delegation swapped it. Kept so `abandon()` can release the
+   * slot of a job whose `finally` will never run (a child that never settles after an abort).
+   */
+  ownRelease?: () => void;
+  /**
    * How many foreground delegations have given up this run's slot and are still waiting on a child. The first one
    * releases the slot (0 -> 1) and the last one to finish re-acquires it (1 -> 0); concurrent delegations from one
    * parent therefore share a single yielded grant instead of each releasing and re-acquiring its own, which deadlocked
@@ -1866,6 +1871,7 @@ export class SubagentManager {
       session,
       asks: options.asks ?? asks,
       release,
+      ownRelease: release,
       activity: { phase: "model", phaseSince: now, turnStartedAt: now, tools: new Map() },
     };
     this.live.set(record.id, live);
@@ -1888,10 +1894,29 @@ export class SubagentManager {
         }
         return;
       }
+      if (activity.phase === "tool-end") {
+        // Only this call is over: a parallel call of the same assistant message may still be running (F10), and it must
+        // keep its own budget instead of losing every in-flight entry.
+        state.tools.delete(activity.toolCallId);
+        const next = state.tools.values().next().value;
+        if (next) {
+          if (state.phase !== "tool") {
+            state.phase = "tool";
+            state.phaseSince = stamp;
+          }
+          state.toolName = next.name;
+          return;
+        }
+        // The last in-flight call ended: the run is back to waiting for the model.
+        state.phase = "model";
+        state.toolName = undefined;
+        state.phaseSince = stamp;
+        return;
+      }
       state.phase = activity.phase;
       state.toolName = undefined;
       state.phaseSince = stamp;
-      // A finished turn (or the end of a tool call) leaves no call in flight.
+      // A new model request or the end of the turn leaves no call in flight.
       state.tools.clear();
     });
     const batch = options.mode === "batch";
@@ -1935,7 +1960,8 @@ export class SubagentManager {
         } catch {
           // A broken session simply leaves the previous leaf in place.
         }
-        this.live.delete(record.id);
+        // A restart may already have put a new run of the same record live; the old run must not remove its bookkeeping.
+        if (this.live.get(record.id) === live) this.live.delete(record.id);
         markFinished?.();
         // Nothing is left to watch: the interval must not outlive the last live child.
         if (!this.live.size) this.stopStallWatch();
@@ -2301,15 +2327,19 @@ export class SubagentManager {
     } catch {
       // The record stays paused in memory even when persisting fails.
     }
-    const note = `@${settled.handle} paused: ${message}`;
+    // The waiting caller gets an actionable line: the record is paused, and rerunning it is `restart` (spec §3.5).
+    const note = `@${settled.handle} paused: did not settle after abort; use restart (the child may still be running)`;
     try {
       live.settle?.({ record: settled, payload: { text: note, summary: note } });
     } catch {
       // A settle callback must never throw into the watchdog.
     }
     if (live.job) this.work.delete(live.job);
-    this.live.delete(record.id);
-    // The job of an abandoned run may never settle, so its `finally` never runs: stop the watchdog here instead.
+    // A restart may already own this record's live slot; never remove the new run's entry here.
+    if (this.live.get(record.id) === live) this.live.delete(record.id);
+    // The job of an abandoned run may never settle, so its `finally` never runs: release its slot and stop the watchdog
+    // here instead (the scheduler makes a repeated release a no-op, so a late `finally` is harmless).
+    (live.release ?? live.ownRelease)?.();
     if (!this.live.size) this.stopStallWatch();
     void this.close(record.id, live.session);
     this.maybeStopMailbox();

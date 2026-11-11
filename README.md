@@ -192,7 +192,8 @@ returns. Three budgets bound that, all in the settings file:
 Only a pause is ever automatic — never a stop, never an automatic resume, never a delivery. The tool call that was
 waiting then returns with the record `paused`, and the reason is kept in the record's `error`
 (`stalled: bash produced no progress for 45m (tool call call_8699…)`), so `/subagents list` and the notification say
-what happened. From there the choice is yours: `resume` continues the same context, `restart` clears it and reruns the
+what happened. A child that never settles after the abort makes the call return `paused: did not settle after abort;
+use restart`. From there the choice is yours: `resume` continues the same context, `restart` clears it and reruns the
 task, `stop` ends the record. Parallel tool calls are judged per call, so one chatty call never keeps a silent one alive.
 
 When the main agent may stop things: while it has a turn. A foreground `run`/`parallel`/`chain`/`resume` holds the turn,

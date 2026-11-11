@@ -129,7 +129,8 @@ export class SdkChildSession implements ChildSession {
           listener({ phase: "tool", toolCallId: event.toolCallId, toolName: event.toolName, progress: hasPartialText(event.partialResult) });
           break;
         case "tool_execution_end":
-          listener({ phase: "model" });
+          // One call finished, not necessarily the whole message: the manager drops exactly this id (F10).
+          listener({ phase: "tool-end", toolCallId: event.toolCallId });
           break;
         case "agent_settled":
           listener({ phase: "idle" });

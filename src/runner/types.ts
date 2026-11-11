@@ -39,13 +39,15 @@ export interface ChildSpec {
 
 /**
  * A phase change of one child turn: `model` while a model request or the turn itself is in flight, `tool` while a
- * tool call runs, `idle` once the turn settled. `progress` is false when the tool reported nothing new (bash's
- * start-only empty update), so a caller never mistakes a start announcement for real output.
+ * tool call runs, `tool-end` when exactly one call finished (the others of the same message may still run), `idle`
+ * once the turn settled. `progress` is false when the tool reported nothing new (bash's start-only empty update), so a
+ * caller never mistakes a start announcement for real output.
  */
 export type ChildActivity =
   | { phase: "model" }
   | { phase: "idle" }
-  | { phase: "tool"; toolCallId: string; toolName: string; progress: boolean };
+  | { phase: "tool"; toolCallId: string; toolName: string; progress: boolean }
+  | { phase: "tool-end"; toolCallId: string };
 
 export interface ChildResult {
   text: string;

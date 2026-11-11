@@ -124,7 +124,8 @@ class RpcChildSession implements ChildSession {
       } else if (event.type === "tool_execution_update") {
         listener({ phase: "tool", toolCallId: String(event.toolCallId), toolName: String(event.toolName), progress: hasPartialText(event.partialResult) });
       } else if (event.type === "tool_execution_end") {
-        listener({ phase: "model" });
+        // One call finished, not necessarily the whole message: the manager drops exactly this id (F10).
+        listener({ phase: "tool-end", toolCallId: String(event.toolCallId) });
       } else if (event.type === "message_start" || event.type === "message_update") {
         listener({ phase: "model" });
       } else if (event.type === "agent_settled") {

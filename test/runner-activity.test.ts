@@ -59,8 +59,9 @@ describe("runner activity (rpc)", () => {
       ["call_1", "bash", true],
       ["call_1", "bash", false],
     ]);
-    // tool_execution_end returns the child to the model phase, and the settled turn ends idle.
-    expect(seen.some((a) => a.phase === "model")).toBe(true);
+    // tool_execution_end names the call that finished (other calls of the same message may still run), and the settled
+    // turn ends idle.
+    expect(seen.filter((a) => a.phase === "tool-end")).toEqual([{ phase: "tool-end", toolCallId: "call_1" }]);
     expect(seen.at(-1)).toEqual({ phase: "idle" });
   });
 });
