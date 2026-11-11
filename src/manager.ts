@@ -203,6 +203,25 @@ interface Live {
    * two parallel calls under maxConcurrent 1 (REVIEW-046).
    */
   yielding?: number;
+  /** Where this run is and how long it has been there; drives the stall budgets and the `/subagents` phase label. */
+  activity: LiveActivity;
+}
+
+/**
+ * One run's phase bookkeeping. Tool calls are tracked per `toolCallId` because a single assistant message may run
+ * several in parallel (pi runs them concurrently): a shared "current tool" would let one call's output keep another
+ * alive. `turnStartedAt` is the only clock the hard budget reads, and nothing refreshes it.
+ */
+interface LiveActivity {
+  phase: "model" | "tool" | "idle";
+  /** Tool name of the current phase, when `phase === "tool"` (falls back to the last started call). */
+  toolName?: string;
+  /** When the current phase began (model/tool transitions). */
+  phaseSince: number;
+  /** When this turn began; never refreshed (the hard budget counts from here). */
+  turnStartedAt: number;
+  /** In-flight tool calls by id: `lastProgressAt` moves only on a non-empty partial result. */
+  tools: Map<string, { name: string; startedAt: number; lastProgressAt: number }>;
 }
 
 export class SubagentManager {
@@ -242,6 +261,16 @@ export class SubagentManager {
   /** Chains on the current branch, in creation order (for the list tree). */
   listChains(): ChainRecord[] {
     return this.deps.chainStore.list();
+  }
+
+  /** Live-only phase labels for `/subagents`; a record with no run in this process has no entry. */
+  activitySnapshot(): Map<string, { label: string; since: number }> {
+    const out = new Map<string, { label: string; since: number }>();
+    for (const [id, live] of this.live) {
+      const { phase, toolName, phaseSince } = live.activity;
+      out.set(id, { label: phase === "tool" ? (toolName ?? "tool") : phase, since: phaseSince });
+    }
+    return out;
   }
 
   /**
@@ -518,7 +547,7 @@ export class SubagentManager {
       const records = this.descendants(parent.id);
       const ids = new Set(records.map((r) => r.id));
       const chains = this.listChains().filter((c) => c.stepRecordIds.some((id) => ids.has(id)));
-      return { text: renderTree(records, "list", chains), details: { count: records.length } };
+      return { text: renderTree(records, "list", chains, Date.now(), this.activitySnapshot()), details: { count: records.length } };
     }
     // Mass actions have no handle to scope, and a child has no business ending the tree it lives in; `DELEGATION_ACTIONS`
     // is derived from `SUBAGENT_ACTIONS`, so the refusal must be explicit here rather than by omitting the action.
@@ -1534,9 +1563,38 @@ export class SubagentManager {
     asks: Ask[] = [],
     options: LaunchOptions = {},
   ): Promise<RunOutcome> {
-    const live: Live = { session, asks: options.asks ?? asks, release };
+    const now = this.now();
+    const live: Live = {
+      session,
+      asks: options.asks ?? asks,
+      release,
+      activity: { phase: "model", phaseSince: now, turnStartedAt: now, tools: new Map() },
+    };
     this.live.set(record.id, live);
     this.evictIdle();
+    // Phase bookkeeping for the stall budgets and `/subagents`; a runner without `onActivity` simply never reports.
+    const unwatch = session.onActivity?.((activity) => {
+      const stamp = this.now();
+      const state = live.activity;
+      if (activity.phase === "tool") {
+        const call = state.tools.get(activity.toolCallId) ?? { name: activity.toolName, startedAt: stamp, lastProgressAt: stamp };
+        call.name = activity.toolName;
+        // Only real output counts as progress: bash sends an empty update the moment it starts (F7).
+        if (activity.progress) call.lastProgressAt = stamp;
+        state.tools.set(activity.toolCallId, call);
+        if (state.phase !== "tool" || state.toolName !== activity.toolName) {
+          state.phase = "tool";
+          state.toolName = activity.toolName;
+          state.phaseSince = stamp;
+        }
+        return;
+      }
+      state.phase = activity.phase;
+      state.toolName = undefined;
+      state.phaseSince = stamp;
+      // A finished turn (or the end of a tool call) leaves no call in flight.
+      state.tools.clear();
+    });
     const batch = options.mode === "batch";
     // Only a foreground single call is still waiting on its tool signal; a background or batch call runs detached.
     const callSignal = background || batch ? undefined : signal;
@@ -1554,6 +1612,7 @@ export class SubagentManager {
       } catch (error) {
         result = { text: "", stopReason: "error", errorMessage: (error as Error).message, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } };
       } finally {
+        unwatch?.();
         callSignal?.removeEventListener("abort", onCallAbort);
         try {
           leafId = session.leafId;

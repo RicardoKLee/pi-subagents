@@ -67,7 +67,7 @@ function waitCell(record: SubagentRecord, now: number): string {
   return `(${pending.length} results waiting · ${waitDuration(Math.max(0, Math.floor((now - oldest) / 60_000)))})`;
 }
 
-function cells(node: Node, view: TreeView, now: number): string[] {
+function cells(node: Node, view: TreeView, now: number, activity: ActivityMap | undefined): string[] {
   const r = node.record;
   const waiting = waitCell(r, now);
   if (view === "cost") {
@@ -77,7 +77,10 @@ function cells(node: Node, view: TreeView, now: number): string[] {
   }
   const cost = node.children.length ? `${money(r.usage.cost)} (subtree ${money(subtree(node).cost)})` : money(r.usage.cost);
   const error = r.error ? r.error.split("\n")[0]!.slice(0, 60) : "";
-  return [`@${r.handle}`, recordEntryLabel(r), `run ${r.runId}`, cost, error, `[${r.status}]`, waiting];
+  const live = activity?.get(r.id);
+  // A live run shows where it is and for how long: `[running] · bash 45m`.
+  const status = live ? `[${r.status}] · ${live.label} ${waitDuration(Math.max(0, Math.floor((now - live.since) / 60_000)))}` : `[${r.status}]`;
+  return [`@${r.handle}`, recordEntryLabel(r), `run ${r.runId}`, cost, error, status, waiting];
 }
 
 function chainCells(group: { chain: ChainRecord; index: number; nodes: readonly Node[] }, view: TreeView): string[] {
@@ -91,13 +94,22 @@ function chainCells(group: { chain: ChainRecord; index: number; nodes: readonly 
   return [label, `${chain.steps.length} steps`, progress, money(total.cost), error, `[${chain.status}]`];
 }
 
+/** What `/subagents` shows for a record with a live run: the phase label and when that phase began. */
+export type ActivityMap = Map<string, { label: string; since: number }>;
+
 /** pstree-style tree of subagents under the main session; chain steps are grouped under their chain header. */
-export function renderTree(records: readonly SubagentRecord[], view: TreeView, chains: readonly ChainRecord[] = [], now: number = Date.now()): string {
+export function renderTree(
+  records: readonly SubagentRecord[],
+  view: TreeView,
+  chains: readonly ChainRecord[] = [],
+  now: number = Date.now(),
+  activity?: ActivityMap,
+): string {
   if (!records.length && !chains.length) return "No subagents yet.";
   const rows: { prefix: string; cells: string[] }[] = [];
 
   function pushNode(node: Node, indent: string, last: boolean): void {
-    rows.push({ prefix: `${indent}${last ? "└─ " : "├─ "}`, cells: cells(node, view, now) });
+    rows.push({ prefix: `${indent}${last ? "└─ " : "├─ "}`, cells: cells(node, view, now, activity) });
     walkForest(node.children, `${indent}${last ? "   " : "│  "}`);
   }
 

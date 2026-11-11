@@ -332,6 +332,21 @@ describe("renderTree with chains", () => {
   });
 });
 
+describe("renderTree activity", () => {
+  it("shows the current phase and how long it has been there", () => {
+    const record = rec({ handle: "worker", createdAt: 1_000_000, status: "running" });
+    const now = record.createdAt + 45 * 60_000;
+    const text = renderTree([record], "list", [], now, new Map([[record.id, { label: "bash", since: now - 45 * 60_000 }]]));
+    expect(text).toContain("[running] · bash 45m");
+  });
+
+  it("leaves the status cell alone for a record with no live run", () => {
+    const record = rec({ handle: "worker", createdAt: 1_000_000, status: "running" });
+    const text = renderTree([record], "list", [], record.createdAt, new Map());
+    expect(text.split("\n")[1]).toMatch(/\[running\]$/);
+  });
+});
+
 describe("renderTree cost", () => {
   it("shows token columns and a total", () => {
     const text = renderTree(

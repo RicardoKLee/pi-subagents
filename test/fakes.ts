@@ -1,5 +1,5 @@
 import type { Usage } from "../src/registry.ts";
-import type { ChildResult, ChildSession, ChildSpec, Runner } from "../src/runner/types.ts";
+import type { ChildActivity, ChildResult, ChildSession, ChildSpec, Runner } from "../src/runner/types.ts";
 
 export const usage = (cost = 0.01): Usage => ({ input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost });
 
@@ -18,6 +18,7 @@ export class FakeSession implements ChildSession {
   /** True once a dispose() call has finished; `disposed` turns true as soon as dispose() is called. */
   disposeDone = false;
   private readonly exitListeners: ((reason: string) => void)[] = [];
+  private readonly activityListeners = new Set<(a: ChildActivity) => void>();
   private pending?: (r: ChildResult) => void;
   private held?: ChildResult;
 
@@ -34,6 +35,16 @@ export class FakeSession implements ChildSession {
       const i = this.exitListeners.indexOf(listener);
       if (i >= 0) this.exitListeners.splice(i, 1);
     };
+  }
+
+  onActivity(listener: (a: ChildActivity) => void): () => void {
+    this.activityListeners.add(listener);
+    return () => this.activityListeners.delete(listener);
+  }
+
+  /** Test hook: emit one activity record to every listener. */
+  emitActivity(activity: ChildActivity): void {
+    for (const listener of this.activityListeners) listener(activity);
   }
 
   /** Simulates the child dying on its own (crash, killed process). */

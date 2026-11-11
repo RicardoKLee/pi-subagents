@@ -1262,3 +1262,19 @@ describe("resident children", () => {
     await manager.shutdown();
   });
 });
+
+describe("live activity", () => {
+  it("reports the running child's phase and forgets it once the run ends", async () => {
+    const { manager, runner } = setup({ hold: true, scripts: [[]] });
+    const pending = manager.run({ agent: "reviewer", task: "go" });
+    await vi.waitFor(() => expect(manager.activitySnapshot().size).toBe(1));
+    expect([...manager.activitySnapshot().values()][0]?.label).toBe("model");
+
+    runner.sessions[0]!.emitActivity({ phase: "tool", toolCallId: "call_1", toolName: "bash", progress: false });
+    expect([...manager.activitySnapshot().values()]).toEqual([expect.objectContaining({ label: "bash" })]);
+
+    runner.sessions[0]!.finish();
+    await pending;
+    expect(manager.activitySnapshot().size).toBe(0);
+  });
+});
