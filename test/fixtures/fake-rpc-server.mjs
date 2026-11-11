@@ -50,7 +50,9 @@ function handle(cmd) {
       respond(cmd, { disposition: "started" });
       leaf = `leaf-${n + 1}`;
       if (mode === "activity") {
-        // The tool-event stream a real child emits: one start, real progress, bash's empty start update, then end.
+        // The tool-event stream a real child emits: the assistant message opens, one start, real progress, bash's empty
+        // start update, then the end of that single call.
+        write({ type: "message_start", message: { role: "assistant" } });
         write({ type: "tool_execution_start", toolCallId: "call_1", toolName: "bash", args: { command: "sleep 1" } });
         write({ type: "tool_execution_update", toolCallId: "call_1", toolName: "bash", args: {}, partialResult: { content: [{ type: "text", text: "building" }] } });
         write({ type: "tool_execution_update", toolCallId: "call_1", toolName: "bash", args: {}, partialResult: { content: [] } });

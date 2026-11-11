@@ -20,6 +20,8 @@ const ok = (text: string): ChildResult => ({ text, stopReason: "stop", usage: us
 interface LiveLike {
   intent?: string;
   abandoned?: boolean;
+  /** The grant `execute` currently holds; `undefined` while a delegation has yielded it (REVIEW-046). */
+  release?: () => void;
 }
 
 function setup(opts: { scripts?: ChildResult[][]; hold?: boolean; limit?: number; settings?: Partial<SubagentSettings>; now?: () => number } = {}) {
@@ -123,6 +125,37 @@ describe("REVIEW-002: a late settle of an abandoned run leaves the new run alone
   });
 });
 
+describe("REVIEW-001: the release stays safe around a delegation yield", () => {
+  it("never takes the waiting child's slot, and a late release is a no-op", async () => {
+    const { manager, registry, runner, scheduler } = setup({ limit: 1, hold: true, settings: { interruptGraceSeconds: 1 } });
+    const parent = await manager.run({ agent: "reviewer", task: "parent", background: true });
+    await vi.waitFor(() => expect(runner.sessions).toHaveLength(1));
+    expect(scheduler.running).toBe(1);
+
+    // A foreground delegation gives the parent's slot up while it waits (REVIEW-046); the child takes it.
+    const delegating = manager.delegate(parent.record.id, { action: "run", agent: "reviewer", task: "kid" });
+    await vi.waitFor(() => expect(runner.sessions).toHaveLength(2));
+    expect(scheduler.running).toBe(1);
+    const live = liveMap(manager).get(parent.record.id)!;
+    expect(live.release).toBeUndefined(); // the yield swapped the parent's own release closure out
+
+    // The parent is abandoned while it is yielded: its own grant is already back, so this must not touch the child's.
+    abandon(manager, registry.get(parent.record.id)!, live, "stalled: the turn exceeded 10m");
+    expect(scheduler.running).toBe(1);
+    expect(registry.get(parent.record.id)!.status).toBe("paused");
+
+    // The child finishes and hands its slot back; the delegation then re-acquires for a parent that no longer exists.
+    runner.sessions[1]!.finish();
+    await delegating;
+    expect(scheduler.running).toBe(0);
+
+    // The abandoned parent's own job finally settles: one more release, which must not go negative.
+    runner.sessions[0]!.finish();
+    await manager.whenIdle();
+    expect(scheduler.running).toBe(0);
+  });
+});
+
 describe("REVIEW-003: one tool ending keeps the other calls' budget", () => {
   it("judges the still-silent call of the same message", async () => {
     const clock = { t: 1_000_000 };
@@ -145,6 +178,50 @@ describe("REVIEW-003: one tool ending keeps the other calls' budget", () => {
     await vi.waitFor(() => expect(registry.list()[0]!.status).toBe("paused"));
     expect(registry.list()[0]!.error).toMatch(/bash/);
     expect(registry.list()[0]!.error).not.toMatch(/read/);
+    await out;
+  });
+
+  it("ignores a tool-end for a call it never saw", async () => {
+    const clock = { t: 1_000_000 };
+    const { manager, registry, runner } = setup({ hold: true, now: () => clock.t, settings: { toolIdleTimeoutMinutes: 10, interruptGraceSeconds: 1 } });
+    const out = manager.run({ agent: "reviewer", task: "ghost end" });
+    await vi.waitFor(() => expect(manager.activitySnapshot().size).toBe(1));
+    const session = runner.sessions[0]!;
+    session.emitActivity({ phase: "tool", toolCallId: "b", toolName: "bash", progress: false });
+    clock.t += 2 * 60_000;
+    session.emitActivity({ phase: "tool", toolCallId: "a", toolName: "read", progress: false });
+    clock.t += 9 * 60_000; // bash is 11m old, read 9m
+
+    session.emitActivity({ phase: "tool-end", toolCallId: "ghost" });
+
+    // A stale id deletes nothing: the phase stays a tool phase and neither call loses its deadline.
+    expect([...manager.activitySnapshot().values()][0]?.label).not.toBe("model");
+    expect(manager.checkStalls()).toBe(1);
+    await vi.waitFor(() => expect(registry.list()[0]!.status).toBe("paused"));
+    expect(registry.list()[0]!.error).toMatch(/bash/);
+    await out;
+  });
+
+  it("gives the next call its own clock once the table is empty", async () => {
+    const clock = { t: 1_000_000 };
+    const { manager, registry, runner } = setup({ hold: true, now: () => clock.t, settings: { toolIdleTimeoutMinutes: 10, interruptGraceSeconds: 1 } });
+    const out = manager.run({ agent: "reviewer", task: "sequential tools" });
+    await vi.waitFor(() => expect(manager.activitySnapshot().size).toBe(1));
+    const session = runner.sessions[0]!;
+    session.emitActivity({ phase: "tool", toolCallId: "first", toolName: "bash", progress: false });
+    clock.t += 9 * 60_000;
+    session.emitActivity({ phase: "tool-end", toolCallId: "first" });
+    expect([...manager.activitySnapshot().values()][0]?.label).toBe("model");
+
+    session.emitActivity({ phase: "tool", toolCallId: "second", toolName: "read", progress: false });
+    clock.t += 2 * 60_000; // 11m since the first call began, 2m since this one
+    expect(manager.checkStalls()).toBe(0); // the finished call left no deadline behind
+
+    clock.t += 9 * 60_000; // 11m since this call began
+    expect(manager.checkStalls()).toBe(1);
+    await vi.waitFor(() => expect(registry.list()[0]!.status).toBe("paused"));
+    expect(registry.list()[0]!.error).toMatch(/read/);
+    expect(registry.list()[0]!.error).not.toMatch(/bash/);
     await out;
   });
 
