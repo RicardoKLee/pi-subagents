@@ -285,7 +285,7 @@ and a read-only snapshot `<sessionDir>/<sessionId>.subagents.json` (never used f
 
 ## Known limits
 
-- Esc pauses subagents only while a single foreground `subagents` call is executing: Esc (and any caller abort) cascades into `interruptAll()`. The items of a foreground `parallel`, `chain` or `continue` do not receive the caller's signal — only `waitMinutes` reaches a batch — so while such a call blocks the turn, only the stall budgets, `/subagents …` or `ctrl+shift+x` can release it. Background children keep running after Esc; use `interrupt` or `stop`.
+- Esc (or any abort of the calling tool) pauses exactly the runs that call is waiting on — including every item of a foreground `parallel`, `chain` or `continue`; a chain then starts no further step — and the call returns. Background children never take the caller's signal and keep running after Esc; use `interrupt` or `stop` for them. While the main agent is blocked, only the stall budgets, `waitMinutes`, `/subagents …` or `ctrl+shift+x` can release it.
 - An interrupt/stop sent by the main agent needs a turn of its own. While it is blocked in a foreground `run`, `parallel`, `chain`, `resume` or `continue`, only the stall budgets, `/subagents …` and `ctrl+shift+x` can release it.
 - A long **silent** tool (a remote build, `git fetch`, a watcher) is paused once `toolIdleTimeoutMinutes` passes with no output. That is the deliberate trade-off: the cost is one pause and a `resume`, the gain is that an endless wait is bounded. Raise the value or set it to `0` to disable that budget.
 - A subagent stuck inside a tool call is better `restart`ed than `resume`d: resuming hands the same wedged state back.
