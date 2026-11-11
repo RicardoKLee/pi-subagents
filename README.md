@@ -284,11 +284,12 @@ and a read-only snapshot `<sessionDir>/<sessionId>.subagents.json` (never used f
 
 ## Known limits
 
-- Esc pauses subagents only while the `subagents` tool call is executing. Background children keep running after Esc; use `interrupt` or `stop`.
+- Esc pauses subagents only while a single foreground `subagents` call is executing: Esc (and any caller abort) cascades into `interruptAll()`. The items of a foreground `parallel`, `chain` or `continue` do not receive the caller's signal — only `waitMinutes` reaches a batch — so while such a call blocks the turn, only the stall budgets, `/subagents …` or `ctrl+shift+x` can release it. Background children keep running after Esc; use `interrupt` or `stop`.
 - An interrupt/stop sent by the main agent needs a turn of its own. While it is blocked in a foreground `run`, `parallel`, `chain`, `resume` or `continue`, only the stall budgets, `/subagents …` and `ctrl+shift+x` can release it.
 - A long **silent** tool (a remote build, `git fetch`, a watcher) is paused once `toolIdleTimeoutMinutes` passes with no output. That is the deliberate trade-off: the cost is one pause and a `resume`, the gain is that an endless wait is bounded. Raise the value or set it to `0` to disable that budget.
 - A subagent stuck inside a tool call is better `restart`ed than `resume`d: resuming hands the same wedged state back.
-- An abandoned run of an in-process (SDK) child cannot be killed; its record stays `paused` and its pending work lives in the parent process until it exits. An RPC child is killed.
+- An abandoned run of an in-process (SDK) child cannot be killed; its record stays `paused` and its pending work lives in the parent process until it exits. An RPC child is killed. Abandoning hands the scheduler slot back at once, so that still-running in-process child no longer counts against `maxConcurrent` (the limit can be oversold for a while), and `stop-all` does not reclaim it because its record is already `paused`.
+- `interrupt`, `interrupt-all` and `stop` only ask the child to abort; they do not arm the abandonment grace window. A child that ignores the abort keeps its run: after an `interrupt` only the `toolIdleTimeoutMinutes` budget can still abandon it, while `stop` has no automatic fallback, so `whenIdle()` and session shutdown then wait until that child returns on its own.
 - After `/fork` or `/tree`, each branch resumes a subagent from the point its own record last ended, so branches do not see each other's later turns. Their turns are written to the same child session file as separate branches; two pi processes resuming the same handle at the same time write to that file without a lock.
 - Without a session directory (in-memory session), child sessions and outputs go to `<tmpdir>/pi-subagents/<sessionId>/` and no snapshot is written.
 - `private` results are visible only in the TUI; in print, JSON or RPC mode they are not displayed.
