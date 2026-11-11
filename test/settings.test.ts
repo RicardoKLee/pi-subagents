@@ -86,6 +86,29 @@ describe("parseSettings", () => {
   });
 });
 
+describe("the stall-control budgets", () => {
+  it("defaults: toolIdle 45, turnHard off, grace 20", () => {
+    const { settings } = parseSettings({});
+    expect([settings.toolIdleTimeoutMinutes, settings.turnHardTimeoutMinutes, settings.interruptGraceSeconds]).toEqual([45, 0, 20]);
+  });
+
+  it("parses the stall-control settings and rejects bad values", () => {
+    const { settings, warnings } = parseSettings({ toolIdleTimeoutMinutes: 10, turnHardTimeoutMinutes: 0, interruptGraceSeconds: 5 });
+    expect(settings.toolIdleTimeoutMinutes).toBe(10);
+    expect(settings.turnHardTimeoutMinutes).toBe(0);
+    expect(settings.interruptGraceSeconds).toBe(5);
+    expect(warnings).toEqual([]);
+
+    const bad = parseSettings({ toolIdleTimeoutMinutes: -1, turnHardTimeoutMinutes: 1.5, interruptGraceSeconds: 0 });
+    expect(bad.settings.toolIdleTimeoutMinutes).toBe(DEFAULT_SETTINGS.toolIdleTimeoutMinutes);
+    expect(bad.settings.turnHardTimeoutMinutes).toBe(DEFAULT_SETTINGS.turnHardTimeoutMinutes);
+    expect(bad.settings.interruptGraceSeconds).toBe(DEFAULT_SETTINGS.interruptGraceSeconds);
+    expect(bad.warnings.join("\n")).toMatch(/toolIdleTimeoutMinutes/);
+    expect(bad.warnings.join("\n")).toMatch(/turnHardTimeoutMinutes/);
+    expect(bad.warnings.join("\n")).toMatch(/interruptGraceSeconds/);
+  });
+});
+
 describe("the model and thinking defaults", () => {
   it("leaves defaultModel unset and thinking off out of the box", () => {
     const { settings, warnings } = parseSettings({});
