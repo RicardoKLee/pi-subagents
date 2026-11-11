@@ -17,6 +17,11 @@ export class FakeSession implements ChildSession {
   disposeDelayMs = 0;
   /** True once a dispose() call has finished; `disposed` turns true as soon as dispose() is called. */
   disposeDone = false;
+  /**
+   * Tests set this to simulate a tool that ignores the abort signal: `abort()` resolves but the held `prompt()` stays
+   * pending, like an in-process SDK child that cannot be killed.
+   */
+  abortNeverSettles = false;
   private readonly exitListeners: ((reason: string) => void)[] = [];
   private readonly activityListeners = new Set<(a: ChildActivity) => void>();
   private pending?: (r: ChildResult) => void;
@@ -80,6 +85,7 @@ export class FakeSession implements ChildSession {
   /** Mirrors pi: an aborted prompt resolves with stopReason "aborted". */
   async abort(): Promise<void> {
     this.aborted++;
+    if (this.abortNeverSettles) return;
     const resolve = this.pending;
     this.pending = undefined;
     resolve?.({ text: "", stopReason: "aborted", usage: usage(0) });

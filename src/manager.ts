@@ -205,6 +205,12 @@ interface Live {
   yielding?: number;
   /** Where this run is and how long it has been there; drives the stall budgets and the `/subagents` phase label. */
   activity: LiveActivity;
+  /** Releases a foreground caller that is racing this run with `job`; `abandon` resolves it with the paused record. */
+  settle?: (outcome: RunOutcome) => void;
+  /** Set once the run was declared paused because it would not settle after an abort; a late result is ignored. */
+  abandoned?: boolean;
+  /** This run's own job, so `abandon` can stop it keeping `whenIdle()`/`shutdown()` alive. */
+  job?: Promise<unknown>;
 }
 
 /**
@@ -1602,6 +1608,9 @@ export class SubagentManager {
       live.intent = "interrupt";
       void session.abort().catch(() => {});
     };
+    let settle: ((outcome: RunOutcome) => void) | undefined;
+    const abandoned = new Promise<RunOutcome>((resolve) => (settle = resolve));
+    live.settle = settle;
     const job = (async (): Promise<RunOutcome> => {
       let result: ChildResult;
       let leafId: string | undefined;
@@ -1644,14 +1653,21 @@ export class SubagentManager {
       }
     })();
     this.work.add(job);
+    live.job = job;
     void job.catch(() => {}).finally(() => this.work.delete(job));
     if (background && !batch) return { record };
-    return job;
+    // A foreground caller must return even when the child never settles after an abort (an in-process SDK child cannot
+    // be killed): `abandon()` resolves this race with the paused record.
+    return Promise.race([job, abandoned]);
   }
 
   private finish(id: string, result: ChildResult, live: Live, background: boolean, leafId?: string, options: LaunchOptions = {}): RunOutcome {
     const registry = this.deps.registry;
     registry.addUsage(id, result.usage);
+    if (live.abandoned) {
+      // The run was declared paused when it would not settle; a late result must not rewrite that status or be delivered.
+      return { record: registry.get(id)!, payload: { text: "", summary: "" } };
+    }
     let status: RunStatus;
     let error: string | undefined;
     if (live.intent === "stop") status = "stopped";
@@ -1955,6 +1971,36 @@ export class SubagentManager {
     }
     await this.closing.get(record.id);
     return undefined;
+  }
+
+  /**
+   * Gives up waiting on a child that did not settle after an abort. The record is paused (still resumable, `restart`
+   * can rerun it), the awaiting foreground call is released, and the wedged job stops keeping `whenIdle()`/`shutdown()`
+   * alive. The session is closed best-effort: an RPC child reaches SIGKILL, an in-process SDK child only drops its
+   * listeners. A late result is ignored by `finish()` except for its usage.
+   */
+  private abandon(record: SubagentRecord, live: Live, reason: string): void {
+    if (live.abandoned) return;
+    live.abandoned = true;
+    // The stored error says both why the run was given up and that it may still be burning CPU: the status is `paused`
+    // but nothing guarantees the child stopped (an SDK child cannot be killed).
+    const message = `${reason}; did not settle after abort, the child may still be running`;
+    let settled = record;
+    try {
+      settled = this.deps.registry.update(record.id, { status: "paused", error: message });
+    } catch {
+      // The record stays paused in memory even when persisting fails.
+    }
+    const note = `@${settled.handle} paused: ${message}`;
+    try {
+      live.settle?.({ record: settled, payload: { text: note, summary: note } });
+    } catch {
+      // A settle callback must never throw into the watchdog.
+    }
+    if (live.job) this.work.delete(live.job);
+    this.live.delete(record.id);
+    void this.close(record.id, live.session);
+    this.maybeStopMailbox();
   }
 
   /** Closes the idle child of a record, if any; resolves once every close of that record has finished. */
