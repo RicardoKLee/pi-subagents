@@ -7,7 +7,7 @@ import { type Ask, deliver, type DeliveryPort, deliverBatch, quoteAsk, renderAsk
 import { BUILTIN_ENTRY_AGENT_DEF, type EntryRequest, parseEntryRequest, type ResolvedEntry, validateEntryTarget } from "./entries.ts";
 import { type MailboxErrorInfo, MailboxServer } from "./mailbox.ts";
 import { estimateTokens, type Payload, preparePayload, SUMMARY_INSTRUCTION, writeOutput } from "./output.ts";
-import { type PendingResult, recordEntryLabel, type Registry, type RunStatus, type SubagentRecord, type Usage, ZERO_USAGE } from "./registry.ts";
+import { type PendingResult, recordEntryLabel, type RecordPatch, type Registry, type RunStatus, type SubagentRecord, type Usage, ZERO_USAGE } from "./registry.ts";
 import type { ChildDelegation, ChildResult, ChildSession, Runner } from "./runner/types.ts";
 import { type Scheduler, SubagentsDisabledError } from "./scheduler.ts";
 import type { DeliveryMode, RunnerKind, SubagentSettings } from "./settings.ts";
@@ -44,7 +44,7 @@ const DELEGATION_ACTIONS = new Set<string>(SUBAGENT_ACTIONS);
  * (REVIEW-046). `list`, `steer`, `interrupt` and `stop` only touch records that already exist and return without
  * starting a run, so they must never release and re-acquire the parent's slot (REVIEW-049).
  */
-const YIELDING_DELEGATION_ACTIONS = new Set<string>(["run", "resume", "continue", "parallel", "chain"]);
+const YIELDING_DELEGATION_ACTIONS = new Set<string>(["run", "resume", "restart", "continue", "parallel", "chain"]);
 
 export interface SettledInfo {
   handle: string;
@@ -1405,6 +1405,176 @@ export class SubagentManager {
     }
   }
 
+  /**
+   * The resume preflight for a restart: a stopped record may restart, and a live/queued one is refused here only when it
+   * has nothing to rerun yet. The session file is deliberately not checked, because a restart opens a new one.
+   */
+  private restartTarget(handle: string): { record: SubagentRecord; agent: AgentDef; runner: Runner; cwd: string; trusted: boolean | undefined } {
+    const record = this.requireRecord(handle);
+    if (record.chainId !== undefined) throw new SubagentError("busy", `@${record.handle} is a chain step; use action=continue to finish its chain`);
+    if (record.status === "queued" || this.queued.has(record.id)) throw new SubagentError("busy", `@${record.handle} is queued and has not started yet`);
+    const base = record.entry ? BUILTIN_ENTRY_AGENT_DEF : this.requireAgent(record.agent);
+    // The model and thinking level stay those the run was created with, exactly as a resume keeps them.
+    const agent = this.effectiveAgent(base, record.model, record.thinking);
+    const runner = this.requireRunner(record.runner);
+    const cwd = this.resolveCwd(record.cwd);
+    return { record, agent, runner, cwd, trusted: this.deps.trustForCwd?.(cwd) };
+  }
+
+  /**
+   * Runs the record's task again in a brand-new child session and keeps the handle: the record moves to `runId + 1` with
+   * `sessionFile` cleared, so the runner creates a fresh session (the old file stays on disk for review). A run that is
+   * still live is halted first, so two runs of one record never overlap. Pending child results are left queued: the new
+   * context knows nothing about them (`drain` hands them over).
+   */
+  async restart(
+    handle: string,
+    opts: { message?: string; background?: boolean; delivery?: DeliveryMode; signal?: AbortSignal } = {},
+  ): Promise<RunOutcome> {
+    if (this.closed) throw shutDownError();
+    // Refuse before halting anything: a queued record has nothing to rerun and a chain step belongs to its chain.
+    this.restartTarget(handle);
+    const target = this.requireRecord(handle);
+    if (this.live.has(target.id) || this.claims.has(target.id) || this.queued.has(target.id) || target.status === "running") await this.halt(target);
+    const { record, agent, runner, cwd, trusted } = this.restartTarget(handle);
+    // The new run must create a fresh session: close the parked child before opening the next one.
+    await this.closeIdle(record.id);
+    const prompt = opts.message ? `${record.task}\n\n${opts.message}` : record.task;
+    // Snapshot taken before the claim so a restart that never opened a session rolls back completely (no "running"
+    // leak, no cleared `sessionFile`).
+    const previous: RecordPatch = {
+      status: record.status,
+      runId: record.runId,
+      sessionFile: record.sessionFile,
+      childLeafId: record.childLeafId,
+      delivery: record.delivery,
+      error: record.error,
+    };
+    const claimed = this.deps.registry.update(record.id, {
+      status: "running",
+      runId: record.runId + 1,
+      sessionFile: "",
+      childLeafId: undefined,
+      delivery: opts.delivery ?? record.delivery,
+      error: undefined,
+    });
+    const claim: { intent?: "stop"; controller: AbortController } = { controller: new AbortController() };
+    this.claims.set(record.id, claim);
+    const signal = opts.signal;
+    const abortClaim = () => claim.controller.abort();
+    if (this.lifetime.signal.aborted || signal?.aborted) abortClaim();
+    else {
+      this.lifetime.signal.addEventListener("abort", abortClaim, { once: true });
+      signal?.addEventListener("abort", abortClaim, { once: true });
+    }
+    const unlinkClaim = () => {
+      this.lifetime.signal.removeEventListener("abort", abortClaim);
+      signal?.removeEventListener("abort", abortClaim);
+    };
+    const stoppedWhileWaiting = () => {
+      this.markStopped(record.id);
+      return new SubagentError("stopped", `@${record.handle} was stopped while restarting`);
+    };
+    const proceed = async (): Promise<RunOutcome> => {
+      let release: () => void;
+      let delegation: ChildDelegation | undefined;
+      let session: ChildSession;
+      try {
+        release = await this.deps.scheduler.acquire(claim.controller.signal);
+        try {
+          delegation = this.delegationSpecFor(record);
+          // No resumeFile/resumeLeafId: a restart never reuses the old context.
+          session = await runner.open({
+            agent,
+            cwd,
+            sessionDir: this.deps.sessionDir,
+            ...(trusted !== undefined ? { projectTrusted: trusted } : {}),
+            appendSystemPrompt: [agent.systemPrompt, SUMMARY_INSTRUCTION].filter(Boolean),
+            ...(delegation ? { delegation } : {}),
+          });
+          if (this.closed) {
+            await this.close(record.id, session);
+            throw shutDownError();
+          }
+          if (signal?.aborted && claim.intent !== "stop") {
+            await this.close(record.id, session);
+            throw new SubagentError("interrupted", `@${record.handle} was interrupted before it restarted`);
+          }
+        } catch (error) {
+          release();
+          throw error;
+        }
+      } catch (error) {
+        unlinkClaim();
+        this.claims.delete(record.id);
+        this.maybeStopMailbox();
+        if (claim.intent === "stop") throw stoppedWhileWaiting();
+        // A restart that never opened a session puts the record back exactly as it was.
+        this.deps.registry.update(record.id, previous);
+        throw error;
+      }
+      unlinkClaim();
+      this.claims.delete(record.id);
+      if (claim.intent === "stop") {
+        release();
+        this.maybeStopMailbox();
+        await this.close(record.id, session);
+        throw stoppedWhileWaiting();
+      }
+      if (delegation?.canDelegate) {
+        try {
+          this.ensureMailbox();
+        } catch (error) {
+          this.maybeStopMailbox();
+          release();
+          await this.close(record.id, session);
+          this.deps.registry.update(record.id, previous);
+          throw error;
+        }
+      }
+      // A resume reuses the record's file, so nothing else writes it; a restart must point the record at the new one.
+      const running = this.deps.registry.update(record.id, { status: "running", sessionFile: session.sessionFile });
+      // Pending child results are deliberately NOT consumed: the new context knows nothing about them.
+      return this.execute(running, session, prompt, release, opts.background ?? false, signal, []);
+    };
+    if (opts.background && !this.deps.scheduler.hasCapacity()) {
+      this.track(proceed());
+      return { record: claimed };
+    }
+    return proceed();
+  }
+
+  /** Halts a live/claiming/queued run with interrupt semantics and waits (bounded) for it to settle. */
+  private async halt(record: SubagentRecord): Promise<void> {
+    try {
+      await this.haltRecord(record, "interrupt");
+    } catch {
+      // A failed abort must not block the restart; waitForSettled abandons the run instead.
+    }
+    await this.waitForSettled(record.id, this.deps.settings().interruptGraceSeconds * 1_000);
+  }
+
+  /**
+   * Waits until no run is live, claiming or queued for `id`, so a new run never overlaps the old one. A child that will
+   * not settle within `ms` is abandoned, which releases the awaiting call and leaves the record paused (restartable).
+   */
+  private async waitForSettled(id: string, ms: number): Promise<void> {
+    const deadline = Date.now() + ms;
+    const busy = () => this.live.has(id) || this.claims.has(id) || this.queued.has(id);
+    while (busy()) {
+      if (Date.now() >= deadline) {
+        const live = this.live.get(id);
+        const record = this.deps.registry.get(id);
+        if (live && record) this.abandon(record, live, "restart stopped waiting for the previous run to settle");
+        return;
+      }
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 25);
+        timer.unref?.();
+      });
+    }
+  }
+
   async steer(
     handle: string,
     message: string,
@@ -1542,8 +1712,8 @@ export class SubagentManager {
     }
   }
 
-  /** Stops one record's own run; its descendants are the caller's concern (see `stop`). */
-  private async stopRecord(record: SubagentRecord): Promise<void> {
+  /** Stops one record's own run with the given intent; its descendants are the caller's concern (see `stop`). */
+  private async haltRecord(record: SubagentRecord, intent: "interrupt" | "stop"): Promise<void> {
     if (this.cancelQueued(record)) return;
     // Start closing the idle child synchronously (before any await), and return only once it has finished closing.
     const closingIdle = this.closeIdle(record.id);
@@ -1557,12 +1727,17 @@ export class SubagentManager {
       }
       const live = this.live.get(record.id);
       if (live) {
-        live.intent = "stop";
+        live.intent = intent;
         await live.session.abort();
       }
     } finally {
       await closingIdle;
     }
+  }
+
+  /** Stops one record's own run; its descendants are the caller's concern (see `stop`). */
+  private async stopRecord(record: SubagentRecord): Promise<void> {
+    return this.haltRecord(record, "stop");
   }
 
   /**

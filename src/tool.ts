@@ -23,6 +23,7 @@ export const SUBAGENT_ACTIONS = [
   "chain",
   "resume",
   "continue",
+  "restart",
   "steer",
   "interrupt",
   "interrupt-all",
@@ -38,14 +39,14 @@ export const SUBAGENT_ACTIONS = [
 export const SubagentsParams = Type.Object({
   action: Type.Union(
     SUBAGENT_ACTIONS.map((action) => Type.Literal(action)),
-    { description: "run = new subagent; parallel = many at once; chain = sequential with {previous}; resume = continue a finished/paused one by handle; continue = resume the step that stopped a chain and finish it; interrupt pauses one; interrupt-all pauses every running one (all resumable); stop ends one (and its descendants); stop-all ends every active one; drain = hand a paused parent's waiting child results to the caller; drop = discard them" },
+    { description: "run = new subagent; parallel = many at once; chain = sequential with {previous}; resume = continue a finished/paused one by handle; continue = resume the step that stopped a chain and finish it; restart = run the same task again in a fresh session (clears the context, keeps the handle); interrupt pauses one; interrupt-all pauses every running one (all resumable); stop ends one (and its descendants); stop-all ends every active one; drain = hand a paused parent's waiting child results to the caller; drop = discard them" },
   ),
   agent: Type.Optional(Type.String({ description: "Agent name (run); give exactly one of agent, skill or command" })),
   skill: Type.Optional(Type.String({ description: "Skill name (run), run as /skill:<name> in the child" })),
   command: Type.Optional(Type.String({ description: "Prompt template name (run), run as /<name> in the child" })),
   task: Type.Optional(Type.String({ description: "Task for an agent entry, or arguments appended to the skill/template (run)" })),
-  handle: Type.Optional(Type.String({ description: "Existing subagent handle, e.g. reviewer-2 (resume/steer/interrupt/stop/continue/drain/drop)" })),
-  message: Type.Optional(Type.String({ description: "Message for resume, steer or continue" })),
+  handle: Type.Optional(Type.String({ description: "Existing subagent handle, e.g. reviewer-2 (resume/continue/restart/steer/interrupt/stop/drain/drop)" })),
+  message: Type.Optional(Type.String({ description: "Message for resume, restart, steer or continue" })),
   cwd: Type.Optional(Type.String({ description: "Working directory for a single run (run)" })),
   model: Type.Optional(
     Type.String({
@@ -258,6 +259,15 @@ async function dispatch(
     case "steer":
       await manager.steer(need(input.handle, "handle", "steer"), need(input.message, "message", "steer"), input.mode ?? "steer");
       return { text: `Steering message delivered to ${input.handle}.`, details: {} };
+    case "restart": {
+      const { record, payload } = await manager.restart(need(input.handle, "handle", "restart"), {
+        ...(input.message ? { message: input.message } : {}),
+        background: input.background ?? false,
+        ...(signal ? { signal } : {}),
+      });
+      const body = payload ? payload.text : "Restarted in the background; the result will be delivered when it finishes.";
+      return { text: `@${record.handle} restarted as run ${record.runId} in a fresh session.\n\n${body}`, details: { handle: record.handle, runId: record.runId } };
+    }
     case "interrupt": {
       const outcome = await manager.interrupt(need(input.handle, "handle", "interrupt"));
       const text =
