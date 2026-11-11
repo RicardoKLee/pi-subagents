@@ -17,20 +17,34 @@ const BatchItem = Type.Object({
  * Every action the `subagents` tool accepts. The schema union, the delegating session's gate and the dispatcher all
  * read this one list, so adding an action cannot silently miss one of them (REVIEW-040).
  */
-export const SUBAGENT_ACTIONS = ["run", "parallel", "chain", "resume", "continue", "steer", "interrupt", "stop", "drain", "drop", "list"] as const;
+export const SUBAGENT_ACTIONS = [
+  "run",
+  "parallel",
+  "chain",
+  "resume",
+  "continue",
+  "steer",
+  "interrupt",
+  "interrupt-all",
+  "stop",
+  "stop-all",
+  "drain",
+  "drop",
+  "list",
+] as const;
 
 // TODO(delivery): background results from the main agent are always delivered with "auto". Add a `delivery`
 // parameter back if a use case appears (plan section 6.5 item 4).
 export const SubagentsParams = Type.Object({
   action: Type.Union(
     SUBAGENT_ACTIONS.map((action) => Type.Literal(action)),
-    { description: "run = new subagent; parallel = many at once; chain = sequential with {previous}; resume = continue a finished/paused one by handle; continue = resume the step that stopped a chain and finish it; drain = hand a paused parent's waiting child results to the caller; drop = discard them" },
+    { description: "run = new subagent; parallel = many at once; chain = sequential with {previous}; resume = continue a finished/paused one by handle; continue = resume the step that stopped a chain and finish it; interrupt pauses one; interrupt-all pauses every running one (all resumable); stop ends one (and its descendants); stop-all ends every active one; drain = hand a paused parent's waiting child results to the caller; drop = discard them" },
   ),
   agent: Type.Optional(Type.String({ description: "Agent name (run); give exactly one of agent, skill or command" })),
   skill: Type.Optional(Type.String({ description: "Skill name (run), run as /skill:<name> in the child" })),
   command: Type.Optional(Type.String({ description: "Prompt template name (run), run as /<name> in the child" })),
   task: Type.Optional(Type.String({ description: "Task for an agent entry, or arguments appended to the skill/template (run)" })),
-  handle: Type.Optional(Type.String({ description: "Existing subagent handle, e.g. reviewer-2 (resume/steer/interrupt/stop/continue)" })),
+  handle: Type.Optional(Type.String({ description: "Existing subagent handle, e.g. reviewer-2 (resume/steer/interrupt/stop/continue/drain/drop)" })),
   message: Type.Optional(Type.String({ description: "Message for resume, steer or continue" })),
   cwd: Type.Optional(Type.String({ description: "Working directory for a single run (run)" })),
   model: Type.Optional(
@@ -121,6 +135,11 @@ function need<T>(value: T | undefined, name: string, action: string): T {
 function needList<T>(value: readonly T[] | undefined, name: string, action: string): T[] {
   if (!value || value.length === 0) throw new Error(`action "${action}" requires a non-empty "${name}" array`);
   return [...value];
+}
+
+/** Mass actions take no handle: a typo must not silently narrow (or widen) their scope. */
+function noHandle(input: SubagentsInput, action: string): void {
+  if (input.handle !== undefined && input.handle !== "") throw new Error(`action "${action}" takes no handle; it applies to every subagent`);
 }
 
 /** The entry fields of a tool call, only present when the caller set them (keeps call signatures stable). */
@@ -250,6 +269,21 @@ async function dispatch(
     case "stop":
       await manager.stop(need(input.handle, "handle", "stop"));
       return { text: `${input.handle} stopped; it cannot be resumed.`, details: {} };
+    case "stop-all": {
+      noHandle(input, "stop-all");
+      const out = await manager.stopAll();
+      if (!out.stopped) return { text: "No subagent was running; paused ones were left resumable.", details: out };
+      const lines = out.handles.map((h) => `@${h.handle} (${h.wasQueued ? "queued→cancelled" : "running→stopped"})`);
+      return { text: `Stopped ${out.stopped} subagent(s):\n${lines.join("\n")}\nPaused subagents were left resumable.`, details: out };
+    }
+    case "interrupt-all": {
+      noHandle(input, "interrupt-all");
+      const count = await manager.interruptAll();
+      return {
+        text: count ? `Paused ${count} subagent(s); continue them with action=resume.` : "No subagent was running.",
+        details: { count },
+      };
+    }
     case "drain": {
       // Hand a paused parent's waiting child results to the caller instead of resuming the parent.
       const out = await manager.drainPending(need(input.handle, "handle", "drain"));

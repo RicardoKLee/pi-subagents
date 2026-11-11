@@ -520,6 +520,11 @@ export class SubagentManager {
       const chains = this.listChains().filter((c) => c.stepRecordIds.some((id) => ids.has(id)));
       return { text: renderTree(records, "list", chains), details: { count: records.length } };
     }
+    // Mass actions have no handle to scope, and a child has no business ending the tree it lives in; `DELEGATION_ACTIONS`
+    // is derived from `SUBAGENT_ACTIONS`, so the refusal must be explicit here rather than by omitting the action.
+    if (input.action === "stop-all" || input.action === "interrupt-all") {
+      throw new Error("only the main agent can stop all subagents");
+    }
     const scoped: DispatchInput = { ...input };
     if (input.handle) {
       // Resolve inside the delegating child's own subtree only. `requireRecord` must NOT be used here: its miss text
@@ -605,6 +610,24 @@ export class SubagentManager {
   activeRecords(): SubagentRecord[] {
     const ids = new Set([...this.live.keys(), ...this.claims.keys(), ...this.queued.keys()]);
     return [...ids].map((id) => this.deps.registry.get(id)).filter((r): r is SubagentRecord => r !== undefined);
+  }
+
+  /**
+   * Every record a mass stop must end, deepest last: anything with a live child, a pending resume claim, a queued run,
+   * plus a record the registry still calls `running`/`queued` (a recovered record has no run of its own any more, but
+   * it must still end). `paused` is deliberately absent: a paused record stays resumable.
+   */
+  private stopTargets(): SubagentRecord[] {
+    const ids = new Set([...this.live.keys(), ...this.claims.keys(), ...this.queued.keys()]);
+    for (const record of this.deps.registry.list()) {
+      if (record.status === "running" || record.status === "queued") ids.add(record.id);
+    }
+    const out: SubagentRecord[] = [];
+    for (const id of ids) {
+      const record = this.deps.registry.get(id);
+      if (record) out.push(record);
+    }
+    return out.sort((a, b) => a.depth - b.depth);
   }
 
   async run(req: RunRequest): Promise<RunOutcome> {
@@ -1324,7 +1347,7 @@ export class SubagentManager {
     // Synchronously shut every door a descendant could still run through before the first await. Stopping the parent
     // releases its scheduler slot mid-await, and without this the queued descendant would open a session before the
     // cascade reaches it; a descendant's pending resume claim is cancelled the same way (CR-5-1/CR-5-2).
-    this.cancelDescendantStarts(descendants);
+    this.cancelStarts(descendants);
     await halt(record);
     for (const descendant of descendants) {
       mark(descendant.id);
@@ -1334,18 +1357,58 @@ export class SubagentManager {
   }
 
   /**
-   * Bars every descendant from starting a run while the cascade awaits an abort/dispose: cancels each queued run and
-   * aborts each resume claim with `intent = "stop"`. Purely synchronous, so it runs before the parent's slot is freed.
+   * Stops every active record (queued/running, nested descendants included) and leaves paused records resumable.
+   * Everything is marked, de-queued and claim-aborted synchronously before the first await, so nothing can start
+   * while an abort is in flight; the aborts then reuse the same `stopRecord` path as a single `stop()`.
    */
-  private cancelDescendantStarts(descendants: readonly SubagentRecord[]): void {
-    for (const descendant of descendants) {
-      const claim = this.claims.get(descendant.id);
+  async stopAll(): Promise<{ stopped: number; cancelled: number; handles: { handle: string; wasQueued: boolean }[] }> {
+    const targets = this.stopTargets();
+    const handles: { handle: string; wasQueued: boolean }[] = [];
+    if (!targets.length) return { stopped: 0, cancelled: 0, handles };
+    const errors: unknown[] = [];
+    let stopped = 0;
+    let cancelled = 0;
+    // Synchronous phase: mark every target and count what will be cancelled, before any await frees a slot.
+    for (const record of targets) {
+      const wasQueued = this.queued.has(record.id);
+      if (wasQueued) cancelled++;
+      try {
+        this.markStoppedAndDiscardPending(record.id);
+        stopped++;
+        handles.push({ handle: record.handle, wasQueued });
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    this.cancelStarts(targets, errors);
+    for (const record of targets) {
+      try {
+        await this.stopRecord(record);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    // A stopped step must not leave its chain "running": settle it like a branch switch would.
+    this.reconcileChains();
+    this.maybeStopMailbox();
+    if (errors.length) throw errors[0];
+    return { stopped, cancelled, handles };
+  }
+
+  /**
+   * Bars every listed record from starting a run while a mass stop awaits an abort/dispose: cancels each queued run and
+   * aborts each resume claim with `intent = "stop"`. Purely synchronous, so it runs before a slot is freed.
+   */
+  private cancelStarts(records: readonly SubagentRecord[], errors: unknown[] = []): void {
+    for (const record of records) {
+      const claim = this.claims.get(record.id);
       if (claim) claim.intent = "stop";
       try {
-        this.cancelQueued(descendant);
-      } catch {
+        this.cancelQueued(record);
+      } catch (error) {
         // `cancelQueued` already aborted the queued run in its finally block; a persist failure is reported by the
         // per-record `mark`/`stopRecord` below instead of cutting the synchronous sweep short.
+        errors.push(error);
       }
       // Abort after cancelQueued so a run that is both queued and claimed cannot start; cancelQueued has no claim.
       if (claim) claim.controller.abort();
@@ -1375,9 +1438,19 @@ export class SubagentManager {
     }
   }
 
-  /** Called when the main session is shutting down or the user aborts. */
-  async interruptAll(): Promise<void> {
-    await Promise.all([...this.live.values()].map((live) => ((live.intent = "interrupt"), live.session.abort())));
+  /**
+   * Pauses every live child (the main agent's deliberate Esc) and reports how many it paused. A run that is already
+   * stopping keeps its `stop` intent: pausing it would turn a terminal stop into a resumable pause (F13).
+   */
+  async interruptAll(): Promise<number> {
+    const live = [...this.live.values()].filter((entry) => entry.intent !== "stop");
+    await Promise.all(
+      live.map((entry) => {
+        entry.intent = "interrupt";
+        return entry.session.abort().catch(() => {});
+      }),
+    );
+    return live.length;
   }
 
   /** Main session is going away: cancel queued/opening run and resume calls, then interrupt live children. */

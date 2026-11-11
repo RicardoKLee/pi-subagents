@@ -188,7 +188,7 @@ describe("delegate abort scope (REVIEW-019)", () => {
 
   it("should_keep_the_global_interruptAll_for_the_main_session_path", async () => {
     const { manager } = setup();
-    const spy = vi.spyOn(manager, "interruptAll").mockResolvedValue(undefined);
+    const spy = vi.spyOn(manager, "interruptAll").mockResolvedValue(0);
     // The main session's tool call passes no onAbort: the default still pauses every live child.
     await executeAction(manager, { action: "list" }, AbortSignal.abort());
     expect(spy).toHaveBeenCalledTimes(1);

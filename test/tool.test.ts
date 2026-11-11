@@ -10,7 +10,9 @@ function fakeManager(overrides: Partial<Record<keyof SubagentManager, unknown>> 
     resume: vi.fn(async () => ({ record: { ...record, runId: 2 }, payload: { text: "again", summary: "again" } })),
     steer: vi.fn(async () => {}),
     interrupt: vi.fn(async () => {}),
+    interruptAll: vi.fn(async () => 0),
     stop: vi.fn(async () => {}),
+    stopAll: vi.fn(async () => ({ stopped: 0, cancelled: 0, handles: [] })),
     list: vi.fn(() => [record]),
     listChains: vi.fn(() => []),
     ...overrides,
@@ -138,5 +140,37 @@ describe("executeAction", () => {
     const m = fakeManager();
     await expect(executeAction(m, { action: "run", agent: "reviewer", skill: "pdf-tools", task: "x" })).rejects.toThrow(/exactly one of/);
     expect(m.run).not.toHaveBeenCalled();
+  });
+
+  it("stop-all reports what it stopped and what it left resumable", async () => {
+    const m = fakeManager({
+      stopAll: vi.fn(async () => ({ stopped: 2, cancelled: 1, handles: [{ handle: "reviewer", wasQueued: false }, { handle: "reviewer-2", wasQueued: true }] })),
+    });
+    const out = await executeAction(m, { action: "stop-all" });
+    expect(out.text).toContain("Stopped 2 subagent(s)");
+    expect(out.text).toContain("@reviewer (running→stopped)");
+    expect(out.text).toContain("@reviewer-2 (queued→cancelled)");
+    expect(out.text).toContain("Paused subagents were left resumable");
+    expect(out.details).toMatchObject({ stopped: 2, cancelled: 1 });
+  });
+
+  it("stop-all with nothing active says so", async () => {
+    const out = await executeAction(fakeManager(), { action: "stop-all" });
+    expect(out.text).toMatch(/No subagent was running/);
+  });
+
+  it("interrupt-all reports the paused count", async () => {
+    const m = fakeManager({ interruptAll: vi.fn(async () => 3) });
+    const out = await executeAction(m, { action: "interrupt-all" });
+    expect(out.text).toContain("Paused 3 subagent(s)");
+    expect(out.details).toEqual({ count: 3 });
+  });
+
+  it("mass actions take no handle", async () => {
+    for (const action of ["stop-all", "interrupt-all"] as const) {
+      const m = fakeManager();
+      await expect(executeAction(m, { action, handle: "reviewer" })).rejects.toThrow(/takes no handle/);
+    }
+    expect(fakeManager().stopAll).not.toHaveBeenCalled();
   });
 });
