@@ -184,8 +184,10 @@ interface Resolved {
 }
 
 interface LaunchOptions {
-  /** "batch" items never return early, never deliver on their own, and size their output by `receiverContextWindow`. */
+  /** "batch" items wait for completion and use path payloads; by default their group owns delivery. */
   mode?: "single" | "batch";
+  /** Override delivery ownership independently of waiting and payload formatting (resident auto-resume has no group). */
+  resultOwner?: "run" | "group";
   receiverContextWindow?: number;
   /** User messages to quote with the delivered result. */
   asks?: Ask[];
@@ -1338,7 +1340,7 @@ export class SubagentManager {
   async resume(
     handle: string,
     userMessage: string,
-    opts: { delivery?: DeliveryMode; background?: boolean; signal?: AbortSignal; mention?: boolean; receiverContextWindow?: number; mode?: "single" | "batch"; detach?: boolean; waitMinutes?: number; waiting?: boolean } = {},
+    opts: { delivery?: DeliveryMode; background?: boolean; signal?: AbortSignal; mention?: boolean; receiverContextWindow?: number; mode?: "single" | "batch"; resultOwner?: "run" | "group"; detach?: boolean; waitMinutes?: number; waiting?: boolean } = {},
   ): Promise<RunOutcome> {
     const { record, agent, runner, cwd } = this.preflight(handle);
     // Child results that arrived while this record was paused are handed to the model before the user's message.
@@ -1448,6 +1450,7 @@ export class SubagentManager {
       }
       const outcome = await this.execute(claimed, session, message, release, opts.background ?? false, signal, opts.mention ? [this.ask("ask", message)] : [], {
         ...(opts.mode ? { mode: opts.mode } : {}),
+        ...(opts.resultOwner ? { resultOwner: opts.resultOwner } : {}),
         ...(opts.waiting !== undefined ? { waiting: opts.waiting } : {}),
         ...(opts.receiverContextWindow ? { receiverContextWindow: opts.receiverContextWindow } : {}),
         ...(opts.waitMinutes && !opts.background ? { waitMinutes: opts.waitMinutes } : {}),
@@ -2064,12 +2067,13 @@ export class SubagentManager {
 
     const current = registry.get(id)!;
     const batch = options.mode === "batch";
+    const ownsResult = (options.resultOwner ?? (batch ? "group" : "run")) === "run";
     let payload: Payload;
     if (status === "completed") {
       // share/auto background results are delivered into the main LLM context: always move the full text to a file
       // and send only the summary + paths (ratio 0). Private results never enter the LLM context, so they keep the
-      // contextRatio rule like foreground returns. One file per run at most. A batch run is never delivered on its
-      // own: it is sized for its consumer (the next chain step, or the group summary) in the summary + path form.
+      // contextRatio rule like foreground returns. One file per run at most. Batch formatting keeps the summary +
+      // path form for chain/group consumers and resident auto-resumes, independently of delivery ownership.
       const receiverWindow = options.receiverContextWindow ?? this.deps.receiverContextWindow();
       const label =
         batch && current.stepIndex !== undefined ? `${current.handle}-step${current.stepIndex + 1}-run${current.runId}` : `${current.handle}-run${current.runId}`;
@@ -2090,7 +2094,7 @@ export class SubagentManager {
     // Private instructions are never shown to it.
     const shown = live.asks.filter((a) => !a.private);
     if (!background && shown.length) payload = { ...payload, text: `${renderAsks(current.handle, shown)}\n\n${payload.text}` };
-    if (record.parentId && status === "completed" && !batch) {
+    if (record.parentId && ownsResult && (status === "completed" || (options.resultOwner === "run" && status === "failed"))) {
       // A nested run hands its result to its own parent, never to the main session. A paused parent cannot take it
       // right now (this includes a foreground delegation whose tool call was interrupted with the parent), so it is
       // queued for its resume instead of being dropped.
@@ -2099,7 +2103,7 @@ export class SubagentManager {
       else if (background) this.routeChildResult(record, payload);
       // A foreground run with a live parent is delivered by the tool result itself.
     }
-    if (background && !batch && status !== "stopped" && status !== "paused") {
+    if (background && ownsResult && status !== "stopped" && status !== "paused") {
       if (record.parentId) {
         // (already handled above)
       } else {
@@ -2204,7 +2208,8 @@ export class SubagentManager {
     }
     // Tracked for the same reason: the parent's continued turn must be part of whenIdle(), or a caller that awaits it
     // could observe the child result before the parent ever receives it.
-    this.track(this.resume(parent.handle, this.childResultsText(parent, [entry]), { background: true, mode: "batch" }), fail);
+    // Keep batch waiting/formatting, but this continuation has no group consumer: it owns its upward delivery.
+    this.track(this.resume(parent.handle, this.childResultsText(parent, [entry]), { background: true, mode: "batch", resultOwner: "run" }), fail);
   }
 
   /** Appends one child result to the parent's pending queue and makes sure the reminder watch runs. */

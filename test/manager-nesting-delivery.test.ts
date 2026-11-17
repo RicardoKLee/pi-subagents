@@ -32,6 +32,7 @@ function setup(
     contextWindow?: number;
     leadWindow?: number;
     limit?: number;
+    sendError?: string;
   } = {},
 ) {
   const root = tempDir("deliver-");
@@ -59,7 +60,10 @@ function setup(
         [lead.name, lead],
       ]),
     settings: () => ({ ...DEFAULT_SETTINGS, maxResident: 0, ...opts.settings }),
-    port: { sendMessage: (message, options) => sent.push({ message, options }), appendEntry: () => {} },
+    port: { sendMessage: (message, options) => {
+      if (opts.sendError) throw new Error(opts.sendError);
+      sent.push({ message, options });
+    }, appendEntry: () => {} },
     receiverContextWindow: () => opts.contextWindow ?? 200000,
     ...(opts.leadWindow !== undefined
       ? { receiverContextWindowFor: (agent: AgentDef) => (agent.name === "lead" ? opts.leadWindow : undefined) }
@@ -86,7 +90,7 @@ const nested = (parent: { id: string; depth: number }, req: Record<string, unkno
 describe("child result delivery", () => {
   it("continues an idle parent with the child's result in context", async () => {
     // maxResident > 0 keeps the completed parent's session parked, so "idle" can be continued in place.
-    const { manager, runner } = setup({ settings: { maxResident: 2 }, scripts: [[ok("lead done")], [ok("child done")], [ok("parent continued")]] });
+    const { manager, runner, sent } = setup({ settings: { maxResident: 2 }, scripts: [[ok("lead done")], [ok("child done")], [ok("parent continued")]] });
     const { record: parent } = await manager.run({ agent: "lead", task: "plan" });
     await manager.run(nested(parent, { agent: "worker", task: "x", background: true }) as never);
     await manager.whenIdle();
@@ -94,8 +98,79 @@ describe("child result delivery", () => {
     expect(resumed).toBeDefined();
     expect(resumed!.prompts[0]).toContain("child done");
     expect(resumed!.prompts[0]).toMatch(/@worker/);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.message.customType).toBe("pi-subagents/result");
+    expect(sent[0]!.message.content).toContain(`@${parent.handle}`);
+    expect(sent[0]!.message.content).toContain("parent continued");
     await manager.shutdown();
     await manager.whenIdle();
+  });
+
+  it("routes successive resident continuations through the direct parent only", async () => {
+    const { manager, runner, sent } = setup({ settings: { maxResident: 5, maxDepth: 3 }, scripts: [
+      [ok("top initial")], [ok("middle initial")], [ok("leaf result")],
+      [ok("middle continued")], [ok("top continued")],
+    ] });
+    const { record: top } = await manager.run({ agent: "lead", task: "plan" });
+    const { record: middle } = await manager.run(nested(top, { agent: "worker", task: "middle" }) as never);
+    await manager.run(nested(middle, { agent: "worker", task: "leaf", background: true }) as never);
+    await manager.whenIdle();
+    expect(runner.sessions[3]!.prompts[0]).toContain("leaf result");
+    expect(runner.sessions[4]!.prompts[0]).toContain("middle continued");
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.message.content).toContain(`@${top.handle}`);
+    expect(sent[0]!.message.content).toContain("top continued");
+    await manager.shutdown();
+  });
+
+  it("waits for the automatic continuation and delivers once after it finishes", async () => {
+    const { manager, runner, sent } = setup({ hold: true, settings: { maxResident: 3 }, scripts: [
+      [ok("initial")], [ok("child")], [ok("continued")],
+    ] });
+    const initial = manager.run({ agent: "lead", task: "plan" });
+    await expect.poll(() => runner.sessions.length).toBe(1);
+    runner.sessions[0]!.finish();
+    const { record: parent } = await initial;
+    await manager.run(nested(parent, { agent: "worker", task: "child", background: true }) as never);
+    runner.sessions[1]!.finish();
+    await expect.poll(() => runner.sessions[2]?.prompts.length).toBe(1);
+    let idle = false;
+    const waiting = manager.whenIdle().then(() => { idle = true; });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(idle).toBe(false);
+    expect(sent).toHaveLength(0);
+    runner.sessions[2]!.finish();
+    await waiting;
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.message.content).toContain("continued");
+    expect(sent[0]!.options).toMatchObject({ triggerTurn: true });
+    await manager.shutdown();
+  });
+
+  it("reports a failed automatic continuation to main", async () => {
+    const { manager, sent, registry } = setup({ settings: { maxResident: 3 }, scripts: [
+      [ok("initial")], [ok("child")], [{ text: "", stopReason: "error", errorMessage: "model failed", usage: usage() }],
+    ] });
+    const { record: parent } = await manager.run({ agent: "lead", task: "plan" });
+    await manager.run(nested(parent, { agent: "worker", task: "child", background: true }) as never);
+    await manager.whenIdle();
+    expect(registry.get(parent.id)!.status).toBe("failed");
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.message.content).toContain("model failed");
+    await manager.shutdown();
+  });
+
+  it("records and reports an automatic continuation delivery failure", async () => {
+    const { manager, registry, errors } = setup({ sendError: "port unavailable", settings: { maxResident: 3 }, scripts: [
+      [ok("initial")], [ok("child")], [ok("continued")],
+    ] });
+    const { record: parent } = await manager.run({ agent: "lead", task: "plan" });
+    await manager.run(nested(parent, { agent: "worker", task: "child", background: true }) as never);
+    await manager.whenIdle();
+    expect(registry.get(parent.id)).toMatchObject({ status: "completed", error: "delivery failed: port unavailable" });
+    expect(errors).toEqual([{ handle: parent.handle, message: "port unavailable" }]);
+    expect(registry.get(parent.id)!.lastSummary).toContain("continued");
+    await manager.shutdown();
   });
 
   it("never reports a nested child result to the main session", async () => {
@@ -730,6 +805,22 @@ describe("background delegation is fire-and-forget", () => {
 });
 
 describe("nested batch result routing", () => {
+  it.each(["parallel", "chain"] as const)("delivers the resident parent's conclusion after a nested %s", async (kind) => {
+    const { manager, runner, sent } = setup({ settings: { maxResident: 4 }, scripts: [
+      [ok("initial")], [ok("member a")], [ok("member b")], [ok("group conclusion")],
+    ] });
+    const { record: parent } = await manager.run({ agent: "lead", task: "plan" });
+    const items = [{ agent: "worker", task: "a" }, { agent: "worker", task: "b" }];
+    if (kind === "parallel") await manager.runParallel({ items, parentId: parent.id, background: true });
+    else await manager.runChain({ steps: items, parentId: parent.id, background: true });
+    await manager.whenIdle();
+    expect(runner.sessions[3]!.prompts[0]).toContain(kind === "parallel" ? "Parallel: 2/2 succeeded" : "Chain completed (2/2 steps)");
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.message.customType).toBe("pi-subagents/result");
+    expect(sent[0]!.message.content).toContain("group conclusion");
+    await manager.shutdown();
+  });
+
   it("routes a nested background group summary to its parent, not the main session", async () => {
     const { manager, runner, sent } = setup({ hold: true, scripts: [[ok("lead")], [ok("a")], [ok("b")]] });
     const { record: parent } = await manager.run({ agent: "lead", task: "plan", background: true });
